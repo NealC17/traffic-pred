@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Set up and activate the project's Python environment.
 #
-#   source setup_env.sh          # create/update .env/ and activate it in this shell
-#   source setup_env.sh --force  # reinstall packages even if requirements.txt is unchanged
+#   source setup.sh          # create/update .env/ and activate it in this shell
+#   source setup.sh --force  # reinstall packages even if requirements.txt is unchanged
 #
-# Must be *sourced*: a script run as ./setup_env.sh executes in a child shell,
+# Must be *sourced*: a script run as ./setup.sh executes in a child shell,
 # so the activation would vanish when it exits.
 #
 # What it does (safe to re-run; skips work that's already done):
@@ -47,11 +47,27 @@ _setup_env() {
     if [ ! -x "$venv/bin/python" ]; then
         echo "[setup] creating virtual environment .env/ with $($py --version)"
         if ! "$py" -m venv "$venv"; then
-            echo "[setup] venv creation failed. On Debian/Ubuntu: sudo apt install python3-venv" >&2
+            rm -rf "$venv"          # don't leave a half-built env (python but no pip) behind
+            echo "[setup] venv creation failed. On Debian/Ubuntu install the venv package:" >&2
+            echo "          sudo apt install python$("$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])')-venv" >&2
+            echo "        then run: source ${BASH_SOURCE[0]##*/}" >&2
             return 1
         fi
-        "$venv/bin/python" -m pip install -q --upgrade pip || return 1
     fi
+
+    # 2b. make sure the env has pip (a venv made while python3-venv was missing,
+    #     or with --without-pip, has python but no pip: "No module named pip")
+    if ! "$venv/bin/python" -m pip --version >/dev/null 2>&1; then
+        echo "[setup] .env/ has no pip; installing it"
+        if ! "$venv/bin/python" -m ensurepip --upgrade >/dev/null 2>&1; then
+            echo "[setup] couldn't add pip to .env/. On Debian/Ubuntu install the venv package:" >&2
+            echo "          sudo apt install python$("$venv/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])')-venv" >&2
+            echo "        then run: source ${BASH_SOURCE[0]##*/}   (it repairs .env/ in place)" >&2
+            return 1
+        fi
+        rm -f "$stamp"              # packages were never installed into this env
+    fi
+    "$venv/bin/python" -m pip install -q --upgrade pip || return 1
 
     # 3. packages (skip if requirements.txt hasn't changed)
     if [ ! -f "$req" ]; then
