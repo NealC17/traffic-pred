@@ -95,10 +95,25 @@ def fit(model, train_set, test_set, epochs=50, batch_size=16, lr=1e-3,
     return model
 
 
-from data import taxibj_splits
-from viz_flow import browse_notebook
-
 if __name__ == "__main__":
-    train_set, test_set = taxibj_splits()          # 4 -> 4
-    model = fit(MLP(), train_set, test_set, epochs=50, save="checkpoints/mlp_best.pt")
-    
+    import argparse
+    import os
+    from data import taxibj_splits
+
+    ap = argparse.ArgumentParser(description="Train the MLP baseline on TaxiBJ with MSE loss.")
+    ap.add_argument("--tin", type=int, default=4)
+    ap.add_argument("--tout", type=int, default=4)
+    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--hidden", type=int, default=512)
+    ap.add_argument("--depth", type=int, default=3)
+    ap.add_argument("--save", default="checkpoints/mlp_mse.pt")
+    args = ap.parse_args()
+
+    if os.path.dirname(args.save):
+        os.makedirs(os.path.dirname(args.save), exist_ok=True)
+    train_set, test_set = taxibj_splits(args.tin, args.tout)
+    fit(MLP(t_in=args.tin, t_out=args.tout, hidden=args.hidden, depth=args.depth),
+        train_set, test_set, epochs=args.epochs, batch_size=args.batch_size,
+        lr=args.lr, save=args.save)   

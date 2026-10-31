@@ -3,9 +3,14 @@ Train DistVolNet on TaxiBJ using data.py's taxibj_splits().
 
   python train_distvol.py --tin 4 --tout 4 --epochs 50 --save checkpoints/distvol_best.pt
   python train_distvol.py --model cnn --tin 4 --tout 4 --epochs 50   # baseline CNN, same loss
+  python train_distvol.py --model cnn --loss mse                   # baseline CNN, plain MSE
   python train_distvol.py --synthetic --epochs 2 --width 32 --sinkhorn_iters 10   # smoke test
 
-The checkpoint's config["model"] says which class to rebuild ("distvol" or "cnn").
+--loss sinkhorn (default): DistVolLoss = L1 + Sinkhorn + volume
+--loss mse:                plain MSE on the predicted counts
+
+The checkpoint's config["model"] says which class to rebuild ("distvol" or "cnn"),
+config["loss"] which loss it was trained with.
 
 Data: taxibj_splits(tin, tout) trains on every TaxiBJ flow file except the last 4 weeks
 and tests on those 4 weeks, with the same min-max scaling as PredFormer. Windows never
@@ -14,6 +19,8 @@ cross file boundaries. Run from the folder that contains data.py and datasets/.
 import argparse, math, os, time
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from distvol import DistVolNet, DistVolLoss
 from baseline_cnn import BaselineCNN
@@ -56,6 +63,13 @@ def synthetic_splits(tin, tout, n=1500, H=32, W=32, seed=0):
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+class MSELoss(nn.Module):
+    """Plain MSE on the counts, with the same call signature as DistVolLoss."""
+    def forward(self, x_hat, p_hat, N_hat, y):
+        loss = F.mse_loss(x_hat, y)
+        return loss, {"mse": loss.item()}
+
+
 def evaluate(model, loader, device, span):
     """MAE / RMSE over all cells, converted back to raw flow counts."""
     model.eval(); mae = mse = n = 0
@@ -80,6 +94,8 @@ def main():
     ap.add_argument("--tout", type=int, default=4, help="frames to predict")
     ap.add_argument("--model", choices=["distvol", "cnn"], default="distvol",
                     help="distvol = DistVolNet; cnn = BaselineCNN (same loss, plain conv stack)")
+    ap.add_argument("--loss", choices=["sinkhorn", "mse"], default="sinkhorn",
+                    help="sinkhorn = DistVolLoss (L1 + Sinkhorn + volume); mse = plain MSE")
     ap.add_argument("--width", type=int, default=64)
     ap.add_argument("--blocks", type=int, default=6, help="residual blocks (cnn only)")
     ap.add_argument("--epochs", type=int, default=50)
@@ -92,9 +108,9 @@ def main():
     ap.add_argument("--eps", type=float, default=0.01, help="Sinkhorn blur")
     ap.add_argument("--sinkhorn_iters", type=int, default=30)
     ap.add_argument("--save", type=str, default=None,
-                    help="default: checkpoints/<model>_best.pt")
+                    help="default: checkpoints/<model>_<loss>.pt")
     args = ap.parse_args()
-    args.save = args.save or f"checkpoints/{args.model}_best.pt"
+    args.save = args.save or f"checkpoints/{args.model}_{args.loss}.pt"
 
     if args.synthetic:
         train, test, (lo, hi) = synthetic_splits(args.tin, args.tout)
@@ -121,11 +137,12 @@ def main():
         model = BaselineCNN(args.tin, args.tout, C, H, W, args.width, args.blocks).to(device)
     else:
         model = DistVolNet(args.tin, args.tout, C, H, W, args.width).to(device)
-    crit = DistVolLoss(args.l1, args.l2, args.l3, args.eps, args.sinkhorn_iters)
+    crit = (MSELoss() if args.loss == "mse"
+            else DistVolLoss(args.l1, args.l2, args.l3, args.eps, args.sinkhorn_iters))
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, args.lr, total_steps=args.epochs * len(tl))
 
-    print(f"{args.model}: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params | "
+    print(f"{args.model} ({args.loss} loss): {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params | "
           f"tin={args.tin} tout={args.tout} | {len(train)} train / {len(test)} test windows | {device}")
     print(f"copy-last-frame baseline MAE: {copy_last_mae(test, span):.4f}")
 
@@ -134,7 +151,7 @@ def main():
 
     best = float("inf")
     for ep in range(1, args.epochs + 1):
-        model.train(); t0 = time.time(); agg = {"l1": 0.0, "sinkhorn": 0.0, "volume": 0.0}
+        model.train(); t0 = time.time(); agg = {}
         for x, y in tl:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             x_hat, p_hat, N_hat = model(x, return_parts=True)
@@ -142,16 +159,17 @@ def main():
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step(); sched.step()
-            for k in agg:
-                agg[k] += parts[k] / len(tl)
+            for k, v in parts.items():
+                agg[k] = agg.get(k, 0.0) + v / len(tl)
         mae, rmse = evaluate(model, vl, device, span)
         tag = ""
         if mae < best:
             best, tag = mae, " *"
             torch.save({"model": model.state_dict(), "config": vars(args),
                         "shape": (C, H, W), "scale": (lo, hi)}, args.save)
-        print(f"ep {ep:3d} | l1 {agg['l1']:.4f} sink {agg['sinkhorn']:.5f} vol {agg['volume']:.4f} "
-              f"| test MAE {mae:.4f} RMSE {rmse:.4f} | {time.time() - t0:.0f}s{tag}")
+        terms = " ".join(f"{k} {v:.5f}" for k, v in agg.items())
+        print(f"ep {ep:3d} | {terms} | test MAE {mae:.4f} RMSE {rmse:.4f} | "
+              f"{time.time() - t0:.0f}s{tag}", flush=True)
 
 
 if __name__ == "__main__":
