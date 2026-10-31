@@ -1,0 +1,23 @@
+# core
+numpy
+torch
+torchvision
+matplotlib
+pandas
+
+# notebooks + interactive viewer (viz_flow.browse_notebook)
+jupyter
+ipykernel
+ipywidgets
+ipympl
+
+# Sinkhorn loss check (sinkhorn_loss.check_against_pot)
+pot
+
+# official PredFormer repo (official_predformer.py)
+# note: current timm, NOT the repo's pinned timm<=0.6.11 (breaks on Python 3.11+)
+einops
+timm
+fvcore
+opencv-python
+imageio

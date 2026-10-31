@@ -1,0 +1,125 @@
+{
+ "BikeNYC/flow_data.npy.xz": {
+  "dtype": "float64",
+  "stored_dtype": "uint16",
+  "shape": [
+   4392,
+   2,
+   21,
+   12
+  ],
+  "sha256": "6f542ef0f197a3c0c45afcc7846f11953d47fc6ef09d8c489f6cb26511bdfde4"
+ },
+ "BikeNYC/poi_data.npy.xz": {
+  "dtype": "float64",
+  "stored_dtype": "uint8",
+  "shape": [
+   9,
+   21,
+   12
+  ],
+  "sha256": "663ec0c066dda15bda2defa5e829cc325d606b87916101a7b693c622cada255d"
+ },
+ "TaxiBJ/TaxiBJ2013.npy.xz": {
+  "dtype": "float64",
+  "stored_dtype": "uint16",
+  "shape": [
+   4848,
+   2,
+   32,
+   32
+  ],
+  "sha256": "6a2ce4160843b7b652b687cf6341992d3e0e77b83548fe106c40dd3fce50fe16"
+ },
+ "TaxiBJ/TaxiBJ2014.npy.xz": {
+  "dtype": "float64",
+  "stored_dtype": "uint16",
+  "shape": [
+   4368,
+   2,
+   32,
+   32
+  ],
+  "sha256": "a3d0ee716c029d8ac10cae00e49bdabc5bfceae81f4ddd4702ffabc99cc60daf"
+ },
+ "TaxiBJ/TaxiBJ2015.npy.xz": {
+  "dtype": "float64",
+  "stored_dtype": "uint16",
+  "shape": [
+   5520,
+   2,
+   32,
+   32
+  ],
+  "sha256": "5d1498bf2d6bc5cf1046a227a7eeca94ee59a8abfb1eb46adaead96421e8f6d2"
+ },
+ "TaxiBJ/TaxiBJ2016_1.npy.xz": {
+  "dtype": "float64",
+  "stored_dtype": "uint16",
+  "shape": [
+   3312,
+   2,
+   32,
+   32
+  ],
+  "sha256": "aa6d73ecf8dd0433d9c2b72a76f6c439a678a884e6223975d23cdf1aec9699a8"
+ },
+ "TaxiBJ/TaxiBJ2016_2.npy.xz": {
+  "dtype": "float64",
+  "stored_dtype": "uint16",
+  "shape": [
+   3312,
+   2,
+   32,
+   32
+  ],
+  "sha256": "1243b521c80ba47fae773612209cdec30ed4e01cc57c3bf78f7e326d501df475"
+ },
+ "TaxiBJ/TaxiBJ21.npy.xz": {
+  "dtype": "float64",
+  "stored_dtype": "float64",
+  "shape": [
+   4272,
+   2,
+   32,
+   32
+  ],
+  "sha256": "d1cd46a50c4c105c8e5801a278f55bc658517fb8b4738d7769d477168da9befa"
+ },
+ "TaxiBJ/TaxiBJext2013.npy.xz": {
+  "dtype": "float64",
+  "stored_dtype": "float64",
+  "shape": [
+   4848,
+   27
+  ],
+  "sha256": "b4a651e7606ec9ec6dd6036b639aa5bf3c87cf8af2945cc271a6196049f3869a"
+ },
+ "TaxiBJ/TaxiBJext2014.npy.xz": {
+  "dtype": "float64",
+  "stored_dtype": "float64",
+  "shape": [
+   4368,
+   27
+  ],
+  "sha256": "27362651f08a89afbaa520d2f39292b810c2b67be2f40f9898ca736aca5da875"
+ },
+ "TaxiBJ/TaxiBJext2015.npy.xz": {
+  "dtype": "float64",
+  "stored_dtype": "float64",
+  "shape": [
+   5520,
+   27
+  ],
+  "sha256": "fdede50c55bcc628b38544cc08c3c225d17ff29cb62e40922f67c7443da77693"
+ },
+ "TaxiBJ/TaxiBJext2016.npy.xz": {
+  "dtype": "float64",
+  "stored_dtype": "float64",
+  "shape": [
+   6624,
+   27
+  ],
+  "sha256": "d33ef5a9e27c560a0a7a1560fa358d4b20c5548d1d218481c3bded4035977fcf"
+ }
+}
