@@ -42,7 +42,7 @@ def evaluate(model, loader, device):
     model.eval()
     se = ae = 0.0
     n = 0
-    for x, y in loader:
+    for x, y in tqdm(loader, desc="  eval", leave=False, dynamic_ncols=True, mininterval=1):
         x, y = x.to(device), y.to(device)
         pred = model(x).clamp(0, 1)
         se += (pred - y).pow(2).sum(dim=(2, 3, 4)).sum().item()
@@ -69,10 +69,12 @@ def fit(model, train_set, test_set, epochs=50, batch_size=16, lr=1e-3,
           f"{len(train_set)} train / {len(test_set)} test, device={device}")
  
     best, best_state = float("inf"), None
-    for epoch in tqdm(range(epochs)):
+    bar_ep = tqdm(range(epochs), desc=type(model).__name__, unit="ep", dynamic_ncols=True, mininterval=1)
+    for epoch in bar_ep:
         model.train()
         t0, running = time.time(), 0.0
-        for x, y in train_loader:
+        bar = tqdm(train_loader, desc=f"  epoch {epoch + 1}", leave=False, dynamic_ncols=True, mininterval=1)
+        for i, (x, y) in enumerate(bar, 1):
             x, y = x.to(device), y.to(device)
             loss = F.mse_loss(model(x), y)
             opt.zero_grad(set_to_none=True)
@@ -80,6 +82,7 @@ def fit(model, train_set, test_set, epochs=50, batch_size=16, lr=1e-3,
             opt.step()
             sched.step()
             running += loss.item()
+            bar.set_postfix(loss=f"{running / i:.5f}")
         mse, mae = evaluate(model, test_loader, device)
         mark = ""
         if mse < best:
@@ -87,8 +90,9 @@ def fit(model, train_set, test_set, epochs=50, batch_size=16, lr=1e-3,
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             if save:
                 torch.save(best_state, save)
-        print(f"epoch {epoch + 1}/{epochs}  train_loss {running / len(train_loader):.5f}  "
-              f"test MSE {mse:.4f}  MAE {mae:.4f}  {time.time() - t0:.0f}s{mark}", flush=True)
+        bar_ep.set_postfix(best_mse=f"{best:.4f}")
+        tqdm.write(f"epoch {epoch + 1}/{epochs}  train_loss {running / len(train_loader):.5f}  "
+                   f"test MSE {mse:.4f}  MAE {mae:.4f}  {time.time() - t0:.0f}s{mark}")
  
     model.load_state_dict(best_state)
     model.eval()
@@ -116,4 +120,4 @@ if __name__ == "__main__":
     train_set, test_set = taxibj_splits(args.tin, args.tout)
     fit(MLP(t_in=args.tin, t_out=args.tout, hidden=args.hidden, depth=args.depth),
         train_set, test_set, epochs=args.epochs, batch_size=args.batch_size,
-        lr=args.lr, save=args.save)   
+        lr=args.lr, save=args.save)

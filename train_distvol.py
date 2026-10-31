@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 from distvol import DistVolNet, DistVolLoss
 from baseline_cnn import BaselineCNN
 
@@ -74,7 +75,7 @@ def evaluate(model, loader, device, span):
     """MAE / RMSE over all cells, converted back to raw flow counts."""
     model.eval(); mae = mse = n = 0
     with torch.no_grad():
-        for x, y in loader:
+        for x, y in tqdm(loader, desc="  eval", leave=False, dynamic_ncols=True, mininterval=1):
             x, y = x.to(device), y.to(device)
             d = model(x) - y
             mae += d.abs().sum().item(); mse += (d ** 2).sum().item(); n += y.numel()
@@ -84,7 +85,9 @@ def evaluate(model, loader, device, span):
 def copy_last_mae(test, span, max_items=2000):
     """Baseline: predict every future frame as the last observed one."""
     idx = np.linspace(0, len(test) - 1, min(len(test), max_items)).astype(int)
-    return float(np.mean([(test[i][0][-1:] - test[i][1]).abs().mean().item() for i in idx])) * span
+    errs = [(test[i][0][-1:] - test[i][1]).abs().mean().item()
+            for i in tqdm(idx, desc="copy-last baseline", leave=False, dynamic_ncols=True, mininterval=1)]
+    return float(np.mean(errs)) * span
 
 
 def main():
@@ -150,9 +153,11 @@ def main():
         os.makedirs(os.path.dirname(args.save), exist_ok=True)
 
     best = float("inf")
-    for ep in range(1, args.epochs + 1):
+    epochs = tqdm(range(1, args.epochs + 1), desc=f"{args.model} ({args.loss})", unit="ep", dynamic_ncols=True, mininterval=1)
+    for ep in epochs:
         model.train(); t0 = time.time(); agg = {}
-        for x, y in tl:
+        bar = tqdm(tl, desc=f"  epoch {ep}", leave=False, dynamic_ncols=True, mininterval=1)
+        for i, (x, y) in enumerate(bar, 1):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             x_hat, p_hat, N_hat = model(x, return_parts=True)
             loss, parts = crit(x_hat, p_hat, N_hat, y)
@@ -161,6 +166,7 @@ def main():
             opt.step(); sched.step()
             for k, v in parts.items():
                 agg[k] = agg.get(k, 0.0) + v / len(tl)
+            bar.set_postfix(loss=f"{loss.item():.5f}")
         mae, rmse = evaluate(model, vl, device, span)
         tag = ""
         if mae < best:
@@ -168,8 +174,9 @@ def main():
             torch.save({"model": model.state_dict(), "config": vars(args),
                         "shape": (C, H, W), "scale": (lo, hi)}, args.save)
         terms = " ".join(f"{k} {v:.5f}" for k, v in agg.items())
-        print(f"ep {ep:3d} | {terms} | test MAE {mae:.4f} RMSE {rmse:.4f} | "
-              f"{time.time() - t0:.0f}s{tag}", flush=True)
+        epochs.set_postfix(best_mae=f"{best:.4f}")
+        tqdm.write(f"ep {ep:3d} | {terms} | test MAE {mae:.4f} RMSE {rmse:.4f} | "
+                   f"{time.time() - t0:.0f}s{tag}")
 
 
 if __name__ == "__main__":

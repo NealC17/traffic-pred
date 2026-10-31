@@ -20,18 +20,23 @@
 #   distvol_sinkhorn     train_distvol.py    DistVolNet    Sinkhorn   50
 #   mlp_mse              baseline_mlp.py     MLP           MSE        50
 #   predformer_mse       train.py            PredFormer    MSE        200 (paper setting)
+#                                            (ours: predformer.py, TSST)
+#   predformer_official_mse  train.py        PredFormer    MSE        200
+#                                            (official repo code in PredFormer/, STS)
 #
 # Output:
 #   checkpoints/<name>.pt          best weights for each run
 #   checkpoints/logs/<name>.log    full training log
-#   checkpoints/runs/              PredFormer's own run folder (last.pt for --resume)
+#   checkpoints/runs/              PredFormer's own run folders (last.pt for --resume)
+#
+# Progress: each run shows an overall epoch bar plus a per-epoch batch bar (tqdm).
+# The .log files keep the per-epoch summary lines; bar redraws are stripped from them.
 
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # --- options -----------------------------------------------------------------
 EPOCHS="" TIN=4 TOUT=4 FORCE=0 LIST=0 FILTERS=()
-PREDFORMER_IMPL="${PREDFORMER_IMPL:-mine}"   # set to "official" to use the official repo's model
 while [ $# -gt 0 ]; do
     case "$1" in
         --epochs) EPOCHS="$2"; shift 2 ;;
@@ -40,7 +45,7 @@ while [ $# -gt 0 ]; do
         --tout)   TOUT="$2"; shift 2 ;;
         --force)  FORCE=1; shift ;;
         --list)   LIST=1; shift ;;
-        -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
         -*) echo "unknown option: $1 (see --help)"; exit 2 ;;
         *)  FILTERS+=("$1"); shift ;;
     esac
@@ -69,7 +74,8 @@ RUNS=(
     "distvol_mse|50|train_distvol.py --model distvol --loss mse --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_"
     "distvol_sinkhorn|50|train_distvol.py --model distvol --loss sinkhorn --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_"
     "mlp_mse|50|baseline_mlp.py --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_"
-    "predformer_mse|200|train.py --dataset taxibj --impl $PREDFORMER_IMPL --t-in $TIN --t-out $TOUT --epochs EPOCHS_ --out checkpoints/runs"
+    "predformer_mse|200|train.py --dataset taxibj --impl mine --t-in $TIN --t-out $TOUT --epochs EPOCHS_ --out checkpoints/runs"
+    "predformer_official_mse|200|train.py --dataset taxibj --impl official --t-in $TIN --t-out $TOUT --epochs EPOCHS_ --out checkpoints/runs"
 )
 
 selected() {   # run name matches any filter (or there are no filters)
@@ -82,7 +88,7 @@ selected() {   # run name matches any filter (or there are no filters)
 if [ "$LIST" = 1 ]; then
     for r in "${RUNS[@]}"; do
         IFS='|' read -r name ep _ <<< "$r"
-        selected "$name" && printf "%-20s %s epochs -> checkpoints/%s%s.pt\n" "$name" "${EPOCHS:-$ep}" "$name" "$SUFFIX"
+        selected "$name" && printf "%-24s %s epochs -> checkpoints/%s%s.pt\n" "$name" "${EPOCHS:-$ep}" "$name" "$SUFFIX"
     done
     exit 0
 fi
@@ -108,13 +114,15 @@ for r in "${RUNS[@]}"; do
     echo "    log: $log"
     t0=$(date +%s)
     # shellcheck disable=SC2086
-    if "$PY" -u $cmd 2>&1 | tee "$log"; then
-        if [ "$name" = predformer_mse ]; then
+    # Bars go to the terminal as usual; the log keeps only finished lines
+    # (tqdm redraws with carriage returns, so keep the text after the last \r).
+    if "$PY" -u $cmd 2>&1 | tee >(tr '\r' '\n' | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | grep -v -E '^\s*$|%\|' > "$log"); then
+        if [[ "$name" == predformer* ]]; then
             # train.py writes checkpoints/runs/<run>/best.pt; copy it next to the others
             run_dir="taxibj"
-            [ "$PREDFORMER_IMPL" = official ] && run_dir="taxibj_official"
+            [ "$name" = predformer_official_mse ] && run_dir="taxibj_official"
             [ -n "$SUFFIX" ] && run_dir="${run_dir}${SUFFIX}"
-            cp "checkpoints/runs/$run_dir/best.pt" "$ckpt"
+            cp "checkpoints/runs/$run_dir/best.pt" "$ckpt" 2>/dev/null
         fi
         if [ -f "$ckpt" ]; then
             DONE+=("$tag ($(( ($(date +%s) - t0) / 60 )) min)")

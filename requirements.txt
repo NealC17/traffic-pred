@@ -4,6 +4,7 @@ torch
 torchvision
 matplotlib
 pandas
+tqdm
 
 # notebooks + interactive viewer (viz_flow.browse_notebook)
 jupyter

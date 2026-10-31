@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 import data
 from predformer import PredFormer, CONFIGS, VARIANTS
@@ -75,7 +76,7 @@ def evaluate(model, loader, device, amp):
     model.eval()
     se = ae = 0.0
     n = 0
-    for x, y in loader:
+    for x, y in tqdm(loader, desc="  eval", leave=False, dynamic_ncols=True, mininterval=1):
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
             pred = model(x)
@@ -176,10 +177,13 @@ def main():
                         dataset=args.dataset, **(extra or {})), path)
 
     # ---- train ----
-    for epoch in range(start_epoch, hp["epochs"]):
+    epochs = tqdm(range(start_epoch, hp["epochs"]), desc=f"PredFormer {variant}",
+                  initial=start_epoch, total=hp["epochs"], unit="ep", dynamic_ncols=True, mininterval=1)
+    for epoch in epochs:
         model.train()
         t0, running = time.time(), 0.0
-        for x, y in train_loader:
+        bar = tqdm(train_loader, desc=f"  epoch {epoch + 1}", leave=False, dynamic_ncols=True, mininterval=1)
+        for i, (x, y) in enumerate(bar, 1):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             with torch.autocast(device.type, dtype=torch.bfloat16, enabled=args.amp):
                 pred = model(x)
@@ -189,6 +193,7 @@ def main():
             opt.step()
             sched.step()
             running += loss.item()
+            bar.set_postfix(loss=f"{running / i:.5f}")
 
         msg = (f"epoch {epoch + 1}/{hp['epochs']}  train_loss {running / len(train_loader):.5f}  "
                f"lr {sched.get_last_lr()[0]:.2e}  {time.time() - t0:.0f}s")
@@ -201,7 +206,8 @@ def main():
                 save(best_path, epoch, dict(test_mse=mse, test_mae=mae))
                 msg += "  *"
         save(last_path, epoch)
-        print(msg, flush=True)
+        epochs.set_postfix(best_mse=f"{best:.4f}")
+        tqdm.write(msg)
 
     print(f"done. best test MSE {best:.4f} -> {best_path}")
 
