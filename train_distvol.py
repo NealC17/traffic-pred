@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+from devices import pick_device
 from distvol import DistVolNet, DistVolLoss
 from baseline_cnn import BaselineCNN
 
@@ -135,7 +136,7 @@ def main():
                     num_workers=args.workers, persistent_workers=args.workers > 0)
     vl = DataLoader(test, args.batch_size, num_workers=args.workers)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = pick_device()
     if args.model == "cnn":
         model = BaselineCNN(args.tin, args.tout, C, H, W, args.width, args.blocks).to(device)
     else:

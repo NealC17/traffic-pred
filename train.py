@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from devices import pick_device
 import data
 from predformer import PredFormer, CONFIGS, VARIANTS
 
@@ -58,14 +59,6 @@ def get_splits(name, t_in=4, t_out=4):
             raise SystemExit("Moving MNIST sequences are fixed at 10 in -> 10 out")
         return data.moving_mnist_splits()
     raise ValueError(name)
-
-
-def pick_device():
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 @torch.no_grad()

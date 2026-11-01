@@ -6,6 +6,7 @@
 #
 # Must be *sourced*: a script run as ./setup.sh executes in a child shell,
 # so the activation would vanish when it exits.
+# Works in bash (Linux) and zsh (the default shell on macOS).
 #
 # What it does (safe to re-run; skips work that's already done):
 #   1. checks for Python >= 3.10
@@ -15,23 +16,32 @@
 #   5. clones the official PredFormer repo into PredFormer/ (if missing)
 #   6. activates .env/
 
-# --- must be sourced ---------------------------------------------------------
-if ! (return 0 2>/dev/null); then
-    echo "Run this with:  source ${0##*/}"
-    echo "(running it directly can't activate the environment in your shell)"
-    exit 1
+# --- must be sourced; find this file's path (bash or zsh) ----------------------
+if [ -n "${ZSH_VERSION:-}" ]; then
+    case "${ZSH_EVAL_CONTEXT:-}" in
+        *:file*) ;;
+        *) echo "Run this with:  source setup.sh"; exit 1 ;;
+    esac
+    eval '_setup_self=${(%):-%x}'          # zsh-only syntax, hidden from bash's parser
+else
+    if ! (return 0 2>/dev/null); then
+        echo "Run this with:  source ${0##*/}"
+        echo "(running it directly can't activate the environment in your shell)"
+        exit 1
+    fi
+    _setup_self="${BASH_SOURCE[0]}"
 fi
 
 _setup_env() {
     local root venv py force=0 req stamp want have
-    root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    root="$(cd "$(dirname "$_setup_self")" && pwd)"
     venv="$root/.env"
     req="$root/requirements.txt"
     stamp="$venv/.requirements.sha256"
     [ "${1:-}" = "--force" ] && force=1
 
     # 1. Python >= 3.10
-    for py in python3.12 python3.11 python3.10 python3 python; do
+    for py in python3.12 python3.13 python3.11 python3.10 python3 python; do
         if command -v "$py" >/dev/null 2>&1 &&
            "$py" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
             break
@@ -39,7 +49,11 @@ _setup_env() {
         py=""
     done
     if [ -z "$py" ]; then
-        echo "[setup] Python 3.10+ not found; install it and re-run." >&2
+        echo "[setup] Python 3.10+ not found." >&2
+        if [ "$(uname)" = Darwin ]; then
+            echo "        macOS's built-in python3 is too old; install a newer one:  brew install python@3.12" >&2
+        fi
+        echo "        Then re-run:  source setup.sh" >&2
         return 1
     fi
 
@@ -50,7 +64,7 @@ _setup_env() {
             rm -rf "$venv"          # don't leave a half-built env (python but no pip) behind
             echo "[setup] venv creation failed. On Debian/Ubuntu install the venv package:" >&2
             echo "          sudo apt install python$("$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])')-venv" >&2
-            echo "        then run: source ${BASH_SOURCE[0]##*/}" >&2
+            echo "        then run: source setup.sh" >&2
             return 1
         fi
     fi
@@ -62,7 +76,7 @@ _setup_env() {
         if ! "$venv/bin/python" -m ensurepip --upgrade >/dev/null 2>&1; then
             echo "[setup] couldn't add pip to .env/. On Debian/Ubuntu install the venv package:" >&2
             echo "          sudo apt install python$("$venv/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])')-venv" >&2
-            echo "        then run: source ${BASH_SOURCE[0]##*/}   (it repairs .env/ in place)" >&2
+            echo "        then run: source setup.sh   (it repairs .env/ in place)" >&2
             return 1
         fi
         rm -f "$stamp"              # packages were never installed into this env
@@ -74,7 +88,11 @@ _setup_env() {
         echo "[setup] $req not found" >&2
         return 1
     fi
-    want="$(sha256sum "$req" | cut -d' ' -f1)"
+    if command -v sha256sum >/dev/null 2>&1; then     # Linux
+        want="$(sha256sum "$req" | cut -d' ' -f1)"
+    else                                              # macOS
+        want="$(shasum -a 256 "$req" | cut -d' ' -f1)"
+    fi
     have="$(cat "$stamp" 2>/dev/null)"
     if [ "$force" = 1 ] || [ "$want" != "$have" ]; then
         echo "[setup] installing requirements.txt (first time can take a few minutes: torch is large)"
@@ -117,6 +135,6 @@ print(f"[setup] torch {torch.__version__}, device: {dev}")
 EOF
 }
 
-if _setup_env "$@"; then unset -f _setup_env; return 0; fi
-unset -f _setup_env
+if _setup_env "$@"; then unset -f _setup_env; unset _setup_self; return 0; fi
+unset -f _setup_env; unset _setup_self
 return 1

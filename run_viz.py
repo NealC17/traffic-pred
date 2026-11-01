@@ -19,7 +19,8 @@ from viz_flow import browse, plot_prediction, plot_horizon
 
 
 def load_model(path, device=None):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    from devices import pick_device
+    device = device or pick_device()
     ck = torch.load(path, map_location=device)
     # official-repo configs use keys like 'height'/'Ndepth' instead of 'in_shape'
     if ck.get("impl") == "official" or "Ndepth" in ck["config"]:

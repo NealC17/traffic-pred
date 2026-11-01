@@ -32,7 +32,7 @@
 # Progress: each run shows an overall epoch bar plus a per-epoch batch bar (tqdm).
 # The .log files keep the per-epoch summary lines; bar redraws are stripped from them.
 
-set -uo pipefail
+set -o pipefail      # no -u: macOS's bash 3.2 treats empty arrays as unbound
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # --- options -----------------------------------------------------------------
@@ -60,22 +60,31 @@ if [ -z "${VIRTUAL_ENV:-}" ] && [ -f .env/bin/activate ]; then
     source .env/bin/activate
 fi
 PY="${PYTHON:-python}"
+
+# Device: CUDA -> Apple MPS -> CPU is picked inside the Python scripts (devices.py).
+# Ops that MPS doesn't implement fall back to the CPU instead of crashing.
+export PYTORCH_ENABLE_MPS_FALLBACK=1
+# Data loading workers: macOS starts workers with "spawn", which re-imports data.py and
+# copies the arrays into every worker. Batches here are tiny, so load in the main process.
+WORKERS=2
+[ "$(uname)" = Darwin ] && WORKERS=0
 if ! "$PY" -c "import torch" 2>/dev/null; then
     echo "PyTorch not found. Run:  source setup.sh"
     exit 1
 fi
 
 mkdir -p checkpoints/logs
+ESC="$(printf '\033')"     # for stripping terminal escape codes from logs (portable sed)
 
 # --- run table: name | default epochs | command (EPOCHS_ and SAVE_ filled in below) ---
 RUNS=(
-    "cnn_mse|50|train_distvol.py --model cnn --loss mse --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_"
-    "cnn_sinkhorn|50|train_distvol.py --model cnn --loss sinkhorn --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_"
-    "distvol_mse|50|train_distvol.py --model distvol --loss mse --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_"
-    "distvol_sinkhorn|50|train_distvol.py --model distvol --loss sinkhorn --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_"
+    "cnn_mse|50|train_distvol.py --model cnn --loss mse --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ --workers $WORKERS"
+    "cnn_sinkhorn|50|train_distvol.py --model cnn --loss sinkhorn --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ --workers $WORKERS"
+    "distvol_mse|50|train_distvol.py --model distvol --loss mse --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ --workers $WORKERS"
+    "distvol_sinkhorn|50|train_distvol.py --model distvol --loss sinkhorn --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ --workers $WORKERS"
     "mlp_mse|50|baseline_mlp.py --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_"
-    "predformer_mse|200|train.py --dataset taxibj --impl mine --t-in $TIN --t-out $TOUT --epochs EPOCHS_ --out checkpoints/runs"
-    "predformer_official_mse|200|train.py --dataset taxibj --impl official --t-in $TIN --t-out $TOUT --epochs EPOCHS_ --out checkpoints/runs"
+    "predformer_mse|200|train.py --dataset taxibj --impl mine --t-in $TIN --t-out $TOUT --epochs EPOCHS_ --out checkpoints/runs --workers $WORKERS"
+    "predformer_official_mse|200|train.py --dataset taxibj --impl official --t-in $TIN --t-out $TOUT --epochs EPOCHS_ --out checkpoints/runs --workers $WORKERS"
 )
 
 selected() {   # run name matches any filter (or there are no filters)
@@ -116,7 +125,7 @@ for r in "${RUNS[@]}"; do
     # shellcheck disable=SC2086
     # Bars go to the terminal as usual; the log keeps only finished lines
     # (tqdm redraws with carriage returns, so keep the text after the last \r).
-    if "$PY" -u $cmd 2>&1 | tee >(tr '\r' '\n' | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | grep -v -E '^\s*$|%\|' > "$log"); then
+    if "$PY" -u $cmd 2>&1 | tee >(tr '\r' '\n' | sed "s/${ESC}\[[0-9;]*[A-Za-z]//g" | grep -v -E '^[[:space:]]*$|%\|' > "$log"); then
         if [[ "$name" == predformer* ]]; then
             # train.py writes checkpoints/runs/<run>/best.pt; copy it next to the others
             run_dir="taxibj"

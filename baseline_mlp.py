@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import time
 from tqdm import tqdm
+from devices import pick_device
 class MLP(nn.Module):
     """Fully connected baseline. Flattens every input value (T_in x C x H x W =
     4 x 2 x 32 x 32 = 8192 for TaxiBJ) into one vector, passes it through
@@ -57,7 +58,7 @@ def fit(model, train_set, test_set, epochs=50, batch_size=16, lr=1e-3,
     train.py uses for PredFormer, so the comparison is fair). Evaluates on
     test_set every epoch; returns the model with the best test-MSE weights.
     `save`: optional path to store those weights."""
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or pick_device()
     model = model.to(device)
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
                               drop_last=True, num_workers=workers)
