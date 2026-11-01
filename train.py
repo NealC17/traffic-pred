@@ -29,6 +29,7 @@ from tqdm import tqdm
 
 from devices import pick_device
 import data
+from tracking import Tracker, CopyLast, evaluate, fmt
 from predformer import PredFormer, CONFIGS, VARIANTS
 
 
@@ -61,25 +62,6 @@ def get_splits(name, t_in=4, t_out=4):
     raise ValueError(name)
 
 
-@torch.no_grad()
-def evaluate(model, loader, device, amp):
-    """Returns (MSE, MAE) per frame: squared/absolute error summed over the
-    pixels of one frame, averaged over all predicted frames (OpenSTL-style),
-    in the [0, 1] scale data.py produces."""
-    model.eval()
-    se = ae = 0.0
-    n = 0
-    for x, y in tqdm(loader, desc="  eval", leave=False, dynamic_ncols=True, mininterval=1):
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
-            pred = model(x)
-        pred = pred.float().clamp(0, 1)
-        se += (pred - y).pow(2).sum(dim=(2, 3, 4)).sum().item()
-        ae += (pred - y).abs().sum(dim=(2, 3, 4)).sum().item()
-        n += y.shape[0] * y.shape[1]
-    return se / n, ae / n
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", choices=list(CONFIGS), default="taxibj")
@@ -99,6 +81,7 @@ def main():
     ap.add_argument("--resume", action="store_true", help="continue from last.pt")
     ap.add_argument("--out", default="checkpoints")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-wandb", action="store_true", help="don't log to Weights & Biases")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -148,6 +131,18 @@ def main():
     print(f"PredFormer {variant} ({args.impl}), {t_in} in -> {t_out} out: "
           f"{sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params")
 
+    # raw-count conversion for the shared metrics: TaxiBJ min-max scale, Moving MNIST /255
+    lo, hi = data._flow_scale if args.dataset == "taxibj" else (0.0, 255.0)
+    tracker = Tracker(
+        name=f"predformer{'_official' if args.impl == 'official' else ''}_mse"
+             + ("" if (t_in, t_out) == (t_def, t_def) else f"_in{t_in}_out{t_out}"),
+        config={**{k: v for k, v in model_cfg.items() if isinstance(v, (int, float, str))},
+                **hp,
+                **dict(model="predformer", impl=args.impl, variant=variant, loss="mse",
+                       dataset=args.dataset, t_in=t_in, t_out=t_out,
+                       params=sum(p.numel() for p in model.parameters()))},
+        job_type="predformer", enabled=not args.no_wandb)
+
     opt = torch.optim.AdamW(model.parameters(), lr=hp["lr"], weight_decay=hp["weight_decay"])
     total_steps = hp["epochs"] * len(train_loader)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=hp["lr"], total_steps=total_steps)
@@ -169,9 +164,18 @@ def main():
                         t_in=t_in, t_out=t_out,
                         dataset=args.dataset, **(extra or {})), path)
 
+    # ---- reference + live progress ----
+    tracker.log_reference(evaluate(CopyLast(t_out), test_loader, device, hi - lo, lo,
+                                   desc="  copy-last reference"))
+    tracker.start(hp["epochs"], len(train_loader), start_epoch)
+
     # ---- train ----
     epochs = tqdm(range(start_epoch, hp["epochs"]), desc=f"PredFormer {variant}",
                   initial=start_epoch, total=hp["epochs"], unit="ep", dynamic_ncols=True, mininterval=1)
+    if start_epoch and os.path.exists(best_path):        # resumed: report the earlier best too
+        ck_best = torch.load(best_path, map_location="cpu")
+        if "test_metrics" in ck_best:
+            tracker.log_best(ck_best["epoch"] + 1, ck_best["test_metrics"])
     for epoch in epochs:
         model.train()
         t0, running = time.time(), 0.0
@@ -187,22 +191,29 @@ def main():
             sched.step()
             running += loss.item()
             bar.set_postfix(loss=f"{running / i:.5f}")
+            tracker.step(loss.item(), sched.get_last_lr()[0])
 
         msg = (f"epoch {epoch + 1}/{hp['epochs']}  train_loss {running / len(train_loader):.5f}  "
                f"lr {sched.get_last_lr()[0]:.2e}  {time.time() - t0:.0f}s")
 
         if (epoch + 1) % args.eval_every == 0 or epoch + 1 == hp["epochs"]:
-            mse, mae = evaluate(model, test_loader, device, args.amp)
-            msg += f"  | test MSE {mse:.4f}  MAE {mae:.4f}"
-            if mse < best:
-                best = mse
-                save(best_path, epoch, dict(test_mse=mse, test_mae=mae))
+            m = evaluate(model, test_loader, device, hi - lo, lo)
+            msg += "  | " + fmt(m)
+            tracker.log_eval(epoch + 1, m, train_loss=running / len(train_loader),
+                             epoch_time=time.time() - t0, model=model, dataset=test_set,
+                             device=device, span=hi - lo, lo=lo, last=epoch + 1 == hp["epochs"])
+            if m["mse_frame"] < best:                    # same criterion as before (per-frame MSE)
+                best = m["mse_frame"]
+                save(best_path, epoch, dict(test_mse=m["mse_frame"], test_mae=m["mae_frame"],
+                                            test_metrics=m))
+                tracker.log_best(epoch + 1, m)
                 msg += "  *"
         save(last_path, epoch)
         epochs.set_postfix(best_mse=f"{best:.4f}")
         tqdm.write(msg)
 
     print(f"done. best test MSE {best:.4f} -> {best_path}")
+    tracker.finish()
 
 
 if __name__ == "__main__":

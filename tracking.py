@@ -1,0 +1,300 @@
+"""
+Shared evaluation + Weights & Biases logging for every model.
+
+Every training script scores its model with evaluate() below, so all runs report the same
+metrics whatever loss they were trained with, and their W&B charts overlay.
+
+Metrics (predictions are clamped to the data range [0, 1] first, as in OpenSTL):
+    mse, mae               per cell, in the [0, 1] scale data.py produces
+    mse_frame, mae_frame   summed over a frame's cells, averaged over frames
+                           (OpenSTL / PredFormer-paper convention)
+    rmse_flow, mae_flow    per cell, in raw taxi counts
+    sinkhorn               debiased Sinkhorn divergence between the predicted and actual map,
+                           each normalised to a distribution: errors in WHERE traffic goes
+                           (same function and eps / iters as DistVolLoss)
+    volume_err             relative error of each map's total count, sum|N_hat - N| / sum N:
+                           errors in HOW MUCH traffic there is
+    volume_mae_flow        mean |N_hat - N| per map, in taxi counts
+    mse_t1..mse_tT,        the same per prediction step (t+1 = first future frame), to show
+    sinkhorn_t1.., volume_err_t1..   how error grows with the horizon
+
+Reference: copy-last-frame (predict every future frame = the last input frame), scored with
+the same evaluate(). Each run stores it as copy_last/* and reports its own metrics relative
+to it (vs_copy_last/*: < 1 means better than copying). train_all.sh also logs it as its own
+W&B run named copy_last, a flat line on every test chart.
+
+W&B, per run:
+    progress/percent, progress/epoch, progress/eta_min, progress/it_per_s,
+    train/loss, train/lr              ~20 points per epoch: the live training progress
+    test/<every metric above>         once per evaluated epoch
+    epoch/train_loss, epoch/time_s    once per epoch
+    predictions                       actual | predicted | |error| heatmaps for one fixed test
+                                      window (t+1 and last step), every VIZ_EVERY evaluations
+    summary: mse, sinkhorn, volume_err   final numbers = the saved (best-epoch) checkpoint
+             best/<metric>, copy_last/<metric>, vs_copy_last/<metric>, best_epoch
+In the W&B runs table, add the progress/percent column to see how far each run is.
+
+Environment variables (all optional): WANDB_PROJECT (default "traffic-pred"), WANDB_ENTITY,
+WANDB_NAME, WANDB_RUN_GROUP, WANDB_MODE ("offline" to log locally and `wandb sync` later,
+"disabled" to turn W&B off). Without W&B installed or reachable, training still runs.
+"""
+
+import io
+import os
+import time
+
+import numpy as np
+import torch
+import torch.nn as nn
+from tqdm import tqdm
+
+from distvol import split_flow
+from sinkhorn import sinkhorn_divergence
+
+SINKHORN_EPS = 0.01        # same defaults as DistVolLoss / train_distvol.py
+SINKHORN_ITERS = 30
+PROGRESS_POINTS = 20       # progress/train-loss points logged per epoch
+VIZ_EVERY = 10             # evaluations between prediction images (plus the first and the last)
+HEADLINE = ("mse", "sinkhorn", "volume_err")
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+def sinkhorn_per_map(pred, y, eps=SINKHORN_EPS, iters=SINKHORN_ITERS):
+    """Sinkhorn divergence for every map, shaped like pred's leading dims (B, T, C).
+    Negative predictions are clipped to 0 (mass can't be negative)."""
+    H, W = y.shape[-2:]
+    p_hat, _ = split_flow(pred.float().clamp_min(0))
+    p, _ = split_flow(y.float().clamp_min(0))
+    s = sinkhorn_divergence(p_hat.reshape(-1, H, W), p.reshape(-1, H, W), eps=eps, iters=iters)
+    return s.reshape(y.shape[:-2])
+
+
+class CopyLast(nn.Module):
+    """Reference model: every future frame = the last observed frame."""
+
+    def __init__(self, t_out):
+        super().__init__()
+        self.t_out = t_out
+
+    def forward(self, x):
+        return x[:, -1:].expand(-1, self.t_out, *x.shape[2:])
+
+
+@torch.no_grad()
+def evaluate(model, loader, device, span, lo=0.0, desc="  eval"):
+    """All test metrics (see module docstring). span, lo: the data's min-max scaling
+    (raw = scaled * span + lo), used for the count-based metrics. Returns a dict of floats."""
+    model.eval()
+    T = None
+    se_t = ae_t = sk_t = vabs_t = vtot_t = None
+    n_cells = n_frames = n_maps = 0
+    for x, y in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True, mininterval=1):
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        pred = model(x)
+        if isinstance(pred, tuple):                       # forward(..., return_parts=True)
+            pred = pred[0]
+        pred = pred.float().clamp(0, 1)
+        B, T, C, H, W = y.shape
+        if se_t is None:
+            se_t, ae_t, sk_t, vabs_t, vtot_t = (torch.zeros(T, dtype=torch.float64) for _ in range(5))
+        d = pred - y
+        se_t += d.pow(2).sum(dim=(0, 2, 3, 4)).double().cpu()
+        ae_t += d.abs().sum(dim=(0, 2, 3, 4)).double().cpu()
+        sk_t += sinkhorn_per_map(pred, y).sum(dim=(0, 2)).double().cpu()
+        # totals per map in raw counts: sum(scaled) * span + lo * H * W
+        N_hat = pred.sum(dim=(-2, -1)) * span + lo * H * W            # (B, T, C)
+        N = y.sum(dim=(-2, -1)) * span + lo * H * W
+        vabs_t += (N_hat - N).abs().sum(dim=(0, 2)).double().cpu()
+        vtot_t += N.abs().sum(dim=(0, 2)).double().cpu()
+        n_cells += y.numel()
+        n_frames += B * T
+        n_maps += B * T * C
+
+    cells_t, maps_t = n_cells / T, n_maps / T                       # per prediction step
+    cells_per_frame = n_cells / n_frames
+    mse, mae = se_t.sum().item() / n_cells, ae_t.sum().item() / n_cells
+    m = {
+        "mse": mse,
+        "mae": mae,
+        "mse_frame": mse * cells_per_frame,
+        "mae_frame": mae * cells_per_frame,
+        "rmse_flow": float(np.sqrt(mse)) * span,
+        "mae_flow": mae * span,
+        "sinkhorn": sk_t.sum().item() / n_maps,
+        "volume_err": vabs_t.sum().item() / max(vtot_t.sum().item(), 1e-12),
+        "volume_mae_flow": vabs_t.sum().item() / n_maps,
+    }
+    for t in range(T):
+        m[f"mse_t{t + 1}"] = se_t[t].item() / cells_t
+        m[f"sinkhorn_t{t + 1}"] = sk_t[t].item() / maps_t
+        m[f"volume_err_t{t + 1}"] = vabs_t[t].item() / max(vtot_t[t].item(), 1e-12)
+    return m
+
+
+def fmt(m):
+    """One-line summary of evaluate()'s dict for the console."""
+    return (f"test MSE {m['mse']:.5f}  Sinkhorn {m['sinkhorn']:.5f}  volume err {m['volume_err']:.2%}  "
+            f"| MAE {m['mae_flow']:.3f} RMSE {m['rmse_flow']:.3f} (counts)  frame MSE {m['mse_frame']:.3f}")
+
+
+# ---------------------------------------------------------------------------
+# W&B
+# ---------------------------------------------------------------------------
+class Tracker:
+    """Everything a run sends to W&B (see module docstring). With W&B disabled, missing or
+    offline it still prints the final line train_all.sh collects into results.tsv."""
+
+    def __init__(self, name, config, job_type, enabled=True):
+        self.run = None
+        self.wandb = None
+        self.name = os.environ.get("WANDB_NAME", name)
+        self.best = None                  # (epoch, metrics) of the saved checkpoint
+        self.reference = None             # copy-last-frame metrics
+        self._evals = 0
+        self._total = 0
+        if not enabled or os.environ.get("WANDB_MODE") == "disabled":
+            return
+        try:
+            import wandb
+        except ImportError:
+            print("[wandb] not installed (pip install wandb); continuing without it")
+            return
+        self.wandb = wandb
+        kwargs = dict(project=os.environ.get("WANDB_PROJECT", "traffic-pred"), name=self.name,
+                      group=os.environ.get("WANDB_RUN_GROUP"), job_type=job_type, config=config)
+        try:
+            self.run = wandb.init(**kwargs)
+        except Exception as e:                                # no login / no network
+            print(f"[wandb] couldn't start an online run ({e}).\n"
+                  f"[wandb] logging offline instead; upload later with:  wandb sync wandb/offline-run-*")
+            self.run = wandb.init(mode="offline", **kwargs)
+        wandb.define_metric("progress/step")
+        wandb.define_metric("progress/*", step_metric="progress/step")
+        wandb.define_metric("train/*", step_metric="progress/step")
+        wandb.define_metric("epoch")
+        wandb.define_metric("test/*", step_metric="epoch")
+        wandb.define_metric("epoch/*", step_metric="epoch")
+        wandb.define_metric("predictions", step_metric="epoch")
+
+    # ---- reference ---------------------------------------------------------
+    def log_reference(self, metrics):
+        """Copy-last-frame metrics for this run's test set (stored in the run summary)."""
+        self.reference = metrics
+        print(f"copy-last-frame reference: {fmt(metrics)}", flush=True)
+        if self.run is not None:
+            for k, v in metrics.items():
+                self.run.summary[f"copy_last/{k}"] = v
+
+    # ---- live training progress --------------------------------------------
+    def start(self, total_epochs, steps_per_epoch, start_epoch=0):
+        self._total = total_epochs * steps_per_epoch
+        self._spe = steps_per_epoch
+        self._every = max(1, steps_per_epoch // PROGRESS_POINTS)
+        self._step = start_epoch * steps_per_epoch
+        self._first = self._step
+        self._t0 = time.time()
+        self._loss_sum, self._loss_n = 0.0, 0
+
+    def step(self, loss, lr):
+        """Call once per training step; logs ~PROGRESS_POINTS points per epoch."""
+        self._step += 1
+        self._loss_sum += loss
+        self._loss_n += 1
+        if self.run is None or (self._step % self._every and self._step != self._total):
+            return
+        done = self._step - self._first
+        rate = done / max(time.time() - self._t0, 1e-9)
+        self.run.log({
+            "progress/step": self._step,
+            "progress/percent": 100.0 * self._step / self._total,
+            "progress/epoch": self._step / self._spe,
+            "progress/eta_min": (self._total - self._step) / max(rate, 1e-9) / 60,
+            "progress/it_per_s": rate,
+            "train/loss": self._loss_sum / self._loss_n,          # mean since the last point
+            "train/lr": lr,
+        })
+        self._loss_sum, self._loss_n = 0.0, 0
+
+    # ---- per evaluation ------------------------------------------------------
+    def log_eval(self, epoch, metrics, train_loss=None, epoch_time=None, model=None,
+                 dataset=None, device=None, span=1.0, lo=0.0, last=False):
+        if self.run is None:
+            return
+        d = {"epoch": epoch, **{f"test/{k}": v for k, v in metrics.items()}}
+        if train_loss is not None:
+            d["epoch/train_loss"] = train_loss
+        if epoch_time is not None:
+            d["epoch/time_s"] = epoch_time
+        if model is not None and dataset is not None and (self._evals % VIZ_EVERY == 0 or last):
+            fig = prediction_figure(model, dataset, device, span, lo, epoch)
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=80)
+            buf.seek(0)
+            from PIL import Image
+            d["predictions"] = self.wandb.Image(Image.open(buf),
+                                                caption=f"test window {len(dataset) // 2}, epoch {epoch}")
+        self._evals += 1
+        self.run.log(d)
+
+    def log_best(self, epoch, metrics):
+        """Call when this epoch's weights become the saved checkpoint."""
+        self.best = (epoch, metrics)
+
+    def finish(self):
+        """Print the final line (train_all.sh reads it) and fill in the W&B run summary."""
+        if self.best is not None:
+            epoch, m = self.best
+            vals = "  ".join(f"{k}={m[k]:.6f}" for k in HEADLINE)
+            print(f"FINAL {self.name}  {vals}  best_epoch={epoch}", flush=True)
+            if self.run is not None:
+                s = self.run.summary
+                s["best_epoch"] = epoch
+                for k in HEADLINE:
+                    s[k] = m[k]
+                for k, v in m.items():
+                    s[f"best/{k}"] = v
+                if self.reference is not None:
+                    for k in HEADLINE:
+                        ref = self.reference[k]
+                        s[f"vs_copy_last/{k}"] = m[k] / ref if ref else float("nan")
+        if self.run is not None:
+            self.run.summary["progress/percent"] = 100.0
+            self.run.finish()
+
+
+@torch.no_grad()
+def prediction_figure(model, dataset, device, span, lo, epoch, idx=None):
+    """Inflow / outflow at t+1 and the last step: actual | predicted | |error|, in counts."""
+    from matplotlib.figure import Figure
+    idx = len(dataset) // 2 if idx is None else idx
+    model.eval()
+    x, y = dataset[idx]
+    pred = model(x.unsqueeze(0).to(device))
+    if isinstance(pred, tuple):
+        pred = pred[0]
+    pred = pred.squeeze(0).float().clamp(0, 1).cpu()
+    to_counts = lambda t: (t * span + lo).numpy()
+    y, pred = to_counts(y), to_counts(pred)
+    T, C = y.shape[:2]
+    names = ["Inflow", "Outflow"] if C == 2 else [f"ch{c}" for c in range(C)]
+    rows = [(t, c) for t in sorted({0, T - 1}) for c in range(C)]
+
+    fig = Figure(figsize=(10, 3.2 * len(rows)), constrained_layout=True)
+    axes = fig.subplots(len(rows), 3, squeeze=False)
+    for r, (t, c) in enumerate(rows):
+        vmax = max(y[t, c].max(), pred[t, c].max())
+        err = np.abs(pred[t, c] - y[t, c])
+        a = axes[r, 0].imshow(y[t, c], cmap="viridis", vmin=0, vmax=vmax)
+        axes[r, 1].imshow(pred[t, c], cmap="viridis", vmin=0, vmax=vmax)
+        e = axes[r, 2].imshow(err, cmap="Reds", vmin=0)
+        axes[r, 0].set_title(f"Actual {names[c]}, t+{t + 1}")
+        axes[r, 1].set_title(f"Predicted {names[c]}, t+{t + 1}")
+        axes[r, 2].set_title(f"|Error|  MAE {err.mean():.1f}")
+        fig.colorbar(a, ax=axes[r, :2].tolist(), shrink=0.8)
+        fig.colorbar(e, ax=axes[r, 2], shrink=0.8)
+    for ax in axes.flat:
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle(f"epoch {epoch}")
+    return fig

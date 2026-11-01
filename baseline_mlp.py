@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 import time
 from tqdm import tqdm
 from devices import pick_device
+from tracking import Tracker, CopyLast, evaluate, fmt
 class MLP(nn.Module):
     """Fully connected baseline. Flattens every input value (T_in x C x H x W =
     4 x 2 x 32 x 32 = 8192 for TaxiBJ) into one vector, passes it through
@@ -36,28 +37,15 @@ class MLP(nn.Module):
 
 
 
-@torch.no_grad()
-def evaluate(model, loader, device):
-    """(MSE, MAE) per frame in the [0, 1] scale, same definition as train.py:
-    error summed over one frame's pixels, averaged over all predicted frames."""
-    model.eval()
-    se = ae = 0.0
-    n = 0
-    for x, y in tqdm(loader, desc="  eval", leave=False, dynamic_ncols=True, mininterval=1):
-        x, y = x.to(device), y.to(device)
-        pred = model(x).clamp(0, 1)
-        se += (pred - y).pow(2).sum(dim=(2, 3, 4)).sum().item()
-        ae += (pred - y).abs().sum(dim=(2, 3, 4)).sum().item()
-        n += y.shape[0] * y.shape[1]
-    return se / n, ae / n
- 
- 
 def fit(model, train_set, test_set, epochs=50, batch_size=16, lr=1e-3,
-        weight_decay=1e-2, device=None, save=None, workers=0):
+        weight_decay=1e-2, device=None, save=None, workers=0, run_name=None, wandb=True):
     """Train with MSE loss, AdamW and a one-cycle LR schedule (the same recipe
     train.py uses for PredFormer, so the comparison is fair). Evaluates on
     test_set every epoch; returns the model with the best test-MSE weights.
-    `save`: optional path to store those weights."""
+    `save`: optional path to store those weights.
+    Logs to Weights & Biases (see tracking.py) unless wandb=False."""
+    import data
+    lo, hi = data._flow_scale or (0.0, 1.0)
     device = device or pick_device()
     model = model.to(device)
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
@@ -69,6 +57,16 @@ def fit(model, train_set, test_set, epochs=50, batch_size=16, lr=1e-3,
     print(f"{type(model).__name__}: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params, "
           f"{len(train_set)} train / {len(test_set)} test, device={device}")
  
+    tracker = Tracker(
+        name=run_name or "mlp_mse", job_type="mlp", enabled=wandb,
+        config=dict(model=type(model).__name__.lower(), loss="mse", epochs=epochs,
+                    batch_size=batch_size, lr=lr, weight_decay=weight_decay,
+                    t_in=getattr(model, "t_in", None), t_out=getattr(model, "t_out", None),
+                    params=sum(p.numel() for p in model.parameters())))
+    tracker.log_reference(evaluate(CopyLast(model.t_out), test_loader, device, hi - lo, lo,
+                                   desc="  copy-last reference"))
+    tracker.start(epochs, len(train_loader))
+
     best, best_state = float("inf"), None
     bar_ep = tqdm(range(epochs), desc=type(model).__name__, unit="ep", dynamic_ncols=True, mininterval=1)
     for epoch in bar_ep:
@@ -77,24 +75,31 @@ def fit(model, train_set, test_set, epochs=50, batch_size=16, lr=1e-3,
         bar = tqdm(train_loader, desc=f"  epoch {epoch + 1}", leave=False, dynamic_ncols=True, mininterval=1)
         for i, (x, y) in enumerate(bar, 1):
             x, y = x.to(device), y.to(device)
-            loss = F.mse_loss(model(x), y)
+            pred = model(x)
+            loss = F.mse_loss(pred, y)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             sched.step()
             running += loss.item()
             bar.set_postfix(loss=f"{running / i:.5f}")
-        mse, mae = evaluate(model, test_loader, device)
+            tracker.step(loss.item(), sched.get_last_lr()[0])
+        m = evaluate(model, test_loader, device, hi - lo, lo)
+        tracker.log_eval(epoch + 1, m, train_loss=running / len(train_loader),
+                         epoch_time=time.time() - t0, model=model, dataset=test_set,
+                         device=device, span=hi - lo, lo=lo, last=epoch + 1 == epochs)
         mark = ""
-        if mse < best:
-            best, mark = mse, "  *"
+        if m["mse_frame"] < best:                         # same criterion as before (per-frame MSE)
+            best, mark = m["mse_frame"], "  *"
+            tracker.log_best(epoch + 1, m)
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             if save:
                 torch.save(best_state, save)
         bar_ep.set_postfix(best_mse=f"{best:.4f}")
         tqdm.write(f"epoch {epoch + 1}/{epochs}  train_loss {running / len(train_loader):.5f}  "
-                   f"test MSE {mse:.4f}  MAE {mae:.4f}  {time.time() - t0:.0f}s{mark}")
+                   f"{fmt(m)}  {time.time() - t0:.0f}s{mark}")
  
+    tracker.finish()
     model.load_state_dict(best_state)
     model.eval()
     return model
@@ -114,6 +119,7 @@ if __name__ == "__main__":
     ap.add_argument("--hidden", type=int, default=512)
     ap.add_argument("--depth", type=int, default=3)
     ap.add_argument("--save", default="checkpoints/mlp_mse.pt")
+    ap.add_argument("--no-wandb", action="store_true", help="don't log to Weights & Biases")
     args = ap.parse_args()
 
     if os.path.dirname(args.save):
@@ -121,4 +127,5 @@ if __name__ == "__main__":
     train_set, test_set = taxibj_splits(args.tin, args.tout)
     fit(MLP(t_in=args.tin, t_out=args.tout, hidden=args.hidden, depth=args.depth),
         train_set, test_set, epochs=args.epochs, batch_size=args.batch_size,
-        lr=args.lr, save=args.save)
+        lr=args.lr, save=args.save, wandb=not args.no_wandb,
+        run_name="mlp_mse" + ("" if (args.tin, args.tout) == (4, 4) else f"_in{args.tin}_out{args.tout}"))

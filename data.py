@@ -1,6 +1,11 @@
 """
 Loads every .npy under datasets/ and wraps each one as a torch Dataset.
-Downloads Moving MNIST first if it's missing.
+Moving MNIST is NOT downloaded on import (TaxiBJ work never waits on it); it is
+fetched the first time moving_mnist_splits() needs it, or explicitly with
+
+    python -c "import data; data.download_moving_mnist()"
+
+On a cluster whose compute nodes have no internet, run that once on a login node.
 
     arrays   : key -> numpy array (memory-mapped where possible)
     datasets : key -> torch.utils.data.Dataset   (same keys as `arrays`)
@@ -16,27 +21,23 @@ Train/test splits matching the paper: taxibj_splits(), moving_mnist_splits().
 
 import os
 import glob
+import socket
+import time
+import urllib.error
 import urllib.request
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset, TensorDataset, ConcatDataset
 
-ROOT = "datasets"
+# datasets/ next to this file, so scripts work from any working directory (e.g. Slurm jobs)
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets")
 MMNIST_URL = "http://www.cs.toronto.edu/~nitish/unsupervised_video/mnist_test_seq.npy"
 TAXIBJ_PREFIX = "TaxiBJ-TaxiBJ2"      # flow files; excludes TaxiBJ-TaxiBJext*
 TAXIBJ_TEST_FRAMES = 28 * 48          # last 4 weeks of half-hour slots
 
 
-# ---------------------------------------------------------------------------
-# Download Moving MNIST
-# ---------------------------------------------------------------------------
 mnist_path = os.path.join(ROOT, "MovingMNIST", "mnist_test_seq.npy")
-if not os.path.exists(mnist_path):
-    os.makedirs(os.path.dirname(mnist_path), exist_ok=True)
-    print("Downloading Moving MNIST (~800 MB)...")
-    urllib.request.urlretrieve(MMNIST_URL, mnist_path + ".part")
-    os.replace(mnist_path + ".part", mnist_path)
 
 
 # ---------------------------------------------------------------------------
@@ -65,9 +66,10 @@ def _decompress_all():
             arr = np.lib.format.read_array(f, allow_pickle=True)
         if "dtype" in info and info["dtype"] != "object":
             arr = arr.astype(info["dtype"])
-        with open(npy + ".part", "wb") as f:        # file handle: np.save won't add ".npy"
+        part = f"{npy}.{os.getpid()}.part"         # per-process: parallel jobs can't collide
+        with open(part, "wb") as f:                 # file handle: np.save won't add ".npy"
             np.save(f, arr, allow_pickle=True)
-        os.replace(npy + ".part", npy)              # never leave a half-written .npy
+        os.replace(part, npy)                       # never leave a half-written .npy
 
 
 _decompress_all()
@@ -219,10 +221,66 @@ def taxibj_splits(t_in=4, t_out=4):
     return ConcatDataset(train_parts), test
 
 
-def moving_mnist_splits(train_size=10000):
-    """Train: generated on the fly from MNIST digits. Test: mnist_test_seq.npy."""
+def _fetch(url, dest, timeout, retries, desc):
+    """Download url -> dest with a progress bar. `timeout` applies to every network
+    read, so a stalled connection fails after `timeout` seconds instead of hanging."""
+    from tqdm import tqdm
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    part = dest + ".part"
+    for attempt in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r, open(part, "wb") as f:
+                total = int(r.headers.get("Content-Length") or 0) or None
+                with tqdm(total=total, unit="B", unit_scale=True, desc=desc,
+                          dynamic_ncols=True, mininterval=1) as bar:
+                    while True:
+                        chunk = r.read(1 << 20)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        bar.update(len(chunk))
+            if total and os.path.getsize(part) != total:
+                raise IOError(f"incomplete download ({os.path.getsize(part)} of {total} bytes)")
+            os.replace(part, dest)
+            return
+        except (OSError, urllib.error.URLError, socket.timeout) as e:
+            print(f"[data.py] download attempt {attempt}/{retries} failed: {e}")
+            if attempt == retries:
+                if os.path.exists(part):
+                    os.remove(part)
+                raise RuntimeError(
+                    f"Couldn't download {url}\n"
+                    f"If this machine has no internet access (e.g. a cluster compute node), run\n"
+                    f'    python -c "import data; data.download_moving_mnist()"\n'
+                    f"on a machine that does (a login node), or copy the file to\n    {dest}") from e
+            time.sleep(5 * attempt)
+
+
+def download_moving_mnist(timeout=60, retries=3):
+    """Make sure Moving MNIST is available: the test set (mnist_test_seq.npy, ~800 MB)
+    and the MNIST digits used to generate training sequences. Safe to call repeatedly."""
+    if not os.path.exists(mnist_path):
+        _fetch(MMNIST_URL, mnist_path, timeout, retries, "Moving MNIST")
+    key = os.path.relpath(mnist_path, ROOT).replace(os.sep, "-")
+    if key not in datasets:                       # downloaded after import: register it
+        arrays[key] = _load(mnist_path)
+        datasets[key] = MovingMNISTDataset(arrays[key])
+
     from torchvision.datasets import MNIST
-    mnist = MNIST(os.path.join(ROOT, "MNIST_raw"), train=True, download=True)
+    socket.setdefaulttimeout(timeout)             # torchvision's downloader has no timeout knob
+    try:
+        MNIST(os.path.join(ROOT, "MNIST_raw"), train=True, download=True)
+    finally:
+        socket.setdefaulttimeout(None)
+    return mnist_path
+
+
+def moving_mnist_splits(train_size=10000):
+    """Train: generated on the fly from MNIST digits. Test: mnist_test_seq.npy.
+    Downloads both on first use (see download_moving_mnist)."""
+    from torchvision.datasets import MNIST
+    download_moving_mnist()
+    mnist = MNIST(os.path.join(ROOT, "MNIST_raw"), train=True, download=False)
     digits = mnist.data.numpy().astype(np.float32) / 255.0
     test_key = next(k for k in datasets if "mnist_test_seq" in k)
     return MovingMNISTGenerator(digits, length=train_size), datasets[test_key]

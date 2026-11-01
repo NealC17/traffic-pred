@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from devices import pick_device
+from tracking import Tracker, CopyLast, evaluate, fmt
 from distvol import DistVolNet, DistVolLoss
 from baseline_cnn import BaselineCNN
 
@@ -72,25 +73,6 @@ class MSELoss(nn.Module):
         return loss, {"mse": loss.item()}
 
 
-def evaluate(model, loader, device, span):
-    """MAE / RMSE over all cells, converted back to raw flow counts."""
-    model.eval(); mae = mse = n = 0
-    with torch.no_grad():
-        for x, y in tqdm(loader, desc="  eval", leave=False, dynamic_ncols=True, mininterval=1):
-            x, y = x.to(device), y.to(device)
-            d = model(x) - y
-            mae += d.abs().sum().item(); mse += (d ** 2).sum().item(); n += y.numel()
-    return mae / n * span, math.sqrt(mse / n) * span
-
-
-def copy_last_mae(test, span, max_items=2000):
-    """Baseline: predict every future frame as the last observed one."""
-    idx = np.linspace(0, len(test) - 1, min(len(test), max_items)).astype(int)
-    errs = [(test[i][0][-1:] - test[i][1]).abs().mean().item()
-            for i in tqdm(idx, desc="copy-last baseline", leave=False, dynamic_ncols=True, mininterval=1)]
-    return float(np.mean(errs)) * span
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--synthetic", action="store_true", help="smoke test without datasets/")
@@ -111,6 +93,7 @@ def main():
     ap.add_argument("--l3", type=float, default=1.0, help="weight on |N_hat - N|")
     ap.add_argument("--eps", type=float, default=0.01, help="Sinkhorn blur")
     ap.add_argument("--sinkhorn_iters", type=int, default=30)
+    ap.add_argument("--no-wandb", action="store_true", help="don't log to Weights & Biases")
     ap.add_argument("--save", type=str, default=None,
                     help="default: checkpoints/<model>_<loss>.pt")
     args = ap.parse_args()
@@ -148,15 +131,22 @@ def main():
 
     print(f"{args.model} ({args.loss} loss): {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params | "
           f"tin={args.tin} tout={args.tout} | {len(train)} train / {len(test)} test windows | {device}")
-    print(f"copy-last-frame baseline MAE: {copy_last_mae(test, span):.4f}")
 
     if os.path.dirname(args.save):
         os.makedirs(os.path.dirname(args.save), exist_ok=True)
 
+    run_tag = f"{args.model}_{args.loss}" + ("" if (args.tin, args.tout) == (4, 4)
+                                               else f"_in{args.tin}_out{args.tout}")
+    tracker = Tracker(name=run_tag, job_type=args.model, enabled=not args.no_wandb,
+                      config=dict(vars(args), params=sum(p.numel() for p in model.parameters())))
+    tracker.log_reference(evaluate(CopyLast(args.tout), vl, device, span, lo,
+                                   desc="  copy-last reference"))
+    tracker.start(args.epochs, len(tl))
+
     best = float("inf")
     epochs = tqdm(range(1, args.epochs + 1), desc=f"{args.model} ({args.loss})", unit="ep", dynamic_ncols=True, mininterval=1)
     for ep in epochs:
-        model.train(); t0 = time.time(); agg = {}
+        model.train(); t0 = time.time(); agg = {}; running = 0.0
         bar = tqdm(tl, desc=f"  epoch {ep}", leave=False, dynamic_ncols=True, mininterval=1)
         for i, (x, y) in enumerate(bar, 1):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
@@ -167,17 +157,23 @@ def main():
             opt.step(); sched.step()
             for k, v in parts.items():
                 agg[k] = agg.get(k, 0.0) + v / len(tl)
+            running += loss.item()
             bar.set_postfix(loss=f"{loss.item():.5f}")
-        mae, rmse = evaluate(model, vl, device, span)
+            tracker.step(loss.item(), sched.get_last_lr()[0])
+        m = evaluate(model, vl, device, span, lo)
+        tracker.log_eval(ep, m, train_loss=running / len(tl), epoch_time=time.time() - t0,
+                         model=model, dataset=test, device=device, span=span, lo=lo,
+                         last=ep == args.epochs)
         tag = ""
-        if mae < best:
-            best, tag = mae, " *"
+        if m["mae_flow"] < best:                           # same criterion as before: test MAE (counts)
+            best, tag = m["mae_flow"], " *"
             torch.save({"model": model.state_dict(), "config": vars(args),
-                        "shape": (C, H, W), "scale": (lo, hi)}, args.save)
+                        "shape": (C, H, W), "scale": (lo, hi), "test_metrics": m}, args.save)
+            tracker.log_best(ep, m)
         terms = " ".join(f"{k} {v:.5f}" for k, v in agg.items())
         epochs.set_postfix(best_mae=f"{best:.4f}")
-        tqdm.write(f"ep {ep:3d} | {terms} | test MAE {mae:.4f} RMSE {rmse:.4f} | "
-                   f"{time.time() - t0:.0f}s{tag}")
+        tqdm.write(f"ep {ep:3d} | {terms} | {fmt(m)} | {time.time() - t0:.0f}s{tag}")
+    tracker.finish()
 
 
 if __name__ == "__main__":
