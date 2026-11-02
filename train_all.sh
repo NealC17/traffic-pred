@@ -37,8 +37,15 @@
 #   checkpoints/results.tsv        final test MSE and Sinkhorn of every model (also printed at the end)
 #   checkpoints/<name>.done        written only when a run finishes; runs with a .done are skipped,
 #                                  so a job killed by its time limit redoes only unfinished runs
+#   checkpoints/<name>.last.pt     end-of-epoch state of cnn_* / distvol_* runs; an unfinished run
+#                                  resumes from it (same W&B run, same charts). --force starts over.
 #   checkpoints/logs/<name>.log    full training log
 #   checkpoints/runs/              PredFormer's own run folders (last.pt for --resume)
+#
+# Resubmitting after a time limit: finished runs are skipped, an interrupted cnn_*/distvol_*
+# run continues from its last epoch in its original W&B run and group; runs that hadn't
+# started yet go into this job's group. To put them in an earlier job's group instead:
+#   export WANDB_RUN_GROUP=train_all-<earlier job id>
 #
 # Progress: each run shows an overall epoch bar plus a per-epoch batch bar (tqdm).
 # The .log files keep the per-epoch summary lines; bar redraws are stripped from them.
@@ -57,7 +64,7 @@ while [ $# -gt 0 ]; do
         --force)  FORCE=1; shift ;;
         --list)   LIST=1; shift ;;
         --no-wandb) export WANDB_MODE=disabled; shift ;;
-        -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
         -*) echo "unknown option: $1 (see --help)"; exit 2 ;;
         *)  FILTERS+=("$1"); shift ;;
     esac
@@ -158,10 +165,15 @@ for r in "${RUNS[@]}"; do
     fi
 
     rm -f "$done_mark"
-    # PredFormer can continue an interrupted run from checkpoints/runs/<run>/last.pt
-    if [[ "$name" == predformer* ]] && [ "$FORCE" = 0 ]; then
+    # PredFormer continues an interrupted run from checkpoints/runs/<run>/last.pt,
+    # train_distvol.py from checkpoints/<name>.last.pt (both: same W&B run where supported)
+    if [[ "$name" == predformer* || "$cmd" == train_distvol.py* ]] && [ "$FORCE" = 0 ]; then
         cmd="$cmd --resume"
     fi
+    # a resumed run appends to its log instead of overwriting the first part
+    append=0
+    [[ "$cmd" == *--resume* ]] && [ -f "checkpoints/$tag.last.pt" ] && append=1
+    [ "$append" = 0 ] && : > "$log"
     cmd="${cmd//EPOCHS_/${EPOCHS:-$ep}}"
     cmd="${cmd//SAVE_/$ckpt}"
     export WANDB_NAME="$tag"
@@ -171,7 +183,7 @@ for r in "${RUNS[@]}"; do
     # shellcheck disable=SC2086
     # Bars go to the terminal as usual; the log keeps only finished lines
     # (tqdm redraws with carriage returns, so keep the text after the last \r).
-    if "$PY" -u $cmd 2>&1 | tee >(tr '\r' '\n' | sed "s/${ESC}\[[0-9;]*[A-Za-z]//g" | grep -v -E '^[[:space:]]*$|%\|' > "$log"); then
+    if "$PY" -u $cmd 2>&1 | tee >(tr '\r' '\n' | sed "s/${ESC}\[[0-9;]*[A-Za-z]//g" | grep -v -E '^[[:space:]]*$|%\|' >> "$log"); then
         if [[ "$name" == predformer* ]]; then
             # train.py writes checkpoints/runs/<run>/best.pt; copy it next to the others
             run_dir="taxibj"

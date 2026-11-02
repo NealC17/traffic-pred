@@ -34,6 +34,10 @@ W&B, per run:
              best/<metric>, copy_last/<metric>, vs_copy_last/<metric>, best_epoch
 In the W&B runs table, add the progress/percent column to see how far each run is.
 
+Resuming: pass run_id (and group) to Tracker to continue an existing W&B run: same run page,
+charts continue where they stopped. Tracker.run_id / Tracker.group give the values to store
+in a checkpoint. A run that died mid-training shows as "crashed" until it is resumed.
+
 Environment variables (all optional): WANDB_PROJECT (default "traffic-pred"), WANDB_ENTITY,
 WANDB_NAME, WANDB_RUN_GROUP, WANDB_MODE ("offline" to log locally and `wandb sync` later,
 "disabled" to turn W&B off). Without W&B installed or reachable, training still runs.
@@ -98,20 +102,25 @@ def evaluate(model, loader, device, span, lo=0.0, desc="  eval"):
         pred = pred.float().clamp(0, 1)
         B, T, C, H, W = y.shape
         if se_t is None:
-            se_t, ae_t, sk_t, vabs_t, vtot_t = (torch.zeros(T, dtype=torch.float64) for _ in range(5))
+            # Accumulate on the device (float64 where supported) and copy back once at the
+            # end: a .cpu() per batch makes the CPU wait for the GPU five times a batch.
+            acc = torch.float32 if x.device.type == "mps" else torch.float64
+            se_t, ae_t, sk_t, vabs_t, vtot_t = (torch.zeros(T, dtype=acc, device=x.device)
+                                                for _ in range(5))
         d = pred - y
-        se_t += d.pow(2).sum(dim=(0, 2, 3, 4)).double().cpu()
-        ae_t += d.abs().sum(dim=(0, 2, 3, 4)).double().cpu()
-        sk_t += sinkhorn_per_map(pred, y).sum(dim=(0, 2)).double().cpu()
+        se_t += d.pow(2).sum(dim=(0, 2, 3, 4)).to(se_t.dtype)
+        ae_t += d.abs().sum(dim=(0, 2, 3, 4)).to(se_t.dtype)
+        sk_t += sinkhorn_per_map(pred, y).sum(dim=(0, 2)).to(se_t.dtype)
         # totals per map in raw counts: sum(scaled) * span + lo * H * W
         N_hat = pred.sum(dim=(-2, -1)) * span + lo * H * W            # (B, T, C)
         N = y.sum(dim=(-2, -1)) * span + lo * H * W
-        vabs_t += (N_hat - N).abs().sum(dim=(0, 2)).double().cpu()
-        vtot_t += N.abs().sum(dim=(0, 2)).double().cpu()
+        vabs_t += (N_hat - N).abs().sum(dim=(0, 2)).to(se_t.dtype)
+        vtot_t += N.abs().sum(dim=(0, 2)).to(se_t.dtype)
         n_cells += y.numel()
         n_frames += B * T
         n_maps += B * T * C
 
+    se_t, ae_t, sk_t, vabs_t, vtot_t = (t.double().cpu() for t in (se_t, ae_t, sk_t, vabs_t, vtot_t))
     cells_t, maps_t = n_cells / T, n_maps / T                       # per prediction step
     cells_per_frame = n_cells / n_frames
     mse, mae = se_t.sum().item() / n_cells, ae_t.sum().item() / n_cells
@@ -146,9 +155,14 @@ class Tracker:
     """Everything a run sends to W&B (see module docstring). With W&B disabled, missing or
     offline it still prints the final line train_all.sh collects into results.tsv."""
 
-    def __init__(self, name, config, job_type, enabled=True):
+    def __init__(self, name, config, job_type, enabled=True, run_id=None, group=None):
+        """run_id: continue this existing W&B run (resume) instead of starting a new one.
+        group: W&B group; default $WANDB_RUN_GROUP. When resuming, pass the run's stored group
+        so it stays where it was even if this job has a different group."""
         self.run = None
         self.wandb = None
+        self.run_id = run_id
+        self.group = group or os.environ.get("WANDB_RUN_GROUP")
         self.name = os.environ.get("WANDB_NAME", name)
         self.best = None                  # (epoch, metrics) of the saved checkpoint
         self.reference = None             # copy-last-frame metrics
@@ -162,14 +176,20 @@ class Tracker:
             print("[wandb] not installed (pip install wandb); continuing without it")
             return
         self.wandb = wandb
+        resuming = run_id is not None
         kwargs = dict(project=os.environ.get("WANDB_PROJECT", "traffic-pred"), name=self.name,
-                      group=os.environ.get("WANDB_RUN_GROUP"), job_type=job_type, config=config)
+                      group=self.group, job_type=job_type, config=config)
+        if resuming:
+            kwargs.update(id=run_id, resume="allow")
         try:
             self.run = wandb.init(**kwargs)
         except Exception as e:                                # no login / no network
             print(f"[wandb] couldn't start an online run ({e}).\n"
                   f"[wandb] logging offline instead; upload later with:  wandb sync wandb/offline-run-*")
             self.run = wandb.init(mode="offline", **kwargs)
+        self.run_id = self.run.id                            # stored in checkpoints for resuming
+        if resuming:
+            print(f"[wandb] resumed run {self.run_id} ({self.name}, group {self.group})", flush=True)
         wandb.define_metric("progress/step")
         wandb.define_metric("progress/*", step_metric="progress/step")
         wandb.define_metric("train/*", step_metric="progress/step")
@@ -198,7 +218,10 @@ class Tracker:
         self._loss_sum, self._loss_n = 0.0, 0
 
     def step(self, loss, lr):
-        """Call once per training step; logs ~PROGRESS_POINTS points per epoch."""
+        """Call once per training step; logs ~PROGRESS_POINTS points per epoch.
+        loss may be a float or a 0-d tensor (summed on the device, read back only when logged)."""
+        if torch.is_tensor(loss):
+            loss = loss.detach()
         self._step += 1
         self._loss_sum += loss
         self._loss_n += 1
@@ -212,7 +235,7 @@ class Tracker:
             "progress/epoch": self._step / self._spe,
             "progress/eta_min": (self._total - self._step) / max(rate, 1e-9) / 60,
             "progress/it_per_s": rate,
-            "train/loss": self._loss_sum / self._loss_n,          # mean since the last point
+            "train/loss": float(self._loss_sum) / self._loss_n,   # mean since the last point
             "train/lr": lr,
         })
         self._loss_sum, self._loss_n = 0.0, 0
@@ -241,6 +264,16 @@ class Tracker:
     def log_best(self, epoch, metrics):
         """Call when this epoch's weights become the saved checkpoint."""
         self.best = (epoch, metrics)
+
+    def state(self):
+        """What a training checkpoint needs to resume this tracker (see restore())."""
+        return {"run_id": self.run_id, "group": self.group, "best": self.best, "evals": self._evals}
+
+    def restore(self, state):
+        """Bring back best checkpoint / evaluation count from state() (run_id and group go
+        to the constructor)."""
+        self.best = state.get("best")
+        self._evals = state.get("evals", 0)
 
     def finish(self):
         """Print the final line (train_all.sh reads it) and fill in the W&B run summary."""

@@ -160,6 +160,8 @@ class DistVolLoss(nn.Module):
                           eps=self.eps, iters=self.iters).mean()
         l_vol = (N_hat - N).abs().mean() / (H * W)
         total = self.l1 * l_rec + self.l2 * l_ot + self.l3 * l_vol
-        return total, {"l1": l_rec.item(), "sinkhorn": l_ot.item(), "volume": l_vol.item()}
+        # Detached 0-d tensors, not .item(): reading a value back every step makes the CPU
+        # wait for the GPU. float(t) / f"{t:.5f}" still work where a number is needed.
+        return total, {"l1": l_rec.detach(), "sinkhorn": l_ot.detach(), "volume": l_vol.detach()}
 
 
