@@ -4,6 +4,7 @@ Train DistVolNet on TaxiBJ using data.py's taxibj_splits().
   python train_distvol.py --tin 4 --tout 4 --epochs 50 --save checkpoints/distvol_best.pt
   python train_distvol.py --model cnn --tin 4 --tout 4 --epochs 50   # baseline CNN, same loss
   python train_distvol.py --model cnn --loss mse                   # baseline CNN, plain MSE
+  python train_distvol.py --model stresnet --loss mse              # ST-ResNet (paper: MSE)
   python train_distvol.py --synthetic --epochs 2 --width 32 --sinkhorn_iters 10   # smoke test
   python train_distvol.py ... --resume       # continue from <save>.last.pt if it exists
   python train_distvol.py --train-files 2013 --val-files 2014 --test-files 2015 2016
@@ -12,7 +13,12 @@ Train DistVolNet on TaxiBJ using data.py's taxibj_splits().
 --loss sinkhorn (default): DistVolLoss = L1 + Sinkhorn + volume
 --loss mse:                plain MSE on the predicted counts
 
-The checkpoint's config["model"] says which class to rebuild ("distvol" or "cnn"),
+ST-ResNet (stresnet.py) uses --width as its filter count (64, as in the paper), --st-units
+residual units (12, the paper's TaxiBJ setting) and --st-bn for batch norm. Only the closeness
+branch is used: taxibj_splits windows hold consecutive frames, so there are no period / trend
+frames or external factors to feed it.
+
+The checkpoint's config["model"] says which class to rebuild ("distvol", "cnn" or "stresnet"),
 config["loss"] which loss it was trained with.
 
 Resume: every epoch writes <save minus .pt>.last.pt (model, optimizer, LR schedule, epoch,
@@ -46,6 +52,7 @@ from devices import pick_device
 from tracking import Tracker, CopyLast, evaluate, fmt, SELECT
 from distvol import DistVolNet, DistVolLoss
 from baseline_cnn import BaselineCNN
+from stresnet import STResNet
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +131,9 @@ class DeviceBatches:
 
 # Settings that must match for --resume to continue a checkpoint (others, like --workers or
 # --amp, can change between the two halves of a run).
-RESUME_KEYS = ("model", "loss", "tin", "tout", "width", "blocks", "epochs", "batch_size", "lr",
+RESUME_KEYS = ("model", "loss", "tin", "tout", "width", "blocks", "st_units", "st_bn",
+               "st_paper_init",
+               "epochs", "batch_size", "lr",
                "l1", "l2", "l3", "eps", "sinkhorn_iters", "synthetic", "select",
                "train_files", "val_files", "test_files", "train_size", "val_size", "test_size")
 
@@ -141,12 +150,19 @@ def main():
     ap.add_argument("--synthetic", action="store_true", help="smoke test without datasets/")
     ap.add_argument("--tin", type=int, default=4, help="input frames (half-hour steps)")
     ap.add_argument("--tout", type=int, default=4, help="frames to predict")
-    ap.add_argument("--model", choices=["distvol", "cnn"], default="distvol",
-                    help="distvol = DistVolNet; cnn = BaselineCNN (same loss, plain conv stack)")
+    ap.add_argument("--model", choices=["distvol", "cnn", "stresnet"], default="distvol",
+                    help="distvol = DistVolNet; cnn = BaselineCNN (same loss, plain conv stack); "
+                         "stresnet = ST-ResNet (Zhang et al. 2017), closeness branch")
     ap.add_argument("--loss", choices=["sinkhorn", "mse"], default="sinkhorn",
                     help="sinkhorn = DistVolLoss (L1 + Sinkhorn + volume); mse = plain MSE")
     ap.add_argument("--width", type=int, default=64)
     ap.add_argument("--blocks", type=int, default=6, help="residual blocks (cnn only)")
+    ap.add_argument("--st-units", type=int, default=12,
+                    help="ST-ResNet residual units (paper: 12 for TaxiBJ)")
+    ap.add_argument("--st-bn", action="store_true", help="batch norm in ST-ResNet residual units")
+    ap.add_argument("--st-paper-init", action="store_true",
+                    help="ST-ResNet: keep the default output bias (starts at 0.5) instead of "
+                         "starting at the mean training value; with MSE it tends to collapse to 0")
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--workers", type=int, default=2)
@@ -220,6 +236,14 @@ def main():
 
     if args.model == "cnn":
         net = BaselineCNN(args.tin, args.tout, C, H, W, args.width, args.blocks).to(device)
+    elif args.model == "stresnet":
+        init_mean = None
+        if not args.st_paper_init:                     # mean target over up to 2000 windows
+            idx = np.linspace(0, len(train) - 1, min(len(train), 2000)).astype(int)
+            init_mean = float(np.mean([train[i][1].float().mean().item() for i in idx]))
+            print(f"ST-ResNet output starts at the mean training value {init_mean:.5f}")
+        net = STResNet(args.tin, args.tout, C, H, W, filters=args.width, units=args.st_units,
+                       bn=args.st_bn, init_mean=init_mean).to(device)
     else:
         net = DistVolNet(args.tin, args.tout, C, H, W, args.width).to(device)
     model = torch.compile(net) if args.compile else net      # checkpoints always save `net`

@@ -36,6 +36,8 @@
 #   cnn_sinkhorn         train_distvol.py    BaselineCNN   Sinkhorn   50
 #   distvol_mse          train_distvol.py    DistVolNet    MSE        50
 #   distvol_sinkhorn     train_distvol.py    DistVolNet    Sinkhorn   50
+#   stresnet_mse         train_distvol.py    ST-ResNet     MSE        50
+#   stresnet_sinkhorn    train_distvol.py    ST-ResNet     Sinkhorn   50
 #   mlp_mse              baseline_mlp.py     MLP           MSE        50
 #   predformer_mse       train.py            PredFormer    MSE        200 (paper setting)
 #                                            (ours: predformer.py, TSST)
@@ -151,6 +153,8 @@ RUNS=(
     "cnn_sinkhorn|50|train_distvol.py --model cnn --loss sinkhorn --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ --workers $WORKERS $SPLIT_ARGS"
     "distvol_mse|50|train_distvol.py --model distvol --loss mse --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ --workers $WORKERS $SPLIT_ARGS"
     "distvol_sinkhorn|50|train_distvol.py --model distvol --loss sinkhorn --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ --workers $WORKERS $SPLIT_ARGS"
+    "stresnet_mse|50|train_distvol.py --model stresnet --loss mse --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ --workers $WORKERS $SPLIT_ARGS"
+    "stresnet_sinkhorn|50|train_distvol.py --model stresnet --loss sinkhorn --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ --workers $WORKERS $SPLIT_ARGS"
     "mlp_mse|50|baseline_mlp.py --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ $SPLIT_ARGS"
     "predformer_mse|200|train.py --dataset taxibj --impl mine --t-in $TIN --t-out $TOUT --epochs EPOCHS_ --out $PF_OUT --workers $WORKERS $SPLIT_ARGS"
     "predformer_official_mse|200|train.py --dataset taxibj --impl official --t-in $TIN --t-out $TOUT --epochs EPOCHS_ --out $PF_OUT --workers $WORKERS $SPLIT_ARGS"
@@ -256,7 +260,7 @@ done
 
 # --- summary ------------------------------------------------------------------------
 echo
-echo "=== summary ($(( ($(date +%s) - START) / 60 )) min total)"
+echo "=== summary ($(( ($(date +%s) - START) )) sec total)"
 for t in "${DONE[@]}";    do echo "  trained  $t"; done
 for t in "${SKIPPED[@]}"; do echo "  skipped  $t (already had a checkpoint)"; done
 for t in "${FAILED[@]}";  do echo "  FAILED   $t  (log: checkpoints/logs/${t}.log)"; done

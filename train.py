@@ -169,19 +169,30 @@ def main():
     last_path, best_path = os.path.join(out_dir, "last.pt"), os.path.join(out_dir, "best.pt")
     if args.resume and os.path.exists(last_path):
         ck = torch.load(last_path, map_location=device)
-        core.load_state_dict(ck["model"])
-        opt.load_state_dict(ck["opt"])
-        sched.load_state_dict(ck["sched"])
-        start_epoch = ck["epoch"] + 1
-        # checkpoints from before the val split stored a TEST score here: don't trust it
-        best = ck["best"] if ck.get("select") == f"val/{SELECT}" else float("inf")
-        print(f"resumed from epoch {ck['epoch']} (best val {SELECT} {best:.5f})")
+        # Only continue a run made the same way: selected on val (checkpoints from before
+        # the val split were selected on TEST), on the same split, for the same horizon.
+        same = {"selection": (ck.get("select"), f"val/{SELECT}"),
+                "split": (ck.get("split") or {}, {k: v for k, v in split.items()}),
+                "t_in/t_out": ((ck.get("t_in"), ck.get("t_out")), (t_in, t_out)),
+                "epochs": (ck.get("epochs", hp["epochs"]), hp["epochs"])}
+        diff = {k: v for k, v in same.items() if v[0] != v[1]}
+        if not (ck.get("split") or any(split.values())):     # both the default split
+            diff.pop("split", None)
+        if diff:
+            print(f"!!! {last_path} was made with different settings {diff}; starting over")
+        else:
+            core.load_state_dict(ck["model"])
+            opt.load_state_dict(ck["opt"])
+            sched.load_state_dict(ck["sched"])
+            start_epoch, best = ck["epoch"] + 1, ck["best"]
+            print(f"resumed from epoch {ck['epoch']} (best val {SELECT} {best:.5f})")
 
     def save(path, epoch, extra=None):
         torch.save(dict(model=core.state_dict(), opt=opt.state_dict(),
                         sched=sched.state_dict(), epoch=epoch, best=best,
                         config=model_cfg, impl=args.impl, variant=variant,
                         t_in=t_in, t_out=t_out, select=f"val/{SELECT}", split=split,
+                        epochs=hp["epochs"],
                         dataset=args.dataset, **(extra or {})), path)
 
     # ---- reference + live progress ----

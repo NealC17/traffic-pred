@@ -24,6 +24,11 @@ Differences here, so it fits this codebase:
   - Output squash: sigmoid instead of tanh, because data.py scales to [0, 1].
     sigmoid(2z) is tanh(z) mapped from [-1, 1] to [0, 1], so this is the same model. It
     also keeps predictions non-negative, which the Sinkhorn loss needs.
+  - Output bias init (init_mean): the squash starts at 0.5 everywhere, but scaled TaxiBJ
+    values are mostly near 0. With MSE, the first updates push the pre-activation so far
+    negative that sigmoid saturates at 0 and its gradient vanishes: the model gets stuck
+    predicting all zeros. Setting the last conv's bias so the output starts at the mean
+    training value avoids that. It only changes the initialisation, not the architecture.
   - Period, trend and external inputs are optional. taxibj_splits() windows only hold
     consecutive frames, so with the standard pipeline this is ST-ResNet with the
     closeness branch only. Pass x_period / x_trend / ext to forward() (and set the
@@ -72,9 +77,11 @@ class Branch(nn.Module):
 
 class STResNet(nn.Module):
     def __init__(self, T_in=4, T_out=4, C=2, H=32, W=32, filters=64, units=12, bn=False,
-                 len_period=0, len_trend=0, ext_dim=0):
+                 len_period=0, len_trend=0, ext_dim=0, init_mean=None):
         """T_in: closeness frames. len_period / len_trend: frames in those branches
-        (0 = branch off). ext_dim: size of the external-factor vector (0 = off)."""
+        (0 = branch off). ext_dim: size of the external-factor vector (0 = off).
+        init_mean: mean target value in the data's [0, 1] scale; if given, the output
+        starts there instead of at 0.5 (see module docstring)."""
         super().__init__()
         self.T_in, self.T_out, self.C, self.H, self.W = T_in, T_out, C, H, W
         cout = T_out * C
@@ -86,6 +93,13 @@ class STResNet(nn.Module):
         self.fuse = nn.ParameterDict({
             k: nn.Parameter(torch.ones(cout, H, W) / len(self.branches)) for k in self.branches
         })
+        if init_mean is not None:
+            # sigmoid(2 * b) = init_mean  ->  b = logit(init_mean) / 2. The fusion weights sum
+            # to 1 per cell, so giving every branch this bias makes the fused output b.
+            m = float(min(max(init_mean, 1e-4), 1 - 1e-4))
+            b = 0.5 * torch.logit(torch.tensor(m)).item()
+            for branch in self.branches.values():
+                nn.init.constant_(branch.net[-1].bias, b)
         self.ext = None
         if ext_dim > 0:
             self.ext = nn.Sequential(nn.Linear(ext_dim, 10), nn.ReLU(),
