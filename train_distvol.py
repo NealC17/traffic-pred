@@ -6,6 +6,8 @@ Train DistVolNet on TaxiBJ using data.py's taxibj_splits().
   python train_distvol.py --model cnn --loss mse                   # baseline CNN, plain MSE
   python train_distvol.py --synthetic --epochs 2 --width 32 --sinkhorn_iters 10   # smoke test
   python train_distvol.py ... --resume       # continue from <save>.last.pt if it exists
+  python train_distvol.py --train-files 2013 --val-files 2014 --test-files 2015 2016
+  python train_distvol.py --train-size 5000 --val-size 500 --test-size 0.5
 
 --loss sinkhorn (default): DistVolLoss = L1 + Sinkhorn + volume
 --loss mse:                plain MSE on the predicted counts
@@ -23,9 +25,15 @@ fused, and cuDNN autotunes its convolutions. --amp (bf16 model) and --compile (t
 are opt-in: they change the numerics slightly, so runs trained without them aren't
 bit-comparable. Sinkhorn always runs in float32.
 
-Data: taxibj_splits(tin, tout) trains on every TaxiBJ flow file except the last 4 weeks
-and tests on those 4 weeks, with the same min-max scaling as PredFormer. Windows never
-cross file boundaries. Run from the folder that contains data.py and datasets/.
+Data: taxibj_splits(tin, tout, val=True): test = the last 4 weeks of TaxiBJ, val = the
+4 weeks before that, train = everything earlier, with the same min-max scaling as
+PredFormer. Windows never cross file or split boundaries. Run from the folder that contains
+data.py and datasets/.
+
+Protocol: every epoch is scored on val and the checkpoint with the lowest val --select
+metric (default mse, the same as every other model) is kept. When training ends it is
+scored once on test; those are the numbers to report (W&B test/*, and the saved
+checkpoint's "test_metrics").
 """
 import argparse, math, os, time
 import numpy as np
@@ -35,7 +43,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from devices import pick_device
-from tracking import Tracker, CopyLast, evaluate, fmt
+from tracking import Tracker, CopyLast, evaluate, fmt, SELECT
 from distvol import DistVolNet, DistVolLoss
 from baseline_cnn import BaselineCNN
 
@@ -68,10 +76,11 @@ def synthetic_splits(tin, tout, n=1500, H=32, W=32, seed=0):
             f[t, c] = vol * sum(np.exp(-((yy - cy - c) ** 2 + (xx - cx) ** 2) / 8)
                                 for cy, cx in centers)
     f += rng.uniform(0, 0.02, f.shape).astype(np.float32)
-    split = int(0.8 * n)
+    split, vsplit = int(0.7 * n), int(0.85 * n)
     lo, hi = float(f[:split].min()), float(f[:split].max())
     f = (f - lo) / (hi - lo)
-    return _Windows(f[:split], tin, tout), _Windows(f[split:], tin, tout), (lo, hi)
+    return (_Windows(f[:split], tin, tout), _Windows(f[split:vsplit], tin, tout),
+            _Windows(f[vsplit:], tin, tout), (lo, hi))
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +125,8 @@ class DeviceBatches:
 # Settings that must match for --resume to continue a checkpoint (others, like --workers or
 # --amp, can change between the two halves of a run).
 RESUME_KEYS = ("model", "loss", "tin", "tout", "width", "blocks", "epochs", "batch_size", "lr",
-               "l1", "l2", "l3", "eps", "sinkhorn_iters", "synthetic")
+               "l1", "l2", "l3", "eps", "sinkhorn_iters", "synthetic", "select",
+               "train_files", "val_files", "test_files", "train_size", "val_size", "test_size")
 
 
 def save_atomic(obj, path):
@@ -149,8 +159,11 @@ def main():
     ap.add_argument("--no-wandb", action="store_true", help="don't log to Weights & Biases")
     ap.add_argument("--resume", action="store_true",
                     help="continue from <save>.last.pt (and its W&B run) if it exists")
+    ap.add_argument("--select", default=SELECT,
+                    help="val metric to pick the checkpoint by (lower is better); keep the "
+                         "default so every model is selected the same way")
     ap.add_argument("--eval-batch-size", type=int, default=128,
-                    help="test batch size (no effect on results, only speed)")
+                    help="val/test batch size (no effect on results, only speed)")
     ap.add_argument("--data-on-gpu", choices=["auto", "yes", "no"], default="auto",
                     help="keep the whole dataset on the GPU (auto = on CUDA)")
     ap.add_argument("--amp", action="store_true",
@@ -158,19 +171,21 @@ def main():
     ap.add_argument("--compile", action="store_true", help="torch.compile the model (CUDA)")
     ap.add_argument("--save", type=str, default=None,
                     help="default: checkpoints/<model>_<loss>.pt")
+    import data                                       # loads datasets/ on import
+    data.add_split_args(ap)
     args = ap.parse_args()
     args.save = args.save or f"checkpoints/{args.model}_{args.loss}.pt"
     last_path = os.path.splitext(args.save)[0] + ".last.pt"
 
     if args.synthetic:
-        train, test, (lo, hi) = synthetic_splits(args.tin, args.tout)
+        train, val, test, (lo, hi) = synthetic_splits(args.tin, args.tout)
     else:
-        import data                                   # loads datasets/ on import
         if data._flow_scale is None:
             raise SystemExit("No TaxiBJ flow files found under datasets/ "
                              "(expected names starting with TaxiBJ/TaxiBJ2...).")
-        train, test = data.taxibj_splits(args.tin, args.tout)
-        lo, hi = data._flow_scale
+        train, val, test = data.taxibj_splits(args.tin, args.tout, val=True,
+                                              **data.split_kwargs(args))
+        lo, hi = data.scale_of(train)                 # train files only, for a file split
     span = hi - lo
 
     x0, y0 = train[0]
@@ -183,22 +198,25 @@ def main():
     if cuda:
         torch.backends.cudnn.benchmark = True          # fixed shapes: autotune the convolutions
 
-    tl = vl = None
+    tl = vl = sl = None                                # train / val / test loaders
     if args.data_on_gpu == "yes" or (args.data_on_gpu == "auto" and cuda):
         try:
             tl = DeviceBatches(train, args.batch_size, device, shuffle=True, drop_last=True,
                                workers=args.workers)
-            vl = DeviceBatches(test, args.eval_batch_size, device, workers=args.workers)
-            print(f"data on {device}: {(tl.x.numel() + tl.y.numel() + vl.x.numel() + vl.y.numel()) * 4 / 2**30:.2f} GiB")
+            vl = DeviceBatches(val, args.eval_batch_size, device, workers=args.workers)
+            sl = DeviceBatches(test, args.eval_batch_size, device, workers=args.workers)
+            n = sum(b.x.numel() + b.y.numel() for b in (tl, vl, sl))
+            print(f"data on {device}: {n * 4 / 2**30:.2f} GiB")
         except torch.cuda.OutOfMemoryError:
-            tl = vl = None
+            tl = vl = sl = None
             torch.cuda.empty_cache()
             print("dataset doesn't fit on the GPU; using DataLoader")
     if tl is None:
         tl = DataLoader(train, args.batch_size, shuffle=True, drop_last=True,
                         num_workers=args.workers, persistent_workers=args.workers > 0,
                         pin_memory=cuda)
-        vl = DataLoader(test, args.eval_batch_size, num_workers=args.workers, pin_memory=cuda)
+        vl = DataLoader(val, args.eval_batch_size, num_workers=args.workers, pin_memory=cuda)
+        sl = DataLoader(test, args.eval_batch_size, num_workers=args.workers, pin_memory=cuda)
 
     if args.model == "cnn":
         net = BaselineCNN(args.tin, args.tout, C, H, W, args.width, args.blocks).to(device)
@@ -231,12 +249,13 @@ def main():
             if cuda and ck["rng"].get("cuda") is not None:
                 torch.cuda.set_rng_state(ck["rng"]["cuda"].cpu())
             print(f"resuming from {last_path}: {start_epoch}/{args.epochs} epochs done, "
-                  f"best test MAE {best:.4f}")
+                  f"best val {args.select} {best:.5f}")
     elif args.resume:
         print(f"no {last_path}; starting from scratch")
 
     print(f"{args.model} ({args.loss} loss): {sum(p.numel() for p in net.parameters()) / 1e6:.2f}M params | "
-          f"tin={args.tin} tout={args.tout} | {len(train)} train / {len(test)} test windows | {device}")
+          f"tin={args.tin} tout={args.tout} | {len(train)} train / {len(val)} val / {len(test)} test "
+          f"windows | {device}")
 
     if os.path.dirname(args.save):
         os.makedirs(os.path.dirname(args.save), exist_ok=True)
@@ -249,8 +268,9 @@ def main():
                       group=resume_state and resume_state.get("group"))
     if resume_state:
         tracker.restore(resume_state)
-    tracker.log_reference(evaluate(CopyLast(args.tout), vl, device, span, lo,
-                                   desc="  copy-last reference"))
+    tracker.log_reference(
+        val=evaluate(CopyLast(args.tout), vl, device, span, lo, desc="  copy-last (val)"),
+        test=evaluate(CopyLast(args.tout), sl, device, span, lo, desc="  copy-last (test)"))
     tracker.start(args.epochs, len(tl), start_epoch=start_epoch)
 
     POSTFIX_EVERY = 50                                     # progress-bar loss: one GPU sync per 50 steps
@@ -276,22 +296,35 @@ def main():
             tracker.step(loss, sched.get_last_lr()[0])
         running = float(running)
         m = evaluate(net, vl, device, span, lo)
-        tracker.log_eval(ep, m, train_loss=running / len(tl), epoch_time=time.time() - t0,
-                         model=net, dataset=test, device=device, span=span, lo=lo,
-                         last=ep == args.epochs)
+        tracker.log_eval(ep, m, train_loss=running / len(tl),
+                         train_parts={k: float(v) for k, v in agg.items()},
+                         epoch_time=time.time() - t0, model=net, dataset=val, device=device,
+                         span=span, lo=lo, last=ep == args.epochs)
         tag = ""
-        if m["mae_flow"] < best:                           # same criterion as before: test MAE (counts)
-            best, tag = m["mae_flow"], " *"
-            save_atomic({"model": net.state_dict(), "config": vars(args),
-                         "shape": (C, H, W), "scale": (lo, hi), "test_metrics": m}, args.save)
+        if m[args.select] < best:                          # select on VAL, never on test
+            best, tag = m[args.select], " *"
+            save_atomic({"model": net.state_dict(), "config": vars(args), "epoch": ep,
+                         "shape": (C, H, W), "scale": (lo, hi), "val_metrics": m}, args.save)
             tracker.log_best(ep, m)
         save_atomic({"model": net.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
                      "epoch": ep, "best": best, "tracker": tracker.state(), "config": vars(args),
                      "rng": {"cpu": torch.get_rng_state(),
                              "cuda": torch.cuda.get_rng_state() if cuda else None}}, last_path)
         terms = " ".join(f"{k} {float(v):.5f}" for k, v in agg.items())
-        epochs.set_postfix(best_mae=f"{best:.4f}")
+        epochs.set_postfix(best_val=f"{best:.5f}")
         tqdm.write(f"ep {ep:3d} | {terms} | {fmt(m)} | {time.time() - t0:.0f}s{tag}")
+
+    # ---- final: the selected checkpoint, scored once on the test set ----------------
+    if os.path.exists(args.save):
+        ck = torch.load(args.save, map_location=device, weights_only=False)
+        if "val_metrics" in ck:
+            net.load_state_dict(ck["model"])
+            m_test = evaluate(net, sl, device, span, lo, desc="  test")
+            ck["test_metrics"] = m_test
+            save_atomic(ck, args.save)
+            tracker.log_test(m_test, epoch=args.epochs)
+        else:
+            print(f"!!! {args.save} is from before the val split; not scoring it on test")
     tracker.finish()
 
 

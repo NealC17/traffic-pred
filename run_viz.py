@@ -54,7 +54,11 @@ def main():
     print(f"loaded {args.ckpt} (epoch {ck['epoch'] + 1}, "
           f"test MSE {ck.get('test_mse', float('nan')):.4f})")
 
-    _, test_set = taxibj_splits(model.t_in, model.t_out)
+    split = ck.get("split") or {}                     # files / sizes it was trained with
+    if any(split.values()):
+        _, _, test_set = taxibj_splits(model.t_in, model.t_out, val=True, **split)
+    else:
+        _, test_set = taxibj_splits(model.t_in, model.t_out)
     if args.browse:
         browse(model, test_set, start=args.idx, step=args.step)
         return

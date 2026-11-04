@@ -2,10 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+import os
 import time
 from tqdm import tqdm
 from devices import pick_device
-from tracking import Tracker, CopyLast, evaluate, fmt
+from tracking import Tracker, CopyLast, evaluate, fmt, SELECT
 class MLP(nn.Module):
     """Fully connected baseline. Flattens every input value (T_in x C x H x W =
     4 x 2 x 32 x 32 = 8192 for TaxiBJ) into one vector, passes it through
@@ -37,37 +38,44 @@ class MLP(nn.Module):
 
 
 
-def fit(model, train_set, test_set, epochs=50, batch_size=16, lr=1e-3,
-        weight_decay=1e-2, device=None, save=None, workers=0, run_name=None, wandb=True):
+def fit(model, train_set, val_set, test_set, epochs=50, batch_size=16, lr=1e-3,
+        weight_decay=1e-2, device=None, save=None, workers=0, run_name=None, wandb=True,
+        extra_config=None):
     """Train with MSE loss, AdamW and a one-cycle LR schedule (the same recipe
     train.py uses for PredFormer, so the comparison is fair). Evaluates on
-    test_set every epoch; returns the model with the best test-MSE weights.
-    `save`: optional path to store those weights.
+    val_set every epoch and keeps the weights with the lowest val MSE; those are
+    scored once on test_set at the end. Returns the model with the selected weights.
+    `save`: optional path to store those weights (and their val / test metrics).
     Logs to Weights & Biases (see tracking.py) unless wandb=False."""
     import data
-    lo, hi = data._flow_scale or (0.0, 1.0)
+    try:
+        lo, hi = data.scale_of(train_set)                 # train files only, for a file split
+    except TypeError:
+        lo, hi = data._flow_scale or (0.0, 1.0)
     device = device or pick_device()
     model = model.to(device)
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
                               drop_last=True, num_workers=workers)
+    val_loader = DataLoader(val_set, batch_size=batch_size * 2, num_workers=workers)
     test_loader = DataLoader(test_set, batch_size=batch_size * 2, num_workers=workers)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr,
                                                 total_steps=epochs * len(train_loader))
     print(f"{type(model).__name__}: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params, "
-          f"{len(train_set)} train / {len(test_set)} test, device={device}")
+          f"{len(train_set)} train / {len(val_set)} val / {len(test_set)} test, device={device}")
  
     tracker = Tracker(
         name=run_name or "mlp_mse", job_type="mlp", enabled=wandb,
         config=dict(model=type(model).__name__.lower(), loss="mse", epochs=epochs,
                     batch_size=batch_size, lr=lr, weight_decay=weight_decay,
                     t_in=getattr(model, "t_in", None), t_out=getattr(model, "t_out", None),
-                    params=sum(p.numel() for p in model.parameters())))
-    tracker.log_reference(evaluate(CopyLast(model.t_out), test_loader, device, hi - lo, lo,
-                                   desc="  copy-last reference"))
+                    params=sum(p.numel() for p in model.parameters()), **(extra_config or {})))
+    tracker.log_reference(
+        val=evaluate(CopyLast(model.t_out), val_loader, device, hi - lo, lo, desc="  copy-last (val)"),
+        test=evaluate(CopyLast(model.t_out), test_loader, device, hi - lo, lo, desc="  copy-last (test)"))
     tracker.start(epochs, len(train_loader))
 
-    best, best_state = float("inf"), None
+    best, best_state, best_epoch, best_val = float("inf"), None, None, None
     bar_ep = tqdm(range(epochs), desc=type(model).__name__, unit="ep", dynamic_ncols=True, mininterval=1)
     for epoch in bar_ep:
         model.train()
@@ -84,31 +92,37 @@ def fit(model, train_set, test_set, epochs=50, batch_size=16, lr=1e-3,
             running += loss.item()
             bar.set_postfix(loss=f"{running / i:.5f}")
             tracker.step(loss.item(), sched.get_last_lr()[0])
-        m = evaluate(model, test_loader, device, hi - lo, lo)
+        m = evaluate(model, val_loader, device, hi - lo, lo)
         tracker.log_eval(epoch + 1, m, train_loss=running / len(train_loader),
-                         epoch_time=time.time() - t0, model=model, dataset=test_set,
+                         epoch_time=time.time() - t0, model=model, dataset=val_set,
                          device=device, span=hi - lo, lo=lo, last=epoch + 1 == epochs)
         mark = ""
-        if m["mse_frame"] < best:                         # same criterion as before (per-frame MSE)
-            best, mark = m["mse_frame"], "  *"
+        if m[SELECT] < best:                              # select on VAL, never on test
+            best, mark, best_epoch, best_val = m[SELECT], "  *", epoch + 1, m
             tracker.log_best(epoch + 1, m)
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             if save:
                 torch.save(best_state, save)
-        bar_ep.set_postfix(best_mse=f"{best:.4f}")
+        bar_ep.set_postfix(best_val_mse=f"{best:.5f}")
         tqdm.write(f"epoch {epoch + 1}/{epochs}  train_loss {running / len(train_loader):.5f}  "
                    f"{fmt(m)}  {time.time() - t0:.0f}s{mark}")
  
-    tracker.finish()
+    # final: the selected weights, scored once on the test set
     model.load_state_dict(best_state)
+    m_test = evaluate(model, test_loader, device, hi - lo, lo, desc="  test")
+    tracker.log_test(m_test, epoch=epochs)
+    if save:
+        torch.save(best_state, save)                      # weights only, as before
+        torch.save({"epoch": best_epoch, "val_metrics": best_val, "test_metrics": m_test},
+                   os.path.splitext(save)[0] + ".metrics.pt")
+    tracker.finish()
     model.eval()
     return model
 
 
 if __name__ == "__main__":
     import argparse
-    import os
-    from data import taxibj_splits
+    import data
 
     ap = argparse.ArgumentParser(description="Train the MLP baseline on TaxiBJ with MSE loss.")
     ap.add_argument("--tin", type=int, default=4)
@@ -120,12 +134,14 @@ if __name__ == "__main__":
     ap.add_argument("--depth", type=int, default=3)
     ap.add_argument("--save", default="checkpoints/mlp_mse.pt")
     ap.add_argument("--no-wandb", action="store_true", help="don't log to Weights & Biases")
+    data.add_split_args(ap)
     args = ap.parse_args()
+    split = data.split_kwargs(args)
 
     if os.path.dirname(args.save):
         os.makedirs(os.path.dirname(args.save), exist_ok=True)
-    train_set, test_set = taxibj_splits(args.tin, args.tout)
+    train_set, val_set, test_set = data.taxibj_splits(args.tin, args.tout, val=True, **split)
     fit(MLP(t_in=args.tin, t_out=args.tout, hidden=args.hidden, depth=args.depth),
-        train_set, test_set, epochs=args.epochs, batch_size=args.batch_size,
-        lr=args.lr, save=args.save, wandb=not args.no_wandb,
+        train_set, val_set, test_set, epochs=args.epochs, batch_size=args.batch_size,
+        lr=args.lr, save=args.save, wandb=not args.no_wandb, extra_config=split,
         run_name="mlp_mse" + ("" if (args.tin, args.tout) == (4, 4) else f"_in{args.tin}_out{args.tout}"))

@@ -16,7 +16,8 @@ On a cluster whose compute nodes have no internet, run that once on a login node
 Keys are the file's path under datasets/ with separators replaced by "-",
 e.g. "TaxiBJ-TaxiBJ2013.npy", "MovingMNIST-mnist_test_seq.npy".
 
-Train/test splits matching the paper: taxibj_splits(), moving_mnist_splits().
+Splits: taxibj_splits() (the paper's split by default, or by file, with optional sizes),
+moving_mnist_splits(). Training scripts expose the options via add_split_args().
 """
 
 import os
@@ -28,13 +29,14 @@ import urllib.request
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, TensorDataset, ConcatDataset
+from torch.utils.data import Dataset, TensorDataset, ConcatDataset, Subset
 
 # datasets/ next to this file, so scripts work from any working directory (e.g. Slurm jobs)
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets")
 MMNIST_URL = "http://www.cs.toronto.edu/~nitish/unsupervised_video/mnist_test_seq.npy"
 TAXIBJ_PREFIX = "TaxiBJ-TaxiBJ2"      # flow files; excludes TaxiBJ-TaxiBJext*
 TAXIBJ_TEST_FRAMES = 28 * 48          # last 4 weeks of half-hour slots
+TAXIBJ_VAL_FRAMES = 28 * 48           # 4 weeks just before the test period (val=True)
 
 
 mnist_path = os.path.join(ROOT, "MovingMNIST", "mnist_test_seq.npy")
@@ -135,16 +137,17 @@ class MovingMNISTGenerator(Dataset):
     """Generates fresh bouncing-digit sequences every access (the paper trains on
     10,000 freshly generated sequences and tests on mnist_test_seq.npy)."""
 
-    def __init__(self, digits, length=10000, T=20, t_in=10, size=64, num_digits=2):
+    def __init__(self, digits, length=10000, T=20, t_in=10, size=64, num_digits=2, seed=None):
         self.digits = digits            # (M, 28, 28) float32 in [0, 1]
         self.length, self.T, self.t_in = length, T, t_in
         self.size, self.num_digits = size, num_digits
+        self.seed = seed                # None: new sequences every access; int: fixed set
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, i):
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(None if self.seed is None else (self.seed, i))
         T, S, lim = self.T, self.size, self.size - 28
         seq = np.zeros((T, S, S), dtype=np.float32)
         for _ in range(self.num_digits):
@@ -209,16 +212,131 @@ for key, arr in arrays.items():
 # ---------------------------------------------------------------------------
 # Train/test splits matching the paper
 # ---------------------------------------------------------------------------
-def taxibj_splits(t_in=4, t_out=4):
-    """Train on everything except the last 4 weeks; test on the last 4 weeks.
-    Windows never cross file boundaries."""
+SPLIT_KEYS = ("train_files", "val_files", "test_files", "train_size", "val_size", "test_size")
+
+
+def _match_files(specs):
+    """TaxiBJ file keys for specs like ["2013"] or ["TaxiBJ2014.npy"] (substring match,
+    each spec must match exactly one flow file)."""
     keys = _taxibj_keys()
-    train_parts = []
-    for k in keys:
-        frames = arrays[k][:-TAXIBJ_TEST_FRAMES] if k == keys[-1] else arrays[k]
-        train_parts.append(FlowWindowDataset(frames, t_in, t_out, _flow_scale))
-    test = FlowWindowDataset(arrays[keys[-1]][-TAXIBJ_TEST_FRAMES:], t_in, t_out, _flow_scale)
-    return ConcatDataset(train_parts), test
+    out = []
+    for s in specs:
+        hits = [k for k in keys if str(s) in k]
+        if len(hits) != 1:
+            raise ValueError(f"'{s}' matches {hits or 'no file'}; TaxiBJ flow files: {keys}")
+        out.append(hits[0])
+    return out
+
+
+def _limit(ds, size, name):
+    """First `size` windows of ds: an int is a count, a float in (0, 1] a fraction.
+    The first ones, not a random sample: windows stay contiguous in time."""
+    if size is None:
+        return ds
+    n = len(ds)
+    k = int(round(size * n)) if isinstance(size, float) and 0 < size <= 1 else int(size)
+    if k <= 0:
+        raise ValueError(f"{name}_size={size} leaves no windows")
+    if k > n:
+        print(f"[data.py] {name}_size={size} but the {name} split only has {n} windows; using all")
+        return ds
+    return Subset(ds, range(k))
+
+
+def taxibj_splits(t_in=4, t_out=4, val=False, train_files=None, val_files=None,
+                  test_files=None, train_size=None, val_size=None, test_size=None):
+    """Train / (val) / test windows over the TaxiBJ flow files.
+
+    By FILE (any *_files given): each split is the whole of the files you name, e.g.
+        taxibj_splits(val=True, train_files=["2013"], val_files=["2014"], test_files=["2015"])
+    Names match by substring of the file name (here TaxiBJ2013.npy, ...). A file may be in
+    only one split. The min-max scale comes from the TRAIN files only, so nothing about the
+    val / test data leaks into the inputs; get it with scale_of(train).
+
+    Default (no *_files): the paper's split. Test = the last 4 weeks of the last file,
+    train = everything before; with val=True, val = the 4 weeks just before the test period.
+
+    Sizes (either mode): *_size keeps the first N windows of that split (an int), or the
+    first fraction of it (a float in (0, 1]), e.g. train_size=2000, test_size=0.5.
+
+    val=False -> (train, test); val=True -> (train, val, test). Every file / split is its own
+    window dataset, so windows never cross file or split boundaries."""
+    if train_files or val_files or test_files:
+        if not train_files or not test_files:
+            raise ValueError("splitting by file needs at least train_files and test_files")
+        if val and not val_files:
+            raise ValueError("val=True with a file split needs val_files")
+        if val_files and not val:
+            raise ValueError("val_files given but val=False")
+        tr, va, te = (_match_files(f or []) for f in (train_files, val_files, test_files))
+        shared = (set(tr) & set(va)) | (set(tr) & set(te)) | (set(va) & set(te))
+        if shared:
+            raise ValueError(f"file(s) in more than one split: {sorted(shared)}")
+        lo, hi = np.inf, -np.inf                                   # scale: train files only
+        for k in tr:
+            lo, hi = min(lo, float(arrays[k].min())), max(hi, float(arrays[k].max()))
+        cat = lambda ks: ConcatDataset([FlowWindowDataset(arrays[k], t_in, t_out, (lo, hi))
+                                        for k in ks])
+        train, val_set, test = cat(tr), (cat(va) if val else None), cat(te)
+    else:
+        keys = _taxibj_keys()
+        train_parts, val_set = [], None
+        for k in keys:
+            frames = arrays[k]
+            if k == keys[-1]:
+                frames = frames[:-TAXIBJ_TEST_FRAMES]
+                if val:
+                    val_set = FlowWindowDataset(frames[-TAXIBJ_VAL_FRAMES:], t_in, t_out, _flow_scale)
+                    frames = frames[:-TAXIBJ_VAL_FRAMES]
+            train_parts.append(FlowWindowDataset(frames, t_in, t_out, _flow_scale))
+        train = ConcatDataset(train_parts)
+        test = FlowWindowDataset(arrays[keys[-1]][-TAXIBJ_TEST_FRAMES:], t_in, t_out, _flow_scale)
+
+    train = _limit(train, train_size, "train")
+    test = _limit(test, test_size, "test")
+    if val:
+        return train, _limit(val_set, val_size, "val"), test
+    if val_size is not None:
+        raise ValueError("val_size given but val=False")
+    return train, test
+
+
+def scale_of(ds):
+    """(lo, hi) min-max scale of a split from taxibj_splits (raw = scaled * (hi - lo) + lo).
+    Use the TRAIN split's: with a file split it differs from the global _flow_scale."""
+    if isinstance(ds, FlowWindowDataset):
+        return ds.lo, ds.lo + ds.span
+    if isinstance(ds, ConcatDataset):
+        return scale_of(ds.datasets[0])
+    if isinstance(ds, Subset):
+        return scale_of(ds.dataset)
+    raise TypeError(f"no scale on {type(ds).__name__}")
+
+
+def _size_arg(s):
+    """'2000' -> 2000 windows; '0.25' -> a quarter of the split."""
+    return float(s) if any(c in s for c in ".eE") else int(s)
+
+
+def add_split_args(ap):
+    """The split options every training script takes (see taxibj_splits)."""
+    g = ap.add_argument_group(
+        "data splits",
+        "Default: the paper's TaxiBJ split (test = last 4 weeks, val = the 4 weeks before). "
+        "Name files to split by file instead, e.g. --train-files 2013 --val-files 2014 "
+        "--test-files 2015 2016. Sizes keep the first N windows (or a fraction, e.g. 0.5).")
+    g.add_argument("--train-files", nargs="+", metavar="NAME", help="TaxiBJ files to train on")
+    g.add_argument("--val-files", nargs="+", metavar="NAME", help="TaxiBJ files to validate on")
+    g.add_argument("--test-files", nargs="+", metavar="NAME", help="TaxiBJ files to test on")
+    g.add_argument("--train-size", type=_size_arg, metavar="N", help="train windows (or fraction)")
+    g.add_argument("--val-size", type=_size_arg, metavar="N", help="val windows (or fraction)")
+    g.add_argument("--test-size", type=_size_arg, metavar="N", help="test windows (or fraction)")
+    return g
+
+
+def split_kwargs(args):
+    """The split options from parsed args, as taxibj_splits keyword arguments."""
+    return {k: getattr(args, k, None) for k in SPLIT_KEYS}
 
 
 def _fetch(url, dest, timeout, retries, desc):
@@ -275,15 +393,21 @@ def download_moving_mnist(timeout=60, retries=3):
     return mnist_path
 
 
-def moving_mnist_splits(train_size=10000):
+def moving_mnist_splits(train_size=10000, val=False, val_size=1000, test_size=None):
     """Train: generated on the fly from MNIST digits. Test: mnist_test_seq.npy.
+    val=True also returns a fixed (seeded) set of generated sequences as validation:
+    (train, val, test). test_size keeps the first N test sequences (or a fraction).
     Downloads both on first use (see download_moving_mnist)."""
     from torchvision.datasets import MNIST
     download_moving_mnist()
     mnist = MNIST(os.path.join(ROOT, "MNIST_raw"), train=True, download=False)
     digits = mnist.data.numpy().astype(np.float32) / 255.0
     test_key = next(k for k in datasets if "mnist_test_seq" in k)
-    return MovingMNISTGenerator(digits, length=train_size), datasets[test_key]
+    train = MovingMNISTGenerator(digits, length=train_size)
+    test = _limit(datasets[test_key], test_size, "test")
+    if val:
+        return train, MovingMNISTGenerator(digits, length=val_size, seed=12345), test
+    return train, test
 
 
 if __name__ == "__main__":
