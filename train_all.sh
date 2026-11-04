@@ -6,9 +6,19 @@
 #   ./train_all.sh --epochs 5           # same epoch count for every run (quick comparison)
 #   ./train_all.sh --quick              # 1 epoch each: checks the whole pipeline end to end
 #   ./train_all.sh --tin 6 --tout 6     # other horizon (names get an _in6_out6 suffix)
+#   ./train_all.sh --train-files 2013 --val-files 2014 --test-files 2015 2016
+#                                       # split by TaxiBJ file (names get _tr2013_va2014_te2015-2016)
+#   ./train_all.sh --train-size 5000 --val-size 500 --test-size 0.5
+#                                       # fewer windows per split (int = count, decimal = fraction;
+#                                       # names get _ntr5000_nva500_nte0.5)
 #   ./train_all.sh --force              # retrain even if the checkpoint already exists
 #   ./train_all.sh --list               # show the runs and exit
 #   ./train_all.sh --no-wandb           # don't log to Weights & Biases
+#
+# Protocol: every run picks its checkpoint on the VALIDATION set (val MSE, the same for every
+# model) and scores it once on the TEST set at the end; results.tsv holds those test numbers.
+# Default split: test = last 4 weeks of TaxiBJ, val = the 4 weeks before, train = the rest.
+# The split flags are passed to every run (copy_last included), so all models see the same data.
 #
 # Weights & Biases: every run logs to project $WANDB_PROJECT (default "traffic-pred"),
 # named after the run (cnn_mse, ...), grouped per invocation (the Slurm job ID when there
@@ -34,13 +44,16 @@
 #
 # Output:
 #   checkpoints/<name>.pt          best weights for each run (updated during training)
-#   checkpoints/results.tsv        final test MSE and Sinkhorn of every model (also printed at the end)
+#   checkpoints/results.tsv        final test MSE, Sinkhorn, TV and volume error of every model
+#                                  (also printed at the end)
 #   checkpoints/<name>.done        written only when a run finishes; runs with a .done are skipped,
-#                                  so a job killed by its time limit redoes only unfinished runs
+#                                  so a job killed by its time limit redoes only unfinished runs.
+#                                  Runs finished before the val/test protocol (checkpoint picked on
+#                                  the test set) don't count as done: they are retrained.
 #   checkpoints/<name>.last.pt     end-of-epoch state of cnn_* / distvol_* runs; an unfinished run
 #                                  resumes from it (same W&B run, same charts). --force starts over.
 #   checkpoints/logs/<name>.log    full training log
-#   checkpoints/runs/              PredFormer's own run folders (last.pt for --resume)
+#   checkpoints/runs[/<split>]/    PredFormer's own run folders (last.pt for --resume)
 #
 # Resubmitting after a time limit: finished runs are skipped, an interrupted cnn_*/distvol_*
 # run continues from its last epoch in its original W&B run and group; runs that hadn't
@@ -55,6 +68,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # --- options -----------------------------------------------------------------
 EPOCHS="" TIN=4 TOUT=4 FORCE=0 LIST=0 FILTERS=()
+TRAIN_FILES=() VAL_FILES=() TEST_FILES=() TRAIN_SIZE="" VAL_SIZE="" TEST_SIZE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --epochs) EPOCHS="$2"; shift 2 ;;
@@ -64,7 +78,19 @@ while [ $# -gt 0 ]; do
         --force)  FORCE=1; shift ;;
         --list)   LIST=1; shift ;;
         --no-wandb) export WANDB_MODE=disabled; shift ;;
-        -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
+        --train-files|--val-files|--test-files)        # one or more names, up to the next option
+            opt="$1"; shift; vals=()
+            while [ $# -gt 0 ] && [[ "$1" != -* ]]; do vals+=("$1"); shift; done
+            [ ${#vals[@]} -eq 0 ] && { echo "$opt needs at least one file name"; exit 2; }
+            case "$opt" in
+                --train-files) TRAIN_FILES=("${vals[@]}") ;;
+                --val-files)   VAL_FILES=("${vals[@]}") ;;
+                --test-files)  TEST_FILES=("${vals[@]}") ;;
+            esac ;;
+        --train-size) TRAIN_SIZE="$2"; shift 2 ;;
+        --val-size)   VAL_SIZE="$2"; shift 2 ;;
+        --test-size)  TEST_SIZE="$2"; shift 2 ;;
+        -h|--help) sed -n '2,64p' "$0"; exit 0 ;;
         -*) echo "unknown option: $1 (see --help)"; exit 2 ;;
         *)  FILTERS+=("$1"); shift ;;
     esac
@@ -72,6 +98,27 @@ done
 
 SUFFIX=""
 [ "$TIN" != 4 ] || [ "$TOUT" != 4 ] && SUFFIX="_in${TIN}_out${TOUT}"
+
+# --- data split: flags passed to every run, and a name suffix so splits don't collide ---
+join() { local IFS=-; echo "$*"; }
+SPLIT_ARGS="" SPLIT_SUFFIX=""
+n_files=$(( ${#TRAIN_FILES[@]} + ${#VAL_FILES[@]} + ${#TEST_FILES[@]} ))
+if [ "$n_files" -gt 0 ]; then
+    if [ ${#TRAIN_FILES[@]} -eq 0 ] || [ ${#VAL_FILES[@]} -eq 0 ] || [ ${#TEST_FILES[@]} -eq 0 ]; then
+        echo "splitting by file needs all three: --train-files, --val-files and --test-files"; exit 2
+    fi
+    SPLIT_ARGS="--train-files ${TRAIN_FILES[*]} --val-files ${VAL_FILES[*]} --test-files ${TEST_FILES[*]}"
+    SPLIT_SUFFIX="_tr$(join "${TRAIN_FILES[@]}")_va$(join "${VAL_FILES[@]}")_te$(join "${TEST_FILES[@]}")"
+fi
+[ -n "$TRAIN_SIZE" ] && SPLIT_ARGS="$SPLIT_ARGS --train-size $TRAIN_SIZE" && SPLIT_SUFFIX="${SPLIT_SUFFIX}_ntr$TRAIN_SIZE"
+[ -n "$VAL_SIZE" ]   && SPLIT_ARGS="$SPLIT_ARGS --val-size $VAL_SIZE"     && SPLIT_SUFFIX="${SPLIT_SUFFIX}_nva$VAL_SIZE"
+[ -n "$TEST_SIZE" ]  && SPLIT_ARGS="$SPLIT_ARGS --test-size $TEST_SIZE"   && SPLIT_SUFFIX="${SPLIT_SUFFIX}_nte$TEST_SIZE"
+SUFFIX="$SUFFIX$SPLIT_SUFFIX"
+# PredFormer names its own run folder (taxibj, taxibj_official, + horizon); keep each split's apart
+PF_OUT="checkpoints/runs"
+[ -n "$SPLIT_SUFFIX" ] && PF_OUT="checkpoints/runs/split${SPLIT_SUFFIX}"
+# .done files carry this; older ones (checkpoint picked on the test set) don't count as finished
+PROTOCOL="protocol=val-select-v1"
 
 # --- environment ----------------------------------------------------------------
 if [ -z "${VIRTUAL_ENV:-}" ] && [ -f .env/bin/activate ]; then
@@ -99,14 +146,14 @@ ESC="$(printf '\033')"     # for stripping terminal escape codes from logs (port
 
 # --- run table: name | default epochs | command (EPOCHS_ and SAVE_ filled in below) ---
 RUNS=(
-    "copy_last|200|baseline_copy_last.py --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_"
-    "cnn_mse|50|train_distvol.py --model cnn --loss mse --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ --workers $WORKERS"
-    "cnn_sinkhorn|50|train_distvol.py --model cnn --loss sinkhorn --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ --workers $WORKERS"
-    "distvol_mse|50|train_distvol.py --model distvol --loss mse --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ --workers $WORKERS"
-    "distvol_sinkhorn|50|train_distvol.py --model distvol --loss sinkhorn --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ --workers $WORKERS"
-    "mlp_mse|50|baseline_mlp.py --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_"
-    "predformer_mse|200|train.py --dataset taxibj --impl mine --t-in $TIN --t-out $TOUT --epochs EPOCHS_ --out checkpoints/runs --workers $WORKERS"
-    "predformer_official_mse|200|train.py --dataset taxibj --impl official --t-in $TIN --t-out $TOUT --epochs EPOCHS_ --out checkpoints/runs --workers $WORKERS"
+    "copy_last|200|baseline_copy_last.py --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ $SPLIT_ARGS"
+    "cnn_mse|50|train_distvol.py --model cnn --loss mse --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ --workers $WORKERS $SPLIT_ARGS"
+    "cnn_sinkhorn|50|train_distvol.py --model cnn --loss sinkhorn --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ --workers $WORKERS $SPLIT_ARGS"
+    "distvol_mse|50|train_distvol.py --model distvol --loss mse --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ --workers $WORKERS $SPLIT_ARGS"
+    "distvol_sinkhorn|50|train_distvol.py --model distvol --loss sinkhorn --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ --workers $WORKERS $SPLIT_ARGS"
+    "mlp_mse|50|baseline_mlp.py --tin $TIN --tout $TOUT --epochs EPOCHS_ --save SAVE_ $SPLIT_ARGS"
+    "predformer_mse|200|train.py --dataset taxibj --impl mine --t-in $TIN --t-out $TOUT --epochs EPOCHS_ --out $PF_OUT --workers $WORKERS $SPLIT_ARGS"
+    "predformer_official_mse|200|train.py --dataset taxibj --impl official --t-in $TIN --t-out $TOUT --epochs EPOCHS_ --out $PF_OUT --workers $WORKERS $SPLIT_ARGS"
 )
 
 selected() {   # run name matches any filter (or there are no filters)
@@ -124,7 +171,7 @@ if [ "$LIST" = 1 ]; then
     exit 0
 fi
 
-# --- results table: run, final test MSE / Sinkhorn / volume error, best epoch ------------
+# --- results table: run, final test MSE / Sinkhorn / TV / volume error, best epoch -------
 RESULTS=checkpoints/results.tsv
 record_result() {   # $1 = tag, $2 = log; reads the run's "FINAL ..." line
     local line="" i
@@ -135,16 +182,17 @@ record_result() {   # $1 = tag, $2 = log; reads the run's "FINAL ..." line
     done
     [ -z "$line" ] && return
     local header
-    header="$(printf 'run\tmse\tsinkhorn\tvolume_err\tbest_epoch')"
+    header="$(printf 'run\tmse\tsinkhorn\tdist_tv\tvolume_err\tbest_epoch')"
     if [ ! -f "$RESULTS" ] || [ "$(head -1 "$RESULTS")" != "$header" ]; then
         [ -f "$RESULTS" ] && mv "$RESULTS" "$RESULTS.old"          # older format: keep it aside
         echo "$header" > "$RESULTS"
     fi
     awk -v t="$1" -F'\t' '$1 != t' "$RESULTS" > "$RESULTS.tmp"      # drop this run's old row
-    # FINAL <name>  mse=..  sinkhorn=..  volume_err=..  best_epoch=..
+    # FINAL <name>  mse=..  sinkhorn=..  dist_tv=..  volume_err=..  best_epoch=..  (test)
     echo "$line" | awk -v t="$1" '{
-        for (i = 3; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
-        printf "%s\t%s\t%s\t%s\t%s\n", t, v["mse"], v["sinkhorn"], v["volume_err"], v["best_epoch"] }' >> "$RESULTS.tmp"
+        for (i = 3; i <= NF; i++) if (index($i, "=")) { split($i, kv, "="); v[kv[1]] = kv[2] }
+        printf "%s\t%s\t%s\t%s\t%s\t%s\n", t, v["mse"], v["sinkhorn"], v["dist_tv"], v["volume_err"],
+               v["best_epoch"] }' >> "$RESULTS.tmp"
     mv "$RESULTS.tmp" "$RESULTS"
 }
 
@@ -160,8 +208,11 @@ for r in "${RUNS[@]}"; do
 
     done_mark="checkpoints/$tag.done"
     if [ -f "$done_mark" ] && [ "$FORCE" = 0 ]; then
-        echo "=== $tag: already finished ($done_mark), skipping (use --force to retrain)"
-        SKIPPED+=("$tag"); continue
+        if grep -qx "$PROTOCOL" "$done_mark"; then
+            echo "=== $tag: already finished ($done_mark), skipping (use --force to retrain)"
+            SKIPPED+=("$tag"); continue
+        fi
+        echo "=== $tag: finished before the val/test protocol (picked on test); retraining"
     fi
 
     rm -f "$done_mark"
@@ -188,11 +239,11 @@ for r in "${RUNS[@]}"; do
             # train.py writes checkpoints/runs/<run>/best.pt; copy it next to the others
             run_dir="taxibj"
             [ "$name" = predformer_official_mse ] && run_dir="taxibj_official"
-            [ -n "$SUFFIX" ] && run_dir="${run_dir}${SUFFIX}"
-            cp "checkpoints/runs/$run_dir/best.pt" "$ckpt" 2>/dev/null
+            [ "$TIN" != 4 ] || [ "$TOUT" != 4 ] && run_dir="${run_dir}_in${TIN}_out${TOUT}"
+            cp "$PF_OUT/$run_dir/best.pt" "$ckpt" 2>/dev/null
         fi
         if [ -f "$ckpt" ]; then
-            touch "$done_mark"
+            echo "$PROTOCOL" > "$done_mark"
             record_result "$tag" "$log"
             DONE+=("$tag ($(( ($(date +%s) - t0) / 60 )) min)")
         else
@@ -211,7 +262,7 @@ for t in "${SKIPPED[@]}"; do echo "  skipped  $t (already had a checkpoint)"; do
 for t in "${FAILED[@]}";  do echo "  FAILED   $t  (log: checkpoints/logs/${t}.log)"; done
 if [ -f "$RESULTS" ]; then
     echo
-    echo "=== final test metrics (best epoch of each model)  [$RESULTS]"
-    awk -F'\t' '{printf "  %-26s %-12s %-12s %-12s %s\n", $1, $2, $3, $4, $5}' "$RESULTS"
+    echo "=== final test metrics (checkpoint picked on val, scored once on test)  [$RESULTS]"
+    awk -F'\t' '{printf "  %-40s %-12s %-12s %-12s %-12s %s\n", $1, $2, $3, $4, $5, $6}' "$RESULTS"
 fi
 [ ${#FAILED[@]} -eq 0 ]
