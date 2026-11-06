@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
  
 import data
+from seeding import seed_everything
 from predformer import PredFormer, CONFIGS
  
  
@@ -75,7 +76,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
  
-    torch.manual_seed(args.seed)
+    seed_everything(args.seed)
     cfg = CONFIGS[args.dataset]
     hp = dict(cfg["train"])
     for k in ("epochs", "batch_size", "lr", "weight_decay"):

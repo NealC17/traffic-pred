@@ -11,6 +11,7 @@
 #   ./train_all.sh --train-size 5000 --val-size 500 --test-size 0.5
 #                                       # fewer windows per split (int = count, decimal = fraction;
 #                                       # names get _ntr5000_nva500_nte0.5)
+#   ./train_all.sh --seed 1             # another random seed (names get a _seed1 suffix)
 #   ./train_all.sh --force              # retrain even if the checkpoint already exists
 #   ./train_all.sh --list               # show the runs and exit
 #   ./train_all.sh --no-wandb           # don't log to Weights & Biases
@@ -69,7 +70,7 @@ set -o pipefail      # no -u: macOS's bash 3.2 treats empty arrays as unbound
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # --- options -----------------------------------------------------------------
-EPOCHS="" TIN=4 TOUT=4 FORCE=0 LIST=0 FILTERS=()
+EPOCHS="" TIN=4 TOUT=4 FORCE=0 LIST=0 FILTERS=() SEED=""
 TRAIN_FILES=() VAL_FILES=() TEST_FILES=() TRAIN_SIZE="" VAL_SIZE="" TEST_SIZE=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -77,6 +78,7 @@ while [ $# -gt 0 ]; do
         --quick)  EPOCHS=1; shift ;;
         --tin)    TIN="$2"; shift 2 ;;
         --tout)   TOUT="$2"; shift 2 ;;
+        --seed)   SEED="$2"; shift 2 ;;
         --force)  FORCE=1; shift ;;
         --list)   LIST=1; shift ;;
         --no-wandb) export WANDB_MODE=disabled; shift ;;
@@ -116,9 +118,15 @@ fi
 [ -n "$VAL_SIZE" ]   && SPLIT_ARGS="$SPLIT_ARGS --val-size $VAL_SIZE"     && SPLIT_SUFFIX="${SPLIT_SUFFIX}_nva$VAL_SIZE"
 [ -n "$TEST_SIZE" ]  && SPLIT_ARGS="$SPLIT_ARGS --test-size $TEST_SIZE"   && SPLIT_SUFFIX="${SPLIT_SUFFIX}_nte$TEST_SIZE"
 SUFFIX="$SUFFIX$SPLIT_SUFFIX"
-# PredFormer names its own run folder (taxibj, taxibj_official, + horizon); keep each split's apart
+# --seed: passed to every trained run; without it each script uses its default (seed 0)
+# and names stay as they were, so existing checkpoints keep matching
+SEED_SUFFIX=""
+[ -n "$SEED" ] && SEED_SUFFIX="_seed$SEED"
+SUFFIX="$SUFFIX$SEED_SUFFIX"
+# PredFormer names its own run folder (taxibj, taxibj_official, + horizon); keep each
+# split's and seed's apart, so --resume never picks up another seed's last.pt
 PF_OUT="checkpoints/runs"
-[ -n "$SPLIT_SUFFIX" ] && PF_OUT="checkpoints/runs/split${SPLIT_SUFFIX}"
+[ -n "$SPLIT_SUFFIX$SEED_SUFFIX" ] && PF_OUT="checkpoints/runs/split${SPLIT_SUFFIX}${SEED_SUFFIX}"
 # .done files carry this; older ones (checkpoint picked on the test set) don't count as finished
 PROTOCOL="protocol=val-select-v1"
 
@@ -229,6 +237,8 @@ for r in "${RUNS[@]}"; do
     append=0
     [[ "$cmd" == *--resume* ]] && [ -f "checkpoints/$tag.last.pt" ] && append=1
     [ "$append" = 0 ] && : > "$log"
+    # copy_last has no weights to seed
+    [ -n "$SEED" ] && [[ "$cmd" != baseline_copy_last.py* ]] && cmd="$cmd --seed $SEED"
     cmd="${cmd//EPOCHS_/${EPOCHS:-$ep}}"
     cmd="${cmd//SAVE_/$ckpt}"
     export WANDB_NAME="$tag"

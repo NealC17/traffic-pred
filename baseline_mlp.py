@@ -7,6 +7,7 @@ import time
 from tqdm import tqdm
 from devices import pick_device
 from tracking import Tracker, CopyLast, evaluate, fmt, SELECT
+from seeding import seed_everything
 class MLP(nn.Module):
     """Fully connected baseline. Flattens every input value (T_in x C x H x W =
     4 x 2 x 32 x 32 = 8192 for TaxiBJ) into one vector, passes it through
@@ -133,15 +134,18 @@ if __name__ == "__main__":
     ap.add_argument("--hidden", type=int, default=512)
     ap.add_argument("--depth", type=int, default=3)
     ap.add_argument("--save", default="checkpoints/mlp_mse.pt")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="seeds the initial weights, shuffle order and dropout (default 0)")
     ap.add_argument("--no-wandb", action="store_true", help="don't log to Weights & Biases")
     data.add_split_args(ap)
     args = ap.parse_args()
     split = data.split_kwargs(args)
+    seed_everything(args.seed)
 
     if os.path.dirname(args.save):
         os.makedirs(os.path.dirname(args.save), exist_ok=True)
     train_set, val_set, test_set = data.taxibj_splits(args.tin, args.tout, val=True, **split)
     fit(MLP(t_in=args.tin, t_out=args.tout, hidden=args.hidden, depth=args.depth),
         train_set, val_set, test_set, epochs=args.epochs, batch_size=args.batch_size,
-        lr=args.lr, save=args.save, wandb=not args.no_wandb, extra_config=split,
+        lr=args.lr, save=args.save, wandb=not args.no_wandb, extra_config=dict(split, seed=args.seed),
         run_name="mlp_mse" + ("" if (args.tin, args.tout) == (4, 4) else f"_in{args.tin}_out{args.tout}"))

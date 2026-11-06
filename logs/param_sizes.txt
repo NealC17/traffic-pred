@@ -1,0 +1,18 @@
+Trainable parameter counts — checkpoints/
+Generated 2026-11-05 16:34
+Split: tr2013_va2014_te2015-2016_1-2016_2
+
+model                loss         params    size  vs distvol
+-------------------  --------  ---------  ------  ----------
+predformer_official  mse       9,491,232   9.49M       2.40x
+mlp                  mse       8,662,016   8.66M       2.19x
+predformer           mse       8,441,120   8.44M       2.14x
+distvol              mse       3,952,272   3.95M       1.00x
+distvol              sinkhorn  3,952,272   3.95M       1.00x
+stresnet             mse         903,752  903.8K       0.23x
+stresnet             sinkhorn    903,752  903.8K       0.23x
+cnn                  mse         449,864  449.9K       0.11x
+cnn                  sinkhorn    449,864  449.9K       0.11x
+
+Could not read:
+  copy_last_tr2013_va2014_te2015-2016_1-2016_2: ValueError: couldn't find weights in checkpoint

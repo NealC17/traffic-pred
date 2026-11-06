@@ -36,6 +36,7 @@ from tqdm import tqdm
 
 from devices import pick_device
 import data
+from seeding import seed_everything
 from tracking import Tracker, CopyLast, evaluate, fmt, SELECT
 from predformer import PredFormer, CONFIGS, VARIANTS
 
@@ -100,7 +101,7 @@ def main():
     args = ap.parse_args()
     split = data.split_kwargs(args)
 
-    torch.manual_seed(args.seed)
+    seed_everything(args.seed)
     cfg = CONFIGS[args.dataset]
     hp = dict(cfg["train"])
     for k in ("epochs", "batch_size", "lr", "weight_decay"):

@@ -7,6 +7,7 @@ Train DistVolNet on TaxiBJ using data.py's taxibj_splits().
   python train_distvol.py --model stresnet --loss mse              # ST-ResNet (paper: MSE)
   python train_distvol.py --synthetic --epochs 2 --width 32 --sinkhorn_iters 10   # smoke test
   python train_distvol.py ... --resume       # continue from <save>.last.pt if it exists
+  python train_distvol.py ... --seed 1       # another seed (default 0); use its own --save path
   python train_distvol.py --train-files 2013 --val-files 2014 --test-files 2015 2016
   python train_distvol.py --train-size 5000 --val-size 500 --test-size 0.5
 
@@ -53,6 +54,7 @@ from tracking import Tracker, CopyLast, evaluate, fmt, SELECT
 from distvol import DistVolNet, DistVolLoss
 from baseline_cnn import BaselineCNN
 from stresnet import STResNet
+from seeding import seed_everything
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +175,8 @@ def main():
     ap.add_argument("--eps", type=float, default=0.01, help="Sinkhorn blur")
     ap.add_argument("--sinkhorn_iters", type=int, default=30)
     ap.add_argument("--no-wandb", action="store_true", help="don't log to Weights & Biases")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="seeds the initial weights, shuffle order and dropout (default 0)")
     ap.add_argument("--resume", action="store_true",
                     help="continue from <save>.last.pt (and its W&B run) if it exists")
     ap.add_argument("--select", default=SELECT,
@@ -192,6 +196,7 @@ def main():
     args = ap.parse_args()
     args.save = args.save or f"checkpoints/{args.model}_{args.loss}.pt"
     last_path = os.path.splitext(args.save)[0] + ".last.pt"
+    seed_everything(args.seed)
 
     if args.synthetic:
         train, val, test, (lo, hi) = synthetic_splits(args.tin, args.tout)
@@ -265,6 +270,14 @@ def main():
         if diff:
             print(f"!!! {last_path} was trained with different settings {diff}; starting over")
         else:
+            # The seed only matters at the start; a resumed run restores the saved RNG state.
+            # Keep the checkpoint's seed on record (checkpoints from before --seed have none).
+            old_seed = ck["config"].get("seed")
+            if old_seed != args.seed:
+                started = ("before --seed existed (unseeded)" if old_seed is None
+                           else f"with seed {old_seed}")
+                print(f"note: {last_path} was started {started}; continuing it as it was")
+                args.seed = old_seed
             net.load_state_dict(ck["model"])
             opt.load_state_dict(ck["opt"])
             sched.load_state_dict(ck["sched"])
