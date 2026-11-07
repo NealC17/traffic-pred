@@ -1,25 +1,15 @@
-./.env
-*.ipynb
-PredFormer/
-!visualize.ipynb
+.env/
 __pycache__/
 .ipynb_checkpoints/
-datasets/MovingMNIST/
 wandb/
-
-# raw arrays: rebuilt from the committed .npy.xz files by data.py
-datasets/**/*.npy
-datasets/**/*.part
-
-# downloaded automatically by data.py
-datasets/MovingMNIST/
-datasets/MNIST_raw/
-
-# training outputs
+external/
 checkpoints/
 figs*/
 *.pt
+slurm-*.out
 
-__pycache__/
-.ipynb_checkpoints/
-.env/
+datasets/**/*.npy
+datasets/**/*.part
+datasets/MovingMNIST/
+datasets/MNIST_raw/
+.DS_Store

@@ -1,28 +1,11 @@
 #!/usr/bin/env bash
-# Set up and activate the project's Python environment.
-#
-#   source setup.sh          # create/update .env/ and activate it in this shell
-#   source setup.sh --force  # reinstall packages even if requirements.txt is unchanged
-#
-# Must be *sourced*: a script run as ./setup.sh executes in a child shell,
-# so the activation would vanish when it exits.
-# Works in bash (Linux) and zsh (the default shell on macOS).
-#
-# What it does (safe to re-run; skips work that's already done):
-#   1. checks for Python >= 3.10
-#   2. creates the virtual environment .env/ (if missing)
-#   3. installs requirements.txt (only when the file changed since last install)
-#   4. registers a Jupyter kernel named "traffic-pred"
-#   5. clones the official PredFormer repo into PredFormer/ (if missing)
-#   6. activates .env/
 
-# --- must be sourced; find this file's path (bash or zsh) ----------------------
 if [ -n "${ZSH_VERSION:-}" ]; then
     case "${ZSH_EVAL_CONTEXT:-}" in
         *:file*) ;;
         *) echo "Run this with:  source setup.sh"; exit 1 ;;
     esac
-    eval '_setup_self=${(%):-%x}'          # zsh-only syntax, hidden from bash's parser
+    eval '_setup_self=${(%):-%x}'
 else
     if ! (return 0 2>/dev/null); then
         echo "Run this with:  source ${0##*/}"
@@ -40,7 +23,6 @@ _setup_env() {
     stamp="$venv/.requirements.sha256"
     [ "${1:-}" = "--force" ] && force=1
 
-    # 1. Python >= 3.10
     for py in python3.12 python3.13 python3.11 python3.10 python3 python; do
         if command -v "$py" >/dev/null 2>&1 &&
            "$py" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
@@ -57,7 +39,6 @@ _setup_env() {
         return 1
     fi
 
-    # 2. virtual environment
     if [ ! -x "$venv/bin/python" ]; then
         echo "[setup] creating virtual environment .env/ with $($py --version)"
         if ! "$py" -m venv "$venv"; then
@@ -69,8 +50,6 @@ _setup_env() {
         fi
     fi
 
-    # 2b. make sure the env has pip (a venv made while python3-venv was missing,
-    #     or with --without-pip, has python but no pip: "No module named pip")
     if ! "$venv/bin/python" -m pip --version >/dev/null 2>&1; then
         echo "[setup] .env/ has no pip; installing it"
         if ! "$venv/bin/python" -m ensurepip --upgrade >/dev/null 2>&1; then
@@ -83,7 +62,6 @@ _setup_env() {
     fi
     "$venv/bin/python" -m pip install -q --upgrade pip || return 1
 
-    # 3. packages (skip if requirements.txt hasn't changed)
     if [ ! -f "$req" ]; then
         echo "[setup] $req not found" >&2
         return 1
@@ -105,26 +83,29 @@ _setup_env() {
         echo "[setup] packages up to date"
     fi
 
-    # 4. Jupyter kernel (so notebooks can pick this environment)
     if ! "$venv/bin/jupyter" kernelspec list 2>/dev/null | grep -q "traffic-pred"; then
         "$venv/bin/python" -m ipykernel install --user --name traffic-pred \
             --display-name "Python (traffic-pred)" >/dev/null &&
             echo "[setup] Jupyter kernel 'Python (traffic-pred)' registered"
     fi
 
-    # 5. official PredFormer code (needed only for --impl official)
-    if [ ! -d "$root/PredFormer/openstl" ]; then
+    local name url
+    for name in PredFormer ASTGNN STDCformer; do
+        [ -d "$root/external/$name" ] && continue
+        case "$name" in
+            PredFormer) url="https://github.com/yyyujintang/PredFormer.git" ;;
+            ASTGNN) url="https://github.com/guoshnBJTU/ASTGNN.git" ;;
+            STDCformer) url="https://github.com/GeoX-Lab/STDCformer.git" ;;
+        esac
         if command -v git >/dev/null 2>&1; then
-            echo "[setup] cloning official PredFormer repo"
-            git clone -q --depth 1 https://github.com/yyyujintang/PredFormer.git "$root/PredFormer" ||
-                echo "[setup] clone failed (only needed for --impl official); continuing" >&2
+            echo "[setup] cloning $name into external/$name"
+            git clone -q --depth 1 "$url" "$root/external/$name" ||
+                echo "[setup] clone of $name failed (only needed for that model); continuing" >&2
         else
-            echo "[setup] git not found; skipping PredFormer clone (only needed for --impl official)" >&2
+            echo "[setup] git not found; skipping the $name clone" >&2
         fi
-    fi
+    done
 
-    # 6. activate
-    # shellcheck disable=SC1091
     source "$venv/bin/activate" || return 1
     echo "[setup] activated: $(python --version) at $VIRTUAL_ENV"
     python - <<'EOF'
