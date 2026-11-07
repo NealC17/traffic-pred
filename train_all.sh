@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
-# Train every model / loss combination on TaxiBJ and put the best weights in checkpoints/.
+# Train every model / loss combination on TaxiBJ, as one titled session.
 #
-#   ./train_all.sh                      # all runs, default epochs
+# Every invocation is a SESSION with a title you choose. The session gets its own folder,
+# checkpoints/sessions/<title>/, and its own W&B group named <title>, so sessions never
+# skip, resume or overwrite each other's runs. Give the title with --title, or the script
+# asks for it (in a terminal; a Slurm job has no terminal, so pass --title there).
+# Running again with the SAME title continues that session: finished runs are skipped and
+# an interrupted one resumes. That's how to pick up after a Slurm time limit.
+#
+#   ./train_all.sh --title "wide baselines"     # new session (or continue that one)
+#   ./train_all.sh                      # asks for a title, then all runs, default epochs
 #   ./train_all.sh cnn distvol          # only runs whose name contains "cnn" or "distvol"
 #   ./train_all.sh --epochs 5           # same epoch count for every run (quick comparison)
 #   ./train_all.sh --quick              # 1 epoch each: checks the whole pipeline end to end
@@ -14,6 +22,7 @@
 #   ./train_all.sh --seed 1             # another random seed (names get a _seed1 suffix)
 #   ./train_all.sh --force              # retrain even if the checkpoint already exists
 #   ./train_all.sh --list               # show the runs and exit
+#   ./train_all.sh --sessions           # list the existing sessions and exit
 #   ./train_all.sh --no-wandb           # don't log to Weights & Biases
 #
 # Protocol: every run picks its checkpoint on the VALIDATION set (val MSE, the same for every
@@ -22,8 +31,7 @@
 # The split flags are passed to every run (copy_last included), so all models see the same data.
 #
 # Weights & Biases: every run logs to project $WANDB_PROJECT (default "traffic-pred"),
-# named after the run (cnn_mse, ...), grouped per invocation (the Slurm job ID when there
-# is one). All runs log the same metrics (MSE, MAE, Sinkhorn, ...) whatever their loss,
+# named after the run (cnn_mse, ...), in a group named after the session title. All runs log the same metrics (MSE, MAE, Sinkhorn, ...) whatever their loss,
 # so they overlay on one chart. One-time setup: `wandb login`. No internet on the node?
 # Run with WANDB_MODE=offline and later `wandb sync wandb/offline-run-*`.
 #
@@ -45,32 +53,33 @@
 #   predformer_official_mse  train.py        PredFormer    MSE        200
 #                                            (official repo code in PredFormer/, STS)
 #
-# Output:
-#   checkpoints/<name>.pt          best weights for each run (updated during training)
-#   checkpoints/results.tsv        final test MSE, Sinkhorn, TV and volume error of every model
+# Output, in S = checkpoints/sessions/<title>/  (title with spaces etc. turned into _):
+#   S/session.txt                  title, start time, command line, git commit, Slurm job IDs
+#   S/<name>.pt                    best weights for each run (updated during training)
+#   S/results.tsv                  final test MSE, Sinkhorn, TV and volume error of every model
 #                                  (also printed at the end)
-#   checkpoints/<name>.done        written only when a run finishes; runs with a .done are skipped,
+#   S/<name>.done                  written only when a run finishes; runs with a .done are skipped,
 #                                  so a job killed by its time limit redoes only unfinished runs.
 #                                  Runs finished before the val/test protocol (checkpoint picked on
 #                                  the test set) don't count as done: they are retrained.
-#   checkpoints/<name>.last.pt     end-of-epoch state of cnn_* / distvol_* runs; an unfinished run
+#   S/<name>.last.pt               end-of-epoch state of cnn_* / distvol_* runs; an unfinished run
 #                                  resumes from it (same W&B run, same charts). --force starts over.
-#   checkpoints/logs/<name>.log    full training log
-#   checkpoints/runs[/<split>]/    PredFormer's own run folders (last.pt for --resume)
+#   S/logs/<name>.log              full training log
+#   S/runs[/<split>]/              PredFormer's own run folders (last.pt for --resume)
 #
-# Resubmitting after a time limit: finished runs are skipped, an interrupted cnn_*/distvol_*
-# run continues from its last epoch in its original W&B run and group; runs that hadn't
-# started yet go into this job's group. To put them in an earlier job's group instead:
-#   export WANDB_RUN_GROUP=train_all-<earlier job id>
+# Resubmitting after a time limit: run with the same --title. Finished runs are skipped and
+# an interrupted cnn_*/distvol_*/stresnet_*/predformer* run continues from its last epoch,
+# in its original W&B run.
 #
 # Progress: each run shows an overall epoch bar plus a per-epoch batch bar (tqdm).
 # The .log files keep the per-epoch summary lines; bar redraws are stripped from them.
 
 set -o pipefail      # no -u: macOS's bash 3.2 treats empty arrays as unbound
+ORIG_ARGS="$(printf '%q ' "$@")"
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # --- options -----------------------------------------------------------------
-EPOCHS="" TIN=4 TOUT=4 FORCE=0 LIST=0 FILTERS=() SEED=""
+EPOCHS="" TIN=4 TOUT=4 FORCE=0 LIST=0 FILTERS=() SEED="" TITLE="" SESSIONS=0
 TRAIN_FILES=() VAL_FILES=() TEST_FILES=() TRAIN_SIZE="" VAL_SIZE="" TEST_SIZE=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -79,6 +88,8 @@ while [ $# -gt 0 ]; do
         --tin)    TIN="$2"; shift 2 ;;
         --tout)   TOUT="$2"; shift 2 ;;
         --seed)   SEED="$2"; shift 2 ;;
+        --title)  TITLE="$2"; shift 2 ;;
+        --sessions) SESSIONS=1; shift ;;
         --force)  FORCE=1; shift ;;
         --list)   LIST=1; shift ;;
         --no-wandb) export WANDB_MODE=disabled; shift ;;
@@ -94,11 +105,39 @@ while [ $# -gt 0 ]; do
         --train-size) TRAIN_SIZE="$2"; shift 2 ;;
         --val-size)   VAL_SIZE="$2"; shift 2 ;;
         --test-size)  TEST_SIZE="$2"; shift 2 ;;
-        -h|--help) sed -n '2,64p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,/^set -o pipefail/p' "$0" | sed '$d'; exit 0 ;;
         -*) echo "unknown option: $1 (see --help)"; exit 2 ;;
         *)  FILTERS+=("$1"); shift ;;
     esac
 done
+
+# --- session: title -> folder and W&B group ---------------------------------------
+SESSIONS_DIR="checkpoints/sessions"
+if [ "$SESSIONS" = 1 ]; then
+    found=0
+    for d in "$SESSIONS_DIR"/*/; do
+        [ -f "$d/session.txt" ] || continue
+        found=1
+        t="$(sed -n 's/^title: //p' "$d/session.txt" | head -1)"
+        n_done=$(find "$d" -maxdepth 1 -name '*.done' | wc -l | tr -d ' ')
+        printf "%-32s %3s runs finished   %s\n" "$t" "$n_done" "$d"
+    done
+    [ "$found" = 0 ] && echo "no sessions yet in $SESSIONS_DIR/"
+    exit 0
+fi
+if [ -z "$TITLE" ] && [ "$LIST" = 0 ]; then
+    if [ -t 0 ]; then
+        while [ -z "$TITLE" ]; do read -r -p "Session title: " TITLE; done
+    else
+        echo "No session title. Pass one with --title \"...\" (needed when there's no terminal, e.g. Slurm)."
+        exit 2
+    fi
+fi
+# folder name: letters, digits, . _ - kept; anything else (spaces, /, ...) becomes _
+SLUG="$(printf '%s' "${TITLE:-<title>}" | tr -c 'A-Za-z0-9._-' '_' | sed 's/__*/_/g; s/^[_.]*//; s/_*$//')"
+[ -z "$SLUG" ] && { echo "title \"$TITLE\" has no usable characters"; exit 2; }
+CK="$SESSIONS_DIR/$SLUG"
+CK_SHOW="$CK"; [ -z "$TITLE" ] && CK_SHOW="$SESSIONS_DIR/<title>"     # --list without a title
 
 SUFFIX=""
 [ "$TIN" != 4 ] || [ "$TOUT" != 4 ] && SUFFIX="_in${TIN}_out${TOUT}"
@@ -125,8 +164,8 @@ SEED_SUFFIX=""
 SUFFIX="$SUFFIX$SEED_SUFFIX"
 # PredFormer names its own run folder (taxibj, taxibj_official, + horizon); keep each
 # split's and seed's apart, so --resume never picks up another seed's last.pt
-PF_OUT="checkpoints/runs"
-[ -n "$SPLIT_SUFFIX$SEED_SUFFIX" ] && PF_OUT="checkpoints/runs/split${SPLIT_SUFFIX}${SEED_SUFFIX}"
+PF_OUT="$CK/runs"
+[ -n "$SPLIT_SUFFIX$SEED_SUFFIX" ] && PF_OUT="$CK/runs/split${SPLIT_SUFFIX}${SEED_SUFFIX}"
 # .done files carry this; older ones (checkpoint picked on the test set) don't count as finished
 PROTOCOL="protocol=val-select-v1"
 
@@ -140,8 +179,8 @@ PY="${PYTHON:-python}"
 # Device: CUDA -> Apple MPS -> CPU is picked inside the Python scripts (devices.py).
 # Ops that MPS doesn't implement fall back to the CPU instead of crashing.
 export PYTORCH_ENABLE_MPS_FALLBACK=1
-# W&B: one group per invocation, so a batch of runs is easy to filter in the UI
-export WANDB_RUN_GROUP="${WANDB_RUN_GROUP:-train_all-${SLURM_JOB_ID:-$(date +%Y%m%d-%H%M%S)}}"
+# W&B: one group per session, named by its title, so a session is easy to filter in the UI
+export WANDB_RUN_GROUP="$TITLE"
 # Data loading workers: macOS starts workers with "spawn", which re-imports data.py and
 # copies the arrays into every worker. Batches here are tiny, so load in the main process.
 WORKERS=2
@@ -151,7 +190,26 @@ if ! "$PY" -c "import torch" 2>/dev/null; then
     exit 1
 fi
 
-mkdir -p checkpoints/logs
+start_session() {   # create or continue the session folder; not for --list
+mkdir -p "$CK/logs"
+if [ -f "$CK/session.txt" ]; then
+    old_title="$(sed -n 's/^title: //p' "$CK/session.txt" | head -1)"
+    if [ "$old_title" != "$TITLE" ]; then     # e.g. "my run" and "my/run" share a folder name
+        echo "folder $CK already belongs to session \"$old_title\"; pick another title"; exit 2
+    fi
+    n_done=$(find "$CK" -maxdepth 1 -name '*.done' | wc -l | tr -d ' ')
+    echo "=== continuing session \"$TITLE\" ($n_done runs already finished)  [$CK]"
+else
+    {
+        echo "title: $TITLE"
+        echo "started: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "host: $(hostname)"
+        echo "git: $(git rev-parse --short HEAD 2>/dev/null || echo n/a)$(git diff --quiet 2>/dev/null || echo ' (uncommitted changes)')"
+    } > "$CK/session.txt"
+    echo "=== new session \"$TITLE\"  [$CK]"
+fi
+echo "invoked $(date '+%Y-%m-%d %H:%M:%S')${SLURM_JOB_ID:+ (Slurm job $SLURM_JOB_ID)}: ./train_all.sh $ORIG_ARGS" >> "$CK/session.txt"
+}
 ESC="$(printf '\033')"     # for stripping terminal escape codes from logs (portable sed)
 
 # --- run table: name | default epochs | command (EPOCHS_ and SAVE_ filled in below) ---
@@ -178,13 +236,15 @@ selected() {   # run name matches any filter (or there are no filters)
 if [ "$LIST" = 1 ]; then
     for r in "${RUNS[@]}"; do
         IFS='|' read -r name ep _ <<< "$r"
-        selected "$name" && printf "%-24s %s epochs -> checkpoints/%s%s.pt\n" "$name" "${EPOCHS:-$ep}" "$name" "$SUFFIX"
+        selected "$name" && printf "%-24s %s epochs -> $CK_SHOW/%s%s.pt\n" "$name" "${EPOCHS:-$ep}" "$name" "$SUFFIX"
     done
     exit 0
 fi
 
+start_session || exit 2
+
 # --- results table: run, final test MSE / Sinkhorn / TV / volume error, best epoch -------
-RESULTS=checkpoints/results.tsv
+RESULTS="$CK/results.tsv"
 record_result() {   # $1 = tag, $2 = log; reads the run's "FINAL ..." line
     local line="" i
     for i in 1 2 3 4 5 6 7 8 9 10; do          # the log is written by a background tee; give it a moment
@@ -215,10 +275,10 @@ for r in "${RUNS[@]}"; do
     IFS='|' read -r name ep cmd <<< "$r"
     selected "$name" || continue
     tag="$name$SUFFIX"
-    ckpt="checkpoints/$tag.pt"
-    log="checkpoints/logs/$tag.log"
+    ckpt="$CK/$tag.pt"
+    log="$CK/logs/$tag.log"
 
-    done_mark="checkpoints/$tag.done"
+    done_mark="$CK/$tag.done"
     if [ -f "$done_mark" ] && [ "$FORCE" = 0 ]; then
         if grep -qx "$PROTOCOL" "$done_mark"; then
             echo "=== $tag: already finished ($done_mark), skipping (use --force to retrain)"
@@ -228,14 +288,14 @@ for r in "${RUNS[@]}"; do
     fi
 
     rm -f "$done_mark"
-    # PredFormer continues an interrupted run from checkpoints/runs/<run>/last.pt,
-    # train_distvol.py from checkpoints/<name>.last.pt (both: same W&B run where supported)
+    # PredFormer continues an interrupted run from <session>/runs/<run>/last.pt,
+    # train_distvol.py from <session>/<name>.last.pt (both: same W&B run where supported)
     if [[ "$name" == predformer* || "$cmd" == train_distvol.py* ]] && [ "$FORCE" = 0 ]; then
         cmd="$cmd --resume"
     fi
     # a resumed run appends to its log instead of overwriting the first part
     append=0
-    [[ "$cmd" == *--resume* ]] && [ -f "checkpoints/$tag.last.pt" ] && append=1
+    [[ "$cmd" == *--resume* ]] && [ -f "$CK/$tag.last.pt" ] && append=1
     [ "$append" = 0 ] && : > "$log"
     # copy_last has no weights to seed
     [ -n "$SEED" ] && [[ "$cmd" != baseline_copy_last.py* ]] && cmd="$cmd --seed $SEED"
@@ -250,7 +310,7 @@ for r in "${RUNS[@]}"; do
     # (tqdm redraws with carriage returns, so keep the text after the last \r).
     if "$PY" -u $cmd 2>&1 | tee >(tr '\r' '\n' | sed "s/${ESC}\[[0-9;]*[A-Za-z]//g" | grep -v -E '^[[:space:]]*$|%\|' >> "$log"); then
         if [[ "$name" == predformer* ]]; then
-            # train.py writes checkpoints/runs/<run>/best.pt; copy it next to the others
+            # train.py writes <session>/runs/<run>/best.pt; copy it next to the others
             run_dir="taxibj"
             [ "$name" = predformer_official_mse ] && run_dir="taxibj_official"
             [ "$TIN" != 4 ] || [ "$TOUT" != 4 ] && run_dir="${run_dir}_in${TIN}_out${TOUT}"
@@ -273,7 +333,7 @@ echo
 echo "=== summary ($(( ($(date +%s) - START) )) sec total)"
 for t in "${DONE[@]}";    do echo "  trained  $t"; done
 for t in "${SKIPPED[@]}"; do echo "  skipped  $t (already had a checkpoint)"; done
-for t in "${FAILED[@]}";  do echo "  FAILED   $t  (log: checkpoints/logs/${t}.log)"; done
+for t in "${FAILED[@]}";  do echo "  FAILED   $t  (log: $CK/logs/${t}.log)"; done
 if [ -f "$RESULTS" ]; then
     echo
     echo "=== final test metrics (checkpoint picked on val, scored once on test)  [$RESULTS]"
