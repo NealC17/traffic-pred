@@ -3,6 +3,7 @@ import torch
 from tqdm import tqdm
 
 from trafficpred.sinkhorn import sinkhorn_divergence, split_flow
+from trafficpred.utils import predict, to_device
 
 SINKHORN_EPS = 0.01
 SINKHORN_ITERS = 30
@@ -11,6 +12,12 @@ SELECT = "mse"
 SPLITS = ("train", "val", "test")
 REPORTED = ("mse_flow", "rmse_flow", "mae_flow")
 REPORTED_NAMES = {"mse_flow": "mse", "rmse_flow": "rmse", "mae_flow": "mae"}
+PANELS = {"RMSE": "rmse_flow", "MAE": "mae_flow", "MSE": "mse_flow", "Sinkhorn": "sinkhorn",
+          "TV": "dist_tv", "Frame MSE": "mse_frame"}
+
+
+def panel_metrics(by_split):
+    return {f"{name}/{split}": m[key] for split, m in by_split.items() for name, key in PANELS.items()}
 
 
 class _Totals:
@@ -32,10 +39,10 @@ class _Totals:
 def evaluate(model, loader, device, span, lo=0.0, amp=False, desc="  eval"):
     model.eval()
     totals = None
-    for x, y in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True, mininterval=1):
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+    for batch in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True, mininterval=1):
+        x, y, ext = to_device(batch, device)
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp and device.type == "cuda"):
-            pred = model(x)
+            pred = predict(model, x, ext)
         pred = pred.float().clamp(0, 1)
         B, T, C, H, W = y.shape
         totals = totals or _Totals(T, x.device)

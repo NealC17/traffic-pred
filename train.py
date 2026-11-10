@@ -20,6 +20,7 @@ EXAMPLES = """examples:
   python train.py --model copy_last                                  # reference, nothing to train
   python train.py --model mlp --train-files 2013 --val-files 2014 --test-files 2015 2016
   python train.py --model stresnet --loss mse --resume               # continue <save>.last.pt
+  python train.py --model stresnet --external                        # + TaxiBJ weather / calendar data
 """
 
 
@@ -29,7 +30,7 @@ def parse_args():
                                  epilog=EXAMPLES, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", choices=list(MODELS), required=True)
     ap.add_argument("--loss", choices=(*LOSSES, "none"),
-                    help="default: sinkhorn for cnn/distvol, masked_mae for stdcformer, mse otherwise")
+                    help="default: sinkhorn for cnn/distvol/distvolformer, masked_mae for stdcformer, mse otherwise")
     add_data_args(ap)
 
     g = ap.add_argument_group("training (unset values use the model's defaults)")
@@ -48,6 +49,9 @@ def parse_args():
     g.add_argument("--workers", type=int, default=2)
     g.add_argument("--eval-batch-size", type=int, help="default 128 (stdcformer: its training batch size)")
     g.add_argument("--data-on-gpu", choices=("auto", "yes", "no"), default="auto")
+    g.add_argument("--curves", choices=("all", "val"), default="all",
+                   help="splits scored every epoch for the W&B RMSE / MAE / MSE / Sinkhorn / TV / Frame MSE "
+                        "panels: all = val, test and a val-sized train sample (default); val = val only")
     g.add_argument("--seed", type=int, default=42)
     g.add_argument("--save", help="default: checkpoints/<dataset>/<run name>.pt")
     g.add_argument("--resume", action="store_true", help="continue from <save minus .pt>.last.pt")
@@ -80,7 +84,7 @@ def training_settings(args, spec):
     eval_batch_size = args.eval_batch_size or (chosen["batch_size"] if args.model == "stdcformer" else 128)
     return TrainSettings(**chosen, select=args.select, amp=args.amp, compile=args.compile,
                          workers=args.workers, eval_batch_size=eval_batch_size,
-                         data_on_gpu=args.data_on_gpu)
+                         data_on_gpu=args.data_on_gpu, curves=args.curves)
 
 
 def run_name(args, splits, loss):
@@ -89,6 +93,8 @@ def run_name(args, splits, loss):
         name = f"{args.dataset}_{name}"
     if (splits.t_in, splits.t_out) != DATASETS[args.dataset].horizon:
         name += f"_in{splits.t_in}_out{splits.t_out}"
+    if splits.ext_dim:
+        name += "_ext"
     return name
 
 

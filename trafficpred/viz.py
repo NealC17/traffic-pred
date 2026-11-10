@@ -8,6 +8,7 @@ from torch.utils.data import Dataset
 
 from trafficpred.data import Splits, get_splits
 from trafficpred.data.windows import base_datasets
+from trafficpred.utils import predict
 
 
 class Windows(Dataset):
@@ -92,9 +93,10 @@ class _View:
             p = next(self.model.parameters(), None)
             device = p.device if p is not None else "cpu"
         self.model.eval()
-        x, y = self.dataset[idx][:2]
-        x, y = _as_4d(x).float(), _as_4d(y).float()
-        y_hat = self.model(x.unsqueeze(0).to(device)).squeeze(0).cpu().reshape(y.shape)
+        item = self.dataset[idx]
+        x, y = _as_4d(item[0]).float(), _as_4d(item[1]).float()
+        ext = item[2].unsqueeze(0).to(device) if len(item) > 2 else None
+        y_hat = predict(self.model, x.unsqueeze(0).to(device), ext).squeeze(0).cpu().reshape(y.shape)
         to_numpy = lambda t: np.asarray(self.unscale(t), dtype=np.float32)
         return to_numpy(x), to_numpy(y), to_numpy(y_hat)
 

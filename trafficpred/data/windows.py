@@ -2,10 +2,13 @@ import numpy as np
 import torch
 from torch.utils.data import ConcatDataset, Dataset, Subset
 
+from trafficpred.data import external
+
 
 class FlowWindows(Dataset):
-    def __init__(self, frames, t_in, t_out, lo, hi):
+    def __init__(self, frames, t_in, t_out, lo, hi, ext=None):
         self.frames = frames
+        self.ext = ext
         self.t_in, self.t_out = t_in, t_out
         self.lo, self.span = lo, max(hi - lo, 1e-8)
         self.n = max(len(frames) - t_in - t_out + 1, 0)
@@ -16,7 +19,9 @@ class FlowWindows(Dataset):
     def __getitem__(self, i):
         w = np.asarray(self.frames[i:i + self.t_in + self.t_out], dtype=np.float32)
         w = torch.from_numpy((w - self.lo) / self.span)
-        return w[:self.t_in], w[self.t_in:]
+        if self.ext is None:
+            return w[:self.t_in], w[self.t_in:]
+        return w[:self.t_in], w[self.t_in:], torch.from_numpy(external.window(self.ext, i, self.t_in, self.t_out))
 
 
 class MovingMNISTSequences(Dataset):

@@ -3,13 +3,14 @@ import os
 import time
 from dataclasses import asdict, dataclass
 
+import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from trafficpred.metrics import evaluate, fmt
 from trafficpred.models import CopyLast
-from trafficpred.utils import rng_state, save_atomic, set_rng_state
+from trafficpred.utils import predict, rng_state, save_atomic, set_rng_state, to_device
 
 PROGRESS_EVERY = 50
 
@@ -31,27 +32,28 @@ class TrainSettings:
     workers: int = 2
     eval_batch_size: int = 128
     data_on_gpu: str = "auto"
+    curves: str = "all"
 
     def must_match_on_resume(self):
         d = asdict(self)
-        for k in ("amp", "compile", "workers", "eval_batch_size", "data_on_gpu", "patience"):
+        for k in ("amp", "compile", "workers", "eval_batch_size", "data_on_gpu", "patience", "curves"):
             d.pop(k)
         return d
 
 
 class DeviceBatches:
     def __init__(self, dataset, batch_size, device, shuffle=False, drop_last=False, workers=0):
-        xs, ys = [], []
-        for x, y in tqdm(DataLoader(dataset, batch_size=512, num_workers=workers),
-                         desc="  copying data to the GPU", leave=False, mininterval=1):
-            xs.append(x)
-            ys.append(y)
-        self.x, self.y = torch.cat(xs).to(device), torch.cat(ys).to(device)
+        parts = []
+        for batch in tqdm(DataLoader(dataset, batch_size=512, num_workers=workers),
+                          desc="  copying data to the GPU", leave=False, mininterval=1):
+            parts.append(batch)
+        self.tensors = [torch.cat(column).to(device) for column in zip(*parts)]
+        self.x = self.tensors[0]
         self.batch_size, self.shuffle, self.drop_last = batch_size, shuffle, drop_last
 
     def view(self, batch_size, shuffle=False, drop_last=False):
         other = object.__new__(DeviceBatches)
-        other.x, other.y = self.x, self.y
+        other.tensors, other.x = self.tensors, self.x
         other.batch_size, other.shuffle, other.drop_last = batch_size, shuffle, drop_last
         return other
 
@@ -64,7 +66,7 @@ class DeviceBatches:
         order = torch.randperm(n, device=self.x.device) if self.shuffle else torch.arange(n, device=self.x.device)
         for i in range(len(self)):
             idx = order[i * self.batch_size:(i + 1) * self.batch_size]
-            yield self.x[idx], self.y[idx]
+            yield tuple(t[idx] for t in self.tensors)
 
 
 def _differences(mine, theirs):
@@ -91,6 +93,11 @@ def make_loaders(splits, settings, device):
         loaders[name] = DataLoader(ds, batch_size, shuffle=train, drop_last=train,
                                    num_workers=settings.workers, pin_memory=cuda,
                                    persistent_workers=train and settings.workers > 0)
+    if settings.curves == "all":
+        n = min(len(splits.train), max(len(splits.val), 1))
+        sample = np.sort(np.random.default_rng(0).choice(len(splits.train), n, replace=False))
+        loaders["train_sample"] = DataLoader(Subset(splits.train, sample.tolist()), settings.eval_batch_size,
+                                             num_workers=settings.workers, pin_memory=cuda)
     if isinstance(loaders["train"], DeviceBatches):
         loaders["train_eval"] = loaders["train"].view(settings.eval_batch_size)
     else:
@@ -116,6 +123,7 @@ class Trainer:
         loaders = make_loaders(splits, settings, device)
         self.train_loader, self.val_loader, self.test_loader = loaders["train"], loaders["val"], loaders["test"]
         self.train_eval_loader = loaders["train_eval"]
+        self.train_sample_loader = loaders.get("train_sample")
         self.start_epoch, self.best, self.bad_epochs = 0, float("inf"), 0
         self.opt = self.sched = None
         if any(p.requires_grad for p in self.net.parameters()):
@@ -186,7 +194,11 @@ class Trainer:
             m = self.evaluate(self.net, self.val_loader, "  val")
             if s.schedule == "plateau":
                 self.sched.step(m[s.select])
-            self.tracker.log_eval(epoch, m, train_loss=train_loss, train_parts=parts,
+            curves = None
+            if self.train_sample_loader is not None:
+                curves = {"train": self.evaluate(self.net, self.train_sample_loader, "  train sample"),
+                          "test": self.evaluate(self.net, self.test_loader, "  test")}
+            self.tracker.log_eval(epoch, m, train_loss=train_loss, train_parts=parts, curves=curves,
                                   epoch_time=time.time() - t0, model=self.net, dataset=self.splits.val,
                                   device=self.device, span=self.splits.span, lo=self.splits.lo,
                                   channels=self.splits.channels, last=epoch == s.epochs)
@@ -212,10 +224,13 @@ class Trainer:
         totals, running = {}, 0.0
         bar = tqdm(self.train_loader, desc=f"  epoch {epoch}", leave=False, dynamic_ncols=True,
                    mininterval=1)
-        for i, (x, y) in enumerate(bar, 1):
-            x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+        for i, batch in enumerate(bar, 1):
+            x, y, ext = to_device(batch, self.device)
             with torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.amp):
-                pred = self.model(x, return_parts=True) if self.loss.needs_parts else self.model(x)
+                if self.loss.needs_parts:
+                    pred = predict(self.model, x, ext, return_parts=True)
+                else:
+                    pred = predict(self.model, x, ext)
             loss, parts = self.loss(pred, y)
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -243,7 +258,7 @@ class Trainer:
         scores = self._score_all()
         print(fmt(scores["val"], "val"))
         for epoch in (0, self.settings.epochs):
-            self.tracker.log_eval(epoch, scores["val"])
+            self.tracker.log_eval(epoch, scores["val"], curves={k: scores[k] for k in ("train", "test")})
         self.tracker.log_reference(val=scores["val"], test=scores["test"])
         self.tracker.log_best(0, scores["val"])
         self._save_best(0, scores["val"], scores)

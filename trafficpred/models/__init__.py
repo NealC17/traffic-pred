@@ -4,6 +4,7 @@ from typing import Callable
 from trafficpred.models.cnn import CNN
 from trafficpred.models.copy_last import CopyLast
 from trafficpred.models.distvol import DistVolNet
+from trafficpred.models.distvolformer import DistVolFormer
 from trafficpred.models.mlp import MLP
 from trafficpred.models.predformer import VARIANTS, PredFormer, with_horizon
 from trafficpred.models.stresnet import STResNet
@@ -38,6 +39,14 @@ def _configure_cnn(args, splits):
 
 def _configure_distvol(args, splits):
     return dict(_grid(splits), width=_pick(args, "width", 64))
+
+
+def _configure_distvolformer(args, splits):
+    dim = _pick(args, "dim", 192)
+    return dict(_grid(splits), width=_pick(args, "width", 64),
+                patch=_pick(args, "patch_size", 2), dim=dim,
+                depth=_pick(args, "num_blocks", 6), heads=_pick(args, "heads", 6),
+                mlp_dim=_pick(args, "mlp_dim", 4 * dim), drop=_pick(args, "drop", 0.1))
 
 
 def _configure_stresnet(args, splits):
@@ -119,6 +128,8 @@ MODELS = {
     "cnn": ModelSpec(CNN, _configure_cnn, ("sinkhorn", "mse", "mae"), CONV_TRAIN, parts=True),
     "distvol": ModelSpec(DistVolNet, _configure_distvol, ("sinkhorn", "mse", "mae"), CONV_TRAIN,
                          parts=True),
+    "distvolformer": ModelSpec(DistVolFormer, _configure_distvolformer, ("sinkhorn", "mse", "mae"),
+                               dict(CONV_TRAIN, weight_decay=1e-2), parts=True),
     "stresnet": ModelSpec(STResNet, _configure_stresnet, ("mse", "sinkhorn", "mae"), CONV_TRAIN,
                           parts=True),
     "mlp": ModelSpec(MLP, _configure_mlp, ("mse", "mae"), MLP_TRAIN),
@@ -133,17 +144,26 @@ MODELS = {
 }
 
 
+EXTERNAL_MODELS = ("stresnet",)
+
+
 def build_model(name, kwargs):
     return MODELS[name].build(**kwargs)
 
 
 def configure_model(name, args, splits):
-    return MODELS[name].configure(args, splits)
+    kwargs = MODELS[name].configure(args, splits)
+    if splits.ext_dim:
+        if name not in EXTERNAL_MODELS:
+            raise SystemExit(f"--external only works with --model {' / '.join(EXTERNAL_MODELS)}")
+        kwargs["ext_dim"] = splits.ext_dim
+    return kwargs
 
 
 def add_model_args(ap):
-    g = ap.add_argument_group("cnn / distvol / stresnet")
-    g.add_argument("--width", type=int, help="channels (cnn, distvol) or filters (stresnet); default 64")
+    g = ap.add_argument_group("cnn / distvol / distvolformer / stresnet")
+    g.add_argument("--width", type=int,
+                   help="channels (cnn, distvol, distvolformer's volume UNet) or filters (stresnet); default 64")
     g.add_argument("--blocks", type=int, help="cnn residual blocks (default 6)")
     g.add_argument("--st-units", type=int, help="stresnet residual units (default 12, the paper's)")
     g.add_argument("--st-bn", action="store_true", help="stresnet: batch norm in residual units")
@@ -154,7 +174,8 @@ def add_model_args(ap):
     g.add_argument("--hidden", type=int, help="hidden width (default 512)")
     g.add_argument("--depth", type=int, help="linear layers (default 3)")
 
-    g = ap.add_argument_group("predformer / predformer_official")
+    g = ap.add_argument_group("predformer / predformer_official / distvolformer",
+                              "distvolformer defaults: patch 2, dim 192, 6 blocks, 6 heads, mlp 4*dim, drop 0.1")
     g.add_argument("--variant", choices=VARIANTS,
                    help="block arrangement (default TSST; official: STS, or TSST on mmnist)")
     g.add_argument("--patch-size", type=int, help="default 4 (8 on mmnist), lowered to fit the grid")

@@ -5,7 +5,9 @@ import time
 import numpy as np
 import torch
 
-from trafficpred.metrics import HEADLINE, REPORTED, REPORTED_NAMES, SPLITS, final_line, fmt, summary_table
+from trafficpred.utils import predict
+from trafficpred.metrics import (HEADLINE, PANELS, REPORTED, REPORTED_NAMES, SPLITS, final_line, fmt,
+                                 panel_metrics, summary_table)
 
 PROGRESS_POINTS = 20
 VIZ_EVERY = 10
@@ -53,6 +55,8 @@ class Tracker:
         wandb.define_metric("test/*", step_metric="epoch", summary="last")
         wandb.define_metric("epoch/*", step_metric="epoch")
         wandb.define_metric("predictions", step_metric="epoch")
+        for name in PANELS:
+            wandb.define_metric(f"{name}/*", step_metric="epoch")
 
     def log_reference(self, val=None, test=None):
         for split, metrics in (("val", val), ("test", test)):
@@ -97,10 +101,12 @@ class Tracker:
         self._loss_sum, self._loss_n = 0.0, 0
 
     def log_eval(self, epoch, metrics, train_loss=None, train_parts=None, epoch_time=None,
-                 model=None, dataset=None, device=None, span=1.0, lo=0.0, channels=None, last=False):
+                 model=None, dataset=None, device=None, span=1.0, lo=0.0, channels=None, last=False,
+                 curves=None):
         if self.run is None:
             return
         d = {"epoch": epoch, **{f"val/{k}": v for k, v in metrics.items()}}
+        d.update(panel_metrics({"val": metrics, **(curves or {})}))
         if train_loss is not None:
             d["epoch/train_loss"] = float(train_loss)
         for k, v in (train_parts or {}).items():
@@ -130,6 +136,7 @@ class Tracker:
         if self.run is None:
             return
         d = {f"test/{k}": v for k, v in self.test.items()}
+        d.update(raw_test(self.test))
         if epoch is not None:
             d["epoch"] = epoch
         cols = ["run", "best_epoch"] + [f"{split}_{REPORTED_NAMES[k]}" for split in SPLITS for k in REPORTED]
@@ -154,6 +161,8 @@ class Tracker:
             if self.run is not None:
                 s = self.run.summary
                 s["best_epoch"] = epoch
+                for k, v in panel_metrics(self.final).items():
+                    s[k] = v
                 for split, metrics in self.final.items():
                     for k in REPORTED:
                         s[f"{split}_{REPORTED_NAMES[k]}"] = metrics[k]
@@ -164,6 +173,8 @@ class Tracker:
                 if self.test is not None:
                     for k, v in self.test.items():
                         s[f"test/{k}"] = v
+                    for k, v in raw_test(self.test).items():
+                        s[k] = v
                     if self.reference is not None:
                         for k in HEADLINE:
                             ref = self.reference[k]
@@ -173,13 +184,18 @@ class Tracker:
             self.run.finish()
 
 
+def raw_test(metrics):
+    return {f"test/test_{REPORTED_NAMES[k]}": metrics[k] for k in REPORTED}
+
+
 @torch.no_grad()
 def prediction_figure(model, dataset, device, span, lo, epoch, channels=None, idx=None):
     from matplotlib.figure import Figure
     idx = len(dataset) // 2 if idx is None else idx
     model.eval()
-    x, y = dataset[idx]
-    pred = model(x.unsqueeze(0).to(device)).squeeze(0).float().clamp(0, 1).cpu()
+    x, y, *ext = dataset[idx]
+    ext = ext[0].unsqueeze(0).to(device) if ext else None
+    pred = predict(model, x.unsqueeze(0).to(device), ext).squeeze(0).float().clamp(0, 1).cpu()
     to_raw = lambda t: (t * span + lo).numpy()
     y, pred = to_raw(y), to_raw(pred)
     T, C = y.shape[:2]

@@ -6,11 +6,12 @@ from dataclasses import dataclass, field
 import numpy as np
 from torch.utils.data import ConcatDataset
 
+from trafficpred.data import external as ext_data
 from trafficpred.data import files, mmnist
 from trafficpred.data.windows import (FlowWindows, MovingMNISTGenerator, MovingMNISTSequences,
                                       base_datasets, limit)
 
-SPLIT_KEYS = ("train_files", "val_files", "test_files", "train_size", "val_size", "test_size")
+SPLIT_KEYS = ("train_files", "val_files", "test_files", "train_size", "val_size", "test_size", "external")
 
 
 @dataclass
@@ -27,6 +28,7 @@ class Splits:
     split: dict = field(default_factory=dict)
     train_is_fixed: bool = True
     spatial_features: object = None
+    ext_dim: int = 0
 
     @property
     def span(self):
@@ -34,7 +36,7 @@ class Splits:
 
     @property
     def shape(self):
-        x, _ = self.train[0]
+        x = self.train[0][0]
         return tuple(x.shape[1:])
 
     def _sample(self, samples):
@@ -50,8 +52,9 @@ class Splits:
 
 class GridFlowData:
     def __init__(self, title, pattern, channels, steps_per_day, test_days, val_days, horizon=(4, 4),
-                 spatial_file=None):
+                 spatial_file=None, has_external=False):
         self.title = title
+        self.has_external = has_external
         self.spatial_file = spatial_file
         self.pattern = re.compile(pattern)
         self.channels = channels
@@ -63,22 +66,34 @@ class GridFlowData:
         return [n for n in files.available() if self.pattern.fullmatch(n)]
 
     def splits(self, name, t_in, t_out, train_files=None, val_files=None, test_files=None,
-               train_size=None, val_size=None, test_size=None):
+               train_size=None, val_size=None, test_size=None, external=False):
         names = self.files()
         if not names:
             raise FileNotFoundError(f"no {self.title} files under {files.ROOT}")
+        if external and not self.has_external:
+            raise ValueError(f"{self.title} has no external data (weather / calendar); drop --external")
         if train_files or val_files or test_files:
-            train, val, test = self._by_file(names, train_files, val_files, test_files)
+            parts = self._by_file(names, train_files, val_files, test_files)
         else:
-            train, val, test = self._by_time(names)
-        lo = min(float(a.min()) for a in train)
-        hi = max(float(a.max()) for a in train)
-        windows = lambda parts: ConcatDataset([FlowWindows(a, t_in, t_out, lo, hi) for a in parts])
+            parts = self._by_time(names)
+        frames = [[files.load(n)[rows] for n, rows in group] for group in parts]
+        lo = min(float(a.min()) for a in frames[0])
+        hi = max(float(a.max()) for a in frames[0])
+        ext = [[None] * len(group) for group in parts]
+        if external:
+            raw = {n: ext_data.raw_for(n, len(files.load(n))) for group in parts for n, _ in group}
+            mean, std = ext_data.weather_stats([raw[n][rows] for n, rows in parts[0]])
+            ext = [[ext_data.features(raw[n], mean, std)[rows] for n, rows in group] for group in parts]
+        windows = lambda i: ConcatDataset([FlowWindows(a, t_in, t_out, lo, hi, e)
+                                           for a, e in zip(frames[i], ext[i])])
         split = dict(train_files=train_files, val_files=val_files, test_files=test_files,
                      train_size=train_size, val_size=val_size, test_size=test_size)
-        return Splits(name, limit(windows(train), train_size, "train"),
-                      limit(windows(val), val_size, "val"), limit(windows(test), test_size, "test"),
-                      lo, hi, self.channels, t_in, t_out, split, spatial_features=self._spatial())
+        if external:
+            split["external"] = True
+        return Splits(name, limit(windows(0), train_size, "train"),
+                      limit(windows(1), val_size, "val"), limit(windows(2), test_size, "test"),
+                      lo, hi, self.channels, t_in, t_out, split, spatial_features=self._spatial(),
+                      ext_dim=ext_data.DIM if external else 0)
 
     def _spatial(self):
         if self.spatial_file is None:
@@ -89,13 +104,13 @@ class GridFlowData:
 
     def _by_time(self, names):
         *head, last = names
-        frames = files.load(last)
-        cut_test = len(frames) - self.test_frames
+        cut_test = len(files.load(last)) - self.test_frames
         cut_val = cut_test - self.val_frames
         if cut_val <= 0:
             raise ValueError(f"{last} is too short for the val and test periods")
-        train = [files.load(n) for n in head] + [frames[:cut_val]]
-        return train, [frames[cut_val:cut_test]], [frames[cut_test:]]
+        everything = slice(None)
+        train = [(n, everything) for n in head] + [(last, slice(0, cut_val))]
+        return train, [(last, slice(cut_val, cut_test))], [(last, slice(cut_test, None))]
 
     def _by_file(self, names, train_files, val_files, test_files):
         if not (train_files and val_files and test_files):
@@ -105,7 +120,7 @@ class GridFlowData:
             | (set(groups[1]) & set(groups[2]))
         if shared:
             raise ValueError(f"file(s) in more than one split: {sorted(shared)}")
-        return [[files.load(n) for n in group] for group in groups]
+        return [[(n, slice(None)) for n in group] for group in groups]
 
     def _match(self, names, specs):
         out = []
@@ -123,7 +138,9 @@ class MovingMNISTData:
     horizon = (10, 10)
 
     def splits(self, name, t_in, t_out, train_files=None, val_files=None, test_files=None,
-               train_size=None, val_size=None, test_size=None):
+               train_size=None, val_size=None, test_size=None, external=False):
+        if external:
+            raise ValueError("Moving MNIST has no external data; drop --external")
         if (t_in, t_out) != self.horizon:
             raise ValueError("Moving MNIST sequences are fixed at 10 in -> 10 out")
         if train_files or val_files or test_files:
@@ -144,7 +161,9 @@ class SyntheticData:
     horizon = (4, 4)
 
     def splits(self, name, t_in, t_out, train_files=None, val_files=None, test_files=None,
-               train_size=None, val_size=None, test_size=None, frames=1500, size=32, seed=0):
+               train_size=None, val_size=None, test_size=None, external=False, frames=1500, size=32, seed=0):
+        if external:
+            raise ValueError("the synthetic data has no external data; drop --external")
         if train_files or val_files or test_files:
             raise ValueError("--*-files only apply to file-based datasets such as taxibj")
         f = self._frames(frames, size, seed)
@@ -173,7 +192,7 @@ class SyntheticData:
 
 DATASETS = {
     "taxibj": GridFlowData("TaxiBJ", r"TaxiBJ/TaxiBJ20\d\d(_\d+)?\.npy", ("Inflow", "Outflow"),
-                           steps_per_day=48, test_days=28, val_days=28),
+                           steps_per_day=48, test_days=28, val_days=28, has_external=True),
     "bikenyc": GridFlowData("BikeNYC", r"BikeNYC/flow_data\.npy", ("Inflow", "Outflow"),
                             steps_per_day=24, test_days=10, val_days=10,
                             spatial_file="BikeNYC/poi_data.npy"),
@@ -215,9 +234,12 @@ def add_data_args(ap):
     g.add_argument("--train-size", type=_size, metavar="N")
     g.add_argument("--val-size", type=_size, metavar="N")
     g.add_argument("--test-size", type=_size, metavar="N")
+    g.add_argument("--external", action="store_true",
+                   help="stresnet only: feed TaxiBJ's external data (TaxiBJext: day of week, weekend, "
+                        "time of day, temperature, wind, weather type) to its external component")
     return g
 
 
 def splits_from_args(args):
     return get_splits(args.dataset, args.t_in, args.t_out,
-                      **{k: getattr(args, k, None) for k in SPLIT_KEYS})
+                      **{k: getattr(args, k, None) for k in SPLIT_KEYS if getattr(args, k, None)})

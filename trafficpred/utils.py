@@ -65,3 +65,12 @@ def save_atomic(obj, path):
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def to_device(batch, device):
+    x, y, *rest = (t.to(device, non_blocking=True) for t in batch)
+    return x, y, (rest[0] if rest else None)
+
+
+def predict(model, x, ext=None, **kwargs):
+    return model(x, **kwargs) if ext is None else model(x, ext=ext, **kwargs)

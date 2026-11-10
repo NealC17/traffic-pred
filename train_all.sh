@@ -12,14 +12,18 @@ train, val and test sets of every run into one table.
   ./train_all.sh --workspaces                      list the workspaces and exit
   ./train_all.sh --dataset bikenyc                 taxibj (default) or bikenyc
   ./train_all.sh cnn distvol                       only runs whose name contains "cnn" or "distvol"
+                                                   (so "distvol" also matches the distvolformer runs)
+  ./train_all.sh distvolformer                     DistVolFormer only (transformer distribution head)
   ./train_all.sh stdcformer astgnn                 STDCformer and ASTGNN only
   ./train_all.sh --epochs 5                        same epoch count for every run
   ./train_all.sh --batch-size stdcformer=8         batch size for one model (repeat for more models)
   ./train_all.sh --batch-size 32                   batch size for every model; a MODEL=N value wins
-                                                   (models: copy_last cnn distvol stresnet mlp predformer
-                                                   predformer_official stdcformer astgnn)
+                                                   (models: copy_last cnn distvol distvolformer stresnet mlp
+                                                   predformer predformer_official stdcformer astgnn)
   ./train_all.sh --quick                           1 epoch each: checks the whole pipeline
   ./train_all.sh --seed 1                          another seed (default 42; names get _seed1)
+  ./train_all.sh --external                        ST-ResNet runs only, with TaxiBJ's external data
+                                                   (weather, calendar) as in the paper; names get _ext
   ./train_all.sh --tin 6 --tout 6                  other horizon (names get _in6_out6)
   ./train_all.sh --train-files 2013 --val-files 2014 --test-files 2015 2016
   ./train_all.sh --train-size 5000 --val-size 500 --test-size 0.5
@@ -41,6 +45,8 @@ uses the official code in external/ASTGNN with its own epoch selection, cannot r
   <run>.done        written when a run finishes
   logs/<run>.log    training log
   results.tsv       train / val / test MSE, RMSE, MAE (raw units) and best epoch of every run
+  W&B "leaderboard" run in the workspace's group: test RMSE / MAE / MSE of every finished run,
+                    refreshed after each run (by hand: python tools/leaderboard.py --workspace <name>)
 EOF
 }
 
@@ -50,6 +56,8 @@ RUNS=(
     "cnn_sinkhorn cnn sinkhorn"
     "distvol_mse distvol mse"
     "distvol_sinkhorn distvol sinkhorn"
+    "distvolformer_mse distvolformer mse"
+    "distvolformer_sinkhorn distvolformer sinkhorn"
     "stresnet_mse stresnet mse"
     "stresnet_sinkhorn stresnet sinkhorn"
     "mlp_mse mlp mse"
@@ -67,7 +75,7 @@ LATEST_FILE="$WORKSPACES_DIR/LATEST"
 ORIG_ARGS="$(printf '%q ' "$@")"
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 
-DATASET=taxibj EPOCHS="" TIN="" TOUT="" SEED="$DEFAULT_SEED" FORCE=0 NO_SAVE=0 LIST=0
+DATASET=taxibj EPOCHS="" TIN="" TOUT="" SEED="$DEFAULT_SEED" FORCE=0 NO_SAVE=0 LIST=0 EXTERNAL=0
 NEW_WORKSPACE=0 WORKSPACE_NAME="" LIST_WORKSPACES=0
 FILTERS=() TRAIN_FILES=() VAL_FILES=() TEST_FILES=() TRAIN_SIZE="" VAL_SIZE="" TEST_SIZE=""
 BATCH_ALL="" BATCH_SIZES=()
@@ -89,6 +97,7 @@ while [ $# -gt 0 ]; do
         --tout) TOUT="$2"; shift 2 ;;
         --seed) SEED="$2"; shift 2 ;;
         --force) FORCE=1; shift ;;
+        --external) EXTERNAL=1; shift ;;
         --no_save|--no-save) NO_SAVE=1; shift ;;
         --list) LIST=1; shift ;;
         --no-wandb) export WANDB_MODE=disabled; shift ;;
@@ -185,9 +194,15 @@ fi
 [ -n "$VAL_SIZE" ] && ARGS+=(--val-size "$VAL_SIZE") && SUFFIX="${SUFFIX}_nva$VAL_SIZE"
 [ -n "$TEST_SIZE" ] && ARGS+=(--test-size "$TEST_SIZE") && SUFFIX="${SUFFIX}_nte$TEST_SIZE"
 [ "$SEED" != "$DEFAULT_SEED" ] && SUFFIX="${SUFFIX}_seed$SEED"
+if [ "$EXTERNAL" = 1 ]; then
+    [ "$DATASET" != taxibj ] && { echo "--external needs --dataset taxibj (only TaxiBJ has external data)"; exit 2; }
+    ARGS+=(--external)
+    SUFFIX="${SUFFIX}_ext"
+fi
 [ -n "$EPOCHS" ] && ARGS+=(--epochs "$EPOCHS")
 
 selected() {
+    [ "$EXTERNAL" = 1 ] && [[ "$1" != stresnet_* ]] && return 1
     [ ${#FILTERS[@]} -eq 0 ] && return 0
     local f
     for f in "${FILTERS[@]}"; do [[ "$1" == *"$f"* ]] && return 0; done
@@ -269,6 +284,12 @@ record_result() {
     mv "$RESULTS.tmp" "$RESULTS"
 }
 
+update_leaderboard() {
+    [ "${WANDB_MODE:-}" = disabled ] && return
+    "$PY" tools/leaderboard.py --workspace "$CK" > "$CK/logs/leaderboard.log" 2>&1 \
+        || echo "!!! couldn't update the W&B leaderboard; see $CK/logs/leaderboard.log"
+}
+
 print_table() {
     awk -F'\t' '{
         printf "  %-40s", $1
@@ -337,6 +358,7 @@ for r in "${RUNS[@]}"; do
     elif [ -f "$ckpt" ]; then
         echo "$PROTOCOL" > "$done_mark"
         record_result "$tag" "$log"
+        update_leaderboard
         DONE+=("$tag ($minutes)")
     else
         echo "!!! $tag finished but $ckpt was not written"; FAILED+=("$tag")

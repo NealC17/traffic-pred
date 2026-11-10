@@ -28,7 +28,7 @@ setup.sh, requirements.txt
 
 trafficpred/
   data/                   dataset registry (taxibj, bikenyc, mmnist, synthetic), windows, splits
-  models/                 copy_last, cnn, distvol, stresnet, mlp, predformer, and wrappers for the
+  models/                 copy_last, cnn, distvol, distvolformer, stresnet, mlp, predformer, and wrappers for the
                           official predformer and stdcformer code (+ the registry in __init__.py)
   losses.py               mse / mae / sinkhorn (DistVolLoss)
   sinkhorn.py             debiased Sinkhorn divergence on a grid, split_flow
@@ -66,6 +66,7 @@ Moving MNIST downloads on first use. On a cluster node without internet run
 
 ```bash
 python train.py --model distvol --loss sinkhorn
+python train.py --model distvolformer --loss sinkhorn
 python train.py --model stdcformer --dataset bikenyc --amp
 python train.py --model predformer --dataset mmnist --amp
 python train.py --model cnn --dataset synthetic --epochs 1        # smoke test
@@ -77,6 +78,7 @@ python train.py --help                                             # every optio
 |---|---|---|
 | `copy_last` | – | no training |
 | `cnn`, `distvol` | sinkhorn, mse, mae | 50 epochs, AdamW 1e-3, wd 1e-4, clip 1, one-cycle |
+| `distvolformer` | sinkhorn, mse, mae | same, but wd 1e-2 |
 | `stresnet` | mse, sinkhorn, mae | same; closeness branch only, output starts at the mean training value |
 | `mlp` | mse, mae | 50 epochs, wd 1e-2 |
 | `predformer`, `predformer_official` | mse, mae | 200 epochs (2000 on mmnist), wd 1e-2, paper configs |
@@ -84,7 +86,7 @@ python train.py --help                                             # every optio
 
 Any training flag (`--epochs`, `--lr`, `--batch-size`, `--weight-decay`, `--clip`, `--schedule`,
 `--patience`) overrides the model's default. The sinkhorn loss needs a non-negative output with a
-distribution / volume split, so only `cnn`, `distvol` and `stresnet` take it.
+distribution / volume split, so only `cnn`, `distvol`, `distvolformer` and `stresnet` take it.
 
 Protocol: every epoch is scored on val, the checkpoint with the lowest val MSE (`--select`) is
 kept, and at the end that checkpoint is scored on train, val and test (MSE, RMSE and MAE in raw
@@ -93,9 +95,38 @@ units, plus every metric below). The seed defaults to 42. Checkpoints go to
 its data split, and the val / test metrics. `<run>.last.pt` is written every epoch for `--resume`,
 which refuses to continue a run made with different settings.
 
+### External data (`--external`, ST-ResNet on TaxiBJ only)
+
+`--external` gives `stresnet` the paper's external component, fed from TaxiBJ's external files
+(`TaxiBJext2013-2016.npy`, one row per half hour; `TaxiBJ2016_1` and `TaxiBJ2016_2` are the first
+and second halves of `TaxiBJext2016`). Run names get `_ext`; `./train_all.sh --external` runs the
+two ST-ResNet runs only. Other models refuse the flag.
+
+Each target step gets 29 features:
+
+- calendar (10): day of week (7, one-hot), weekend flag, time of day as sin / cos of the
+  half-hour slot. Known in advance, so they are the target step's real values.
+- weather (19): temperature and wind speed (standardised with the train split's mean and std) and
+  the weather type (17, one-hot). Future weather isn't known at forecast time, so every target
+  step uses the last input step's weather.
+
+The features go through FC(10) -> ReLU -> FC(C*H*W) -> ReLU and are added to the fused branches
+before the output sigmoid, as in the paper.
+
+### DistVolFormer
+
+`distvolformer` keeps DistVolNet's split into a spatial distribution and a total volume per
+channel and step, but swaps the two encoders. The distribution branch is a transformer: the input
+grid is cut into 2x2 patches (`--patch-size`), each patch is a token with a learned position
+embedding, and 6 pre-norm blocks (`--num-blocks`, `--dim` 192, `--heads` 6, `--mlp-dim` 4*dim,
+`--drop` 0.1) predict per-cell logits that a spatial softmax turns into the distribution. The
+volume branch is a UNet (`--width` 64) over the same inputs plus the log input volumes; its pooled
+code predicts the change in volume from the last input frame, and also conditions every
+transformer block through adaptive layer norm. About 7.5M parameters on TaxiBJ (DistVolNet: 4.0M).
+
 Grids that don't fit a model are adapted: PredFormer lowers its patch size to divide the grid
-(3 on BikeNYC), and DistVolNet pads its encoder input to a multiple of 4 and crops before the
-spatial softmax.
+(3 on BikeNYC), DistVolNet pads its encoder input to a multiple of 4 and crops before the
+spatial softmax, and DistVolFormer also pads to a multiple of its patch size.
 
 ### STDCformer on a grid
 
