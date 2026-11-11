@@ -112,7 +112,7 @@ class Trainer:
         self.model = torch.compile(self.net) if settings.compile else self.net
         self.run = run
         self.splits = splits
-        self.loss = loss
+        self.loss = loss.to(device) if loss is not None else None
         self.settings = settings
         self.tracker = None
         self.device = device
@@ -132,11 +132,15 @@ class Trainer:
     def _make_optimizer(self):
         s = self.settings
         optimizer = torch.optim.AdamW if s.optimizer == "adamw" else torch.optim.Adam
+        groups = [{"params": list(self.net.parameters())}]
+        loss_params = list(self.loss.parameters()) if self.loss is not None else []
+        if loss_params:  # e.g. learned uncertainty weights: trained with the model, never decayed
+            groups.append({"params": loss_params, "weight_decay": 0.0})
         try:
-            self.opt = optimizer(self.net.parameters(), lr=s.lr, weight_decay=s.weight_decay,
+            self.opt = optimizer(groups, lr=s.lr, weight_decay=s.weight_decay,
                                  fused=self.device.type == "cuda")
         except (TypeError, RuntimeError):
-            self.opt = optimizer(self.net.parameters(), lr=s.lr, weight_decay=s.weight_decay)
+            self.opt = optimizer(groups, lr=s.lr, weight_decay=s.weight_decay)
         if s.schedule == "onecycle":
             self.sched = torch.optim.lr_scheduler.OneCycleLR(
                 self.opt, s.lr, total_steps=s.epochs * len(self.train_loader))
@@ -160,6 +164,8 @@ class Trainer:
             print(f"!!! {self.last_path} was made with different {changed}; starting over")
             return None
         self.net.load_state_dict(ck["model"])
+        if ck.get("loss_state"):
+            self.loss.load_state_dict(ck["loss_state"])
         self.opt.load_state_dict(ck["opt"])
         self.sched.load_state_dict(ck["sched"])
         self.start_epoch, self.best, self.bad_epochs = ck["epoch"], ck["best"], ck["bad_epochs"]
@@ -278,6 +284,8 @@ class Trainer:
     def _save_best(self, epoch, val_metrics, scores=None):
         state = {k: v.detach().cpu().clone() for k, v in self.net.state_dict().items()}
         ck = dict(self.run, model=state, epoch=epoch, val_metrics=val_metrics)
+        if self._loss_state():
+            ck["loss_state"] = {k: v.detach().cpu().clone() for k, v in self._loss_state().items()}
         if scores is not None:
             ck.update(train_metrics=scores["train"], test_metrics=scores["test"])
         if self.best_path:
@@ -285,10 +293,14 @@ class Trainer:
         else:
             self.best_checkpoint = ck
 
+    def _loss_state(self):
+        return self.loss.state_dict() if self.loss is not None else {}
+
     def _save_last(self, epoch):
         if not self.last_path:
             return
         save_atomic(dict(self.run, model=self.net.state_dict(), opt=self.opt.state_dict(),
+                         loss_state=self._loss_state(),
                          sched=self.sched.state_dict(), epoch=epoch, best=self.best,
                          bad_epochs=self.bad_epochs, tracker=self.tracker.state(), rng=rng_state(),
                          resume_settings=self.resume_settings()), self.last_path)

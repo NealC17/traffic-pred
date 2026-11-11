@@ -5,7 +5,7 @@ from dataclasses import asdict
 import torch
 
 from trafficpred.data import DATASETS, add_data_args, splits_from_args
-from trafficpred.losses import LOSSES, make_loss
+from trafficpred.losses import LOSSES, PARTS_LOSSES, WEIGHTED, default_options, make_loss, needs_parts
 from trafficpred.metrics import SELECT
 from trafficpred.models import MODELS, add_model_args, build_model, configure_model
 from trafficpred.tracking import Tracker
@@ -30,7 +30,9 @@ def parse_args():
                                  epilog=EXAMPLES, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", choices=list(MODELS), required=True)
     ap.add_argument("--loss", choices=(*LOSSES, "none"),
-                    help="default: sinkhorn for cnn/distvol/distvolformer, masked_mae for stdcformer, mse otherwise")
+                    help="default: sinkhorn for cnn/distvol/distvolformer, masked_mae for stdcformer, mse "
+                         "otherwise. The sinkhorn losses (" + ", ".join(PARTS_LOSSES) + ") need a model "
+                         "that predicts shape and volume separately: cnn, distvol, distvolformer, stresnet")
     add_data_args(ap)
 
     g = ap.add_argument_group("training (unset values use the model's defaults)")
@@ -60,22 +62,48 @@ def parse_args():
     g.add_argument("--no-wandb", action="store_true")
     g.add_argument("--params-only", action="store_true", help="print the model size and exit")
 
-    g = ap.add_argument_group("sinkhorn loss (L1 + Sinkhorn + volume)")
-    g.add_argument("--l1", type=float, default=1.0, help="weight on ||X_hat - X||_1")
-    g.add_argument("--l2", type=float, default=10.0, help="weight on Sinkhorn S_eps(p_hat, p)")
-    g.add_argument("--l3", type=float, default=1.0, help="weight on |N_hat - N|")
-    g.add_argument("--eps", type=float, default=0.01, help="Sinkhorn blur")
-    g.add_argument("--sinkhorn-iters", type=int, default=30)
+    g = ap.add_argument_group(
+        "sinkhorn losses",
+        "sinkhorn = 1 L1 + 10 Sinkhorn + 1 volume; sinkhorn_only = Sinkhorn; sinkhorn_vol = 10 Sinkhorn + "
+        "1 volume; sinkhorn_vol_uw = (Sinkhorn, volume) with learned uncertainty weights. A weight or "
+        "Sinkhorn setting that differs from the loss's default is added to the run name (e.g. _l1-0)")
+    g.add_argument("--l1", type=float, help="weight on ||X_hat - X||_1 (fixed-weight losses only)")
+    g.add_argument("--l2", type=float, help="weight on Sinkhorn S_eps(p_hat, p) (fixed-weight losses only)")
+    g.add_argument("--l3", type=float, help="weight on |N_hat - N| (fixed-weight losses only)")
+    g.add_argument("--eps", type=float, help="Sinkhorn blur (default 0.01)")
+    g.add_argument("--sinkhorn-iters", type=int, help="default 30")
 
     add_model_args(ap)
     return ap.parse_args()
 
 
 def choose_loss(args, spec):
-    loss = args.loss or spec.losses[0]
-    if loss not in spec.losses:
-        raise SystemExit(f"--model {args.model} supports --loss {' / '.join(spec.losses)}")
+    loss = args.loss or spec.loss
+    if (loss == "none") != (spec.loss == "none"):
+        raise SystemExit(f"--model {args.model} needs --loss {spec.loss}" if spec.loss == "none"
+                         else "--loss none only works with --model copy_last (nothing to train)")
+    if needs_parts(loss) and not spec.parts:
+        raise SystemExit(f"--loss {loss} needs a model that predicts shape and volume separately "
+                         f"(cnn, distvol, distvolformer, stresnet); --model {args.model} doesn't")
     return loss
+
+
+def choose_loss_options(args, loss):
+    options = default_options(loss)
+    given = {k: getattr(args, k) for k in ("l1", "l2", "l3", "eps", "sinkhorn_iters") if getattr(args, k) is not None}
+    unused = sorted(set(given) - set(options))
+    if unused:
+        flags = ", ".join("--" + k.replace("_", "-") for k in unused)
+        raise SystemExit(f"{flags} doesn't apply to --loss {loss}"
+                         + ("; use one of " + ", ".join(WEIGHTED) if loss in PARTS_LOSSES else ""))
+    return {**options, **given}
+
+
+def option_suffix(loss, options):
+    def fmt(v):
+        return f"{v:g}" if isinstance(v, float) else str(v)
+    changed = [(k, v) for k, v in options.items() if v != default_options(loss).get(k)]
+    return "".join(f"_{k}-{fmt(v)}" for k, v in changed)
 
 
 def training_settings(args, spec):
@@ -87,8 +115,8 @@ def training_settings(args, spec):
                          data_on_gpu=args.data_on_gpu, curves=args.curves)
 
 
-def run_name(args, splits, loss):
-    name = args.model if loss == "none" else f"{args.model}_{loss}"
+def run_name(args, splits, loss, loss_options):
+    name = args.model if loss == "none" else f"{args.model}_{loss}{option_suffix(loss, loss_options)}"
     if args.dataset != "taxibj":
         name = f"{args.dataset}_{name}"
     if (splits.t_in, splits.t_out) != DATASETS[args.dataset].horizon:
@@ -100,8 +128,11 @@ def run_name(args, splits, loss):
 
 def main():
     args = parse_args()
+    if args.external and args.model != "stresnet":
+        raise SystemExit("--external only works with --model stresnet")
     spec = MODELS[args.model]
     loss_name = choose_loss(args, spec)
+    loss_options = choose_loss_options(args, loss_name)
     seed_everything(args.seed)
 
     splits = splits_from_args(args)
@@ -116,12 +147,10 @@ def main():
         return
 
     settings = training_settings(args, spec)
-    name = run_name(args, splits, loss_name)
+    name = run_name(args, splits, loss_name, loss_options)
     save = None if args.no_save else args.save or os.path.join("checkpoints", args.dataset, f"{name}.pt")
     if args.no_save and args.resume:
         raise SystemExit("--resume needs saved checkpoints; drop --no-save")
-    loss_options = dict(l1=args.l1, l2=args.l2, l3=args.l3, eps=args.eps,
-                        sinkhorn_iters=args.sinkhorn_iters) if loss_name == "sinkhorn" else {}
     run = dict(model_name=args.model, model_kwargs=model_kwargs, dataset=args.dataset,
                t_in=splits.t_in, t_out=splits.t_out, split=splits.split,
                scale=(splits.lo, splits.hi), channels=splits.channels, loss=loss_name,

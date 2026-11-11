@@ -14,10 +14,10 @@ from trafficpred.models.stresnet import STResNet
 class ModelSpec:
     build: Callable
     configure: Callable
-    losses: tuple
+    loss: str  # default loss; any loss in trafficpred.losses works if the model fits it
     train: dict
     train_by_dataset: dict = field(default_factory=dict)
-    parts: bool = False
+    parts: bool = False  # returns (x_hat, p_hat, n_hat), so it can train with the sinkhorn losses
 
     def train_defaults(self, dataset):
         return {**self.train, **self.train_by_dataset.get(dataset, {})}
@@ -51,8 +51,9 @@ def _configure_distvolformer(args, splits):
 
 def _configure_stresnet(args, splits):
     init_mean = None if args.st_paper_init else splits.train_mean()
+    external = {"ext_dim": splits.ext_dim} if splits.ext_dim else {}
     return dict(_grid(splits), filters=_pick(args, "width", 64), units=_pick(args, "st_units", 12),
-                bn=bool(args.st_bn), init_mean=init_mean)
+                bn=bool(args.st_bn), init_mean=init_mean, **external)
 
 
 def _configure_mlp(args, splits):
@@ -123,28 +124,25 @@ MLP_TRAIN = dict(CONV_TRAIN, weight_decay=1e-2, clip=0.0)
 PREDFORMER_TRAIN = dict(MLP_TRAIN, epochs=200)
 
 MODELS = {
-    "copy_last": ModelSpec(CopyLast, lambda args, s: dict(t_out=s.t_out), ("none",),
+    "copy_last": ModelSpec(CopyLast, lambda args, s: dict(t_out=s.t_out), "none",
                            dict(CONV_TRAIN, epochs=200)),
-    "cnn": ModelSpec(CNN, _configure_cnn, ("sinkhorn", "mse", "mae"), CONV_TRAIN, parts=True),
-    "distvol": ModelSpec(DistVolNet, _configure_distvol, ("sinkhorn", "mse", "mae"), CONV_TRAIN,
+    "cnn": ModelSpec(CNN, _configure_cnn, "sinkhorn", CONV_TRAIN, parts=True),
+    "distvol": ModelSpec(DistVolNet, _configure_distvol, "sinkhorn", CONV_TRAIN,
                          parts=True),
-    "distvolformer": ModelSpec(DistVolFormer, _configure_distvolformer, ("sinkhorn", "mse", "mae"),
+    "distvolformer": ModelSpec(DistVolFormer, _configure_distvolformer, "sinkhorn",
                                dict(CONV_TRAIN, weight_decay=1e-2), parts=True),
-    "stresnet": ModelSpec(STResNet, _configure_stresnet, ("mse", "sinkhorn", "mae"), CONV_TRAIN,
+    "stresnet": ModelSpec(STResNet, _configure_stresnet, "mse", CONV_TRAIN,
                           parts=True),
-    "mlp": ModelSpec(MLP, _configure_mlp, ("mse", "mae"), MLP_TRAIN),
-    "predformer": ModelSpec(_build_predformer, _configure_predformer, ("mse", "mae"),
+    "mlp": ModelSpec(MLP, _configure_mlp, "mse", MLP_TRAIN),
+    "predformer": ModelSpec(_build_predformer, _configure_predformer, "mse",
                             PREDFORMER_TRAIN, {"mmnist": dict(epochs=2000)}),
-    "predformer_official": ModelSpec(_build_official, _configure_official, ("mse", "mae"),
+    "predformer_official": ModelSpec(_build_official, _configure_official, "mse",
                                      PREDFORMER_TRAIN, {"mmnist": dict(epochs=2000)}),
-    "stdcformer": ModelSpec(_build_stdcformer, _configure_stdcformer, ("masked_mae", "mae", "mse"),
+    "stdcformer": ModelSpec(_build_stdcformer, _configure_stdcformer, "masked_mae",
                             dict(CONV_TRAIN, epochs=120, batch_size=64, weight_decay=1e-4, clip=5.0,
                                  schedule="plateau", patience=50, optimizer="adam",
                                  plateau_patience=50)),
 }
-
-
-EXTERNAL_MODELS = ("stresnet",)
 
 
 def build_model(name, kwargs):
@@ -152,12 +150,7 @@ def build_model(name, kwargs):
 
 
 def configure_model(name, args, splits):
-    kwargs = MODELS[name].configure(args, splits)
-    if splits.ext_dim:
-        if name not in EXTERNAL_MODELS:
-            raise SystemExit(f"--external only works with --model {' / '.join(EXTERNAL_MODELS)}")
-        kwargs["ext_dim"] = splits.ext_dim
-    return kwargs
+    return MODELS[name].configure(args, splits)
 
 
 def add_model_args(ap):

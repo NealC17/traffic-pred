@@ -10,10 +10,15 @@ train, val and test sets of every run into one table.
   ./train_all.sh --workspace                       start a new workspace (named by date and time)
   ./train_all.sh --workspace=baselines             start a new workspace with that name
   ./train_all.sh --workspaces                      list the workspaces and exit
-  ./train_all.sh --dataset bikenyc                 taxibj (default) or bikenyc
+  ./train_all.sh --dataset bikenyc                 any dataset train.py knows: taxibj (default), bikenyc,
+                                                   mmnist (Moving MNIST, 10 in -> 10 out), synthetic
   ./train_all.sh cnn distvol                       only runs whose name contains "cnn" or "distvol"
                                                    (so "distvol" also matches the distvolformer runs)
   ./train_all.sh distvolformer                     DistVolFormer only (transformer distribution head)
+  ./train_all.sh distvol_                          the DistVol loss study: mse, sinkhorn (L1 + Sinkhorn +
+                                                   volume), sinkhorn_only, sinkhorn_vol (Sinkhorn + volume),
+                                                   sinkhorn_vol_uw ((Sinkhorn, volume), uncertainty weights)
+  ./train_all.sh distvolformer_                    the same five losses for DistVolFormer
   ./train_all.sh stdcformer astgnn                 STDCformer and ASTGNN only
   ./train_all.sh --epochs 5                        same epoch count for every run
   ./train_all.sh --batch-size stdcformer=8         batch size for one model (repeat for more models)
@@ -56,15 +61,21 @@ RUNS=(
     "cnn_sinkhorn cnn sinkhorn"
     "distvol_mse distvol mse"
     "distvol_sinkhorn distvol sinkhorn"
+    "distvol_sinkhorn_only distvol sinkhorn_only"
+    "distvol_sinkhorn_vol distvol sinkhorn_vol"
+    "distvol_sinkhorn_vol_uw distvol sinkhorn_vol_uw"
     "distvolformer_mse distvolformer mse"
     "distvolformer_sinkhorn distvolformer sinkhorn"
+    "distvolformer_sinkhorn_only distvolformer sinkhorn_only"
+    "distvolformer_sinkhorn_vol distvolformer sinkhorn_vol"
+    "distvolformer_sinkhorn_vol_uw distvolformer sinkhorn_vol_uw"
     "stresnet_mse stresnet mse"
     "stresnet_sinkhorn stresnet sinkhorn"
     "mlp_mse mlp mse"
-    "predformer_mse predformer mse"
-    "predformer_official_mse predformer_official mse"
-    "stdcformer_masked_mae stdcformer masked_mae"
-    "astgnn astgnn none"
+#    "predformer_mse predformer mse"
+#    "predformer_official_mse predformer_official mse"
+#    "stdcformer_masked_mae stdcformer masked_mae"
+#    "astgnn astgnn none"
 )
 METRICS=(train_mse train_rmse train_mae val_mse val_rmse val_mae test_mse test_rmse test_mae best_epoch)
 PROTOCOL="protocol=v3"
@@ -74,6 +85,10 @@ LATEST_FILE="$WORKSPACES_DIR/LATEST"
 
 ORIG_ARGS="$(printf '%q ' "$@")"
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
+if [ -z "${VIRTUAL_ENV:-}" ] && [ -f .env/bin/activate ]; then
+    source .env/bin/activate
+fi
+PY="${PYTHON:-python}"
 
 DATASET=taxibj EPOCHS="" TIN="" TOUT="" SEED="$DEFAULT_SEED" FORCE=0 NO_SAVE=0 LIST=0 EXTERNAL=0
 NEW_WORKSPACE=0 WORKSPACE_NAME="" LIST_WORKSPACES=0
@@ -119,10 +134,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-case "$DATASET" in
-    taxibj|bikenyc) ;;
-    *) echo "--dataset must be taxibj or bikenyc"; exit 2 ;;
-esac
+KNOWN_DATASETS="$("$PY" -c 'from trafficpred.data import DATASETS; print(*DATASETS)' 2>/dev/null)"
+if [ -n "$KNOWN_DATASETS" ] && [[ " $KNOWN_DATASETS " != *" $DATASET "* ]]; then
+    echo "unknown --dataset \"$DATASET\" (datasets: $KNOWN_DATASETS)"; exit 2
+fi
 
 MODELS=" $(for r in "${RUNS[@]}"; do read -r _ model _ <<< "$r"; echo "$model"; done | uniq | tr '\n' ' ')"
 is_count() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
@@ -201,6 +216,15 @@ if [ "$EXTERNAL" = 1 ]; then
 fi
 [ -n "$EPOCHS" ] && ARGS+=(--epochs "$EPOCHS")
 
+# Runs that don't fit a dataset by default. STDCformer attends over every grid cell: Moving MNIST's
+# 64x64 = 4096 cells need ~40 GB at batch 8, so it runs there only with an explicit batch size.
+unsupported() {
+    local model="$1"
+    if [ "$model" = stdcformer ] && [ "$DATASET" = mmnist ] && [ -z "$(batch_size_for stdcformer)" ]; then
+        echo "STDCformer's attention over 4096 cells needs ~40 GB at batch 8; pass --batch-size stdcformer=N to run it"
+    fi
+}
+
 selected() {
     [ "$EXTERNAL" = 1 ] && [[ "$1" != stresnet_* ]] && return 1
     [ ${#FILTERS[@]} -eq 0 ] && return 0
@@ -219,15 +243,13 @@ if [ "$LIST" = 1 ]; then
         batch="batch $(batch_size_for "$model")"
         [ "$batch" = "batch " ] && batch="batch default"
         [ "$model" = copy_last ] && batch="-"
-        selected "$name" && printf "  %-26s %-50s %-14s -> %s%s.pt\n" "$name" "$script" "$batch" "$name" "$SUFFIX"
+        note="$(unsupported "$model")"
+        [ -n "$note" ] && batch="skipped: $note"
+        selected "$name" && printf "  %-31s %-55s %-14s -> %s%s.pt\n" "$name" "$script" "$batch" "$name" "$SUFFIX"
     done
     exit 0
 fi
 
-if [ -z "${VIRTUAL_ENV:-}" ] && [ -f .env/bin/activate ]; then
-    source .env/bin/activate
-fi
-PY="${PYTHON:-python}"
 export PYTORCH_ENABLE_MPS_FALLBACK=1
 export WANDB_RUN_GROUP="$WORKSPACE"
 WORKERS=2
@@ -311,6 +333,11 @@ for r in "${RUNS[@]}"; do
     read -r name model loss <<< "$r"
     selected "$name" || continue
     tag="$name$SUFFIX"
+    note="$(unsupported "$model")"
+    if [ -n "$note" ]; then
+        echo "=== $tag: skipped on $DATASET ($note)"
+        SKIPPED+=("$tag (doesn't fit $DATASET)"); continue
+    fi
     ckpt="$CK/$tag.pt"
     done_mark="$CK/$tag.done"
     if [ "$model" = astgnn ]; then
@@ -330,7 +357,7 @@ for r in "${RUNS[@]}"; do
         if [ -f "$done_mark" ] && [ "$FORCE" = 0 ]; then
             if grep -qx "$PROTOCOL" "$done_mark"; then
                 echo "=== $tag: already finished, skipping (use --force to retrain)"
-                SKIPPED+=("$tag"); continue
+                SKIPPED+=("$tag (already finished)"); continue
             fi
             echo "=== $tag: finished with an older version of the code; retraining"
         fi
@@ -374,7 +401,7 @@ echo
 echo "=== summary ($(( $(date +%s) - START )) sec total)  [workspace $WORKSPACE]"
 for t in "${DONE[@]}"; do echo "  trained  $t"; done
 for t in "${CHECKED[@]}"; do echo "  ran      $t (nothing saved)"; done
-for t in "${SKIPPED[@]}"; do echo "  skipped  $t (already finished)"; done
+for t in "${SKIPPED[@]}"; do echo "  skipped  $t"; done
 for t in "${FAILED[@]}"; do echo "  FAILED   $t  (log: $(log_of "$t"))"; done
 echo
 if [ "$NO_SAVE" = 1 ]; then

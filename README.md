@@ -30,7 +30,7 @@ trafficpred/
   data/                   dataset registry (taxibj, bikenyc, mmnist, synthetic), windows, splits
   models/                 copy_last, cnn, distvol, distvolformer, stresnet, mlp, predformer, and wrappers for the
                           official predformer and stdcformer code (+ the registry in __init__.py)
-  losses.py               mse / mae / sinkhorn (DistVolLoss)
+  losses.py               every training loss, independent of the models (see Losses below)
   sinkhorn.py             debiased Sinkhorn divergence on a grid, split_flow
   metrics.py              evaluate(): the metrics every model is scored with
   training.py             the shared training loop (Trainer)
@@ -74,19 +74,40 @@ python train.py --model stresnet --resume                          # continue <s
 python train.py --help                                             # every option
 ```
 
-| `--model` | losses (first = default) | defaults |
-|---|---|---|
-| `copy_last` | – | no training |
-| `cnn`, `distvol` | sinkhorn, mse, mae | 50 epochs, AdamW 1e-3, wd 1e-4, clip 1, one-cycle |
-| `distvolformer` | sinkhorn, mse, mae | same, but wd 1e-2 |
-| `stresnet` | mse, sinkhorn, mae | same; closeness branch only, output starts at the mean training value |
-| `mlp` | mse, mae | 50 epochs, wd 1e-2 |
-| `predformer`, `predformer_official` | mse, mae | 200 epochs (2000 on mmnist), wd 1e-2, paper configs |
-| `stdcformer` | masked_mae, mae, mse | official config: 120 epochs, batch 64, Adam, wd 1e-4, clip 5, plateau, early stop 50 |
+| `--model` | default loss | sinkhorn losses | defaults |
+|---|---|---|---|
+| `copy_last` | – | – | no training |
+| `cnn`, `distvol` | sinkhorn | yes | 50 epochs, AdamW 1e-3, wd 1e-4, clip 1, one-cycle |
+| `distvolformer` | sinkhorn | yes | same, but wd 1e-2 |
+| `stresnet` | mse | yes | same; closeness branch only, output starts at the mean training value |
+| `mlp` | mse | no | 50 epochs, wd 1e-2 |
+| `predformer`, `predformer_official` | mse | no | 200 epochs (2000 on mmnist), wd 1e-2, paper configs |
+| `stdcformer` | masked_mae | no | official config: 120 epochs, batch 64, Adam, wd 1e-4, clip 5, plateau, early stop 50 |
 
 Any training flag (`--epochs`, `--lr`, `--batch-size`, `--weight-decay`, `--clip`, `--schedule`,
-`--patience`) overrides the model's default. The sinkhorn loss needs a non-negative output with a
-distribution / volume split, so only `cnn`, `distvol`, `distvolformer` and `stresnet` take it.
+`--patience`) overrides the model's default.
+
+### Losses
+
+Losses live in `trafficpred/losses.py`, apart from the models: a model only names its default
+loss and whether it predicts shape and volume separately. `mse`, `mae` and `masked_mae` work with
+every model. The sinkhorn losses need a model that returns `x_hat = p_hat * n_hat`, with `p_hat` where the flow goes
+(each map sums to 1) and `n_hat` how much there is (`cnn`, `distvol`, `distvolformer`, `stresnet`).
+They are built from three terms: reconstruction `||x_hat - x||_1`, transport `S_eps(p_hat, p)`
+(debiased Sinkhorn divergence) and volume `|n_hat - n| / HW`.
+
+| `--loss` | trains |
+|---|---|
+| `sinkhorn` | `1 * reconstruction + 10 * transport + 1 * volume` |
+| `sinkhorn_only` | transport alone (the volume head gets no gradient, so `n_hat` stays the last input frame's total) |
+| `sinkhorn_vol` | `10 * transport + 1 * volume` |
+| `sinkhorn_vol_uw` | the vector (transport, volume), combined with learned uncertainty weights (Kendall et al. 2018): `sum_i exp(-s_i) L_i + s_i`. `s_i` starts at `log L_i` of the first batch, is trained without weight decay and is saved in the checkpoint; W&B logs the weights as `epoch/train_weight_sinkhorn` / `_volume` |
+
+`--l1 / --l2 / --l3` change the weights of the fixed-weight losses, `--eps / --sinkhorn-iters`
+the Sinkhorn settings of any of them. A value that differs from the loss's default is added to
+the run name (`--loss sinkhorn --l1 0` -> `distvol_sinkhorn_l1-0`), so it never overwrites the
+default run. Every term is logged whether or not it is trained. `./train_all.sh distvol_` and
+`./train_all.sh distvolformer_` run each of those models with mse and all four sinkhorn losses.
 
 Protocol: every epoch is scored on val, the checkpoint with the lowest val MSE (`--select`) is
 kept, and at the end that checkpoint is scored on train, val and test (MSE, RMSE and MAE in raw
@@ -158,13 +179,18 @@ turns it off.
 ./train_all.sh --workspace                         # new workspace (named by date and time), every run
 ./train_all.sh --workspace=baselines               # new workspace with a name
 ./train_all.sh                                     # continue the most recently used workspace
-./train_all.sh --dataset bikenyc stdcformer astgnn # taxibj (default) or bikenyc; some runs only
+./train_all.sh --dataset bikenyc stdcformer astgnn # any registered dataset: taxibj (default), bikenyc,
+                                                   # mmnist, synthetic; some runs only
 ./train_all.sh --quick                             # 1 epoch each: pipeline check
 ./train_all.sh --no_save --quick                   # same check, but saves no checkpoints
 ./train_all.sh --batch-size stdcformer=8           # one model's batch size (repeatable; N alone = all)
 ./train_all.sh --workspaces                        # list workspaces
 ./train_all.sh --help
 ```
+
+On `mmnist` (64x64 = 4096 cells) `train_all.sh` skips STDCformer unless you give it a batch size
+(`--batch-size stdcformer=1`): its attention over every cell needs about 40 GB at batch 8. Moving MNIST is fixed
+at 10 in -> 10 out and has no file split, and PredFormer uses its paper's 2000 epochs there.
 
 A workspace lives in `checkpoints/workspaces/<name>/` and is one W&B group. Without `--workspace`
 the most recently used workspace is continued: finished runs are skipped and interrupted ones
