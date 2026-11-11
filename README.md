@@ -102,6 +102,7 @@ They are built from three terms: reconstruction `||x_hat - x||_1`, transport `S_
 | `sinkhorn_only` | transport alone (the volume head gets no gradient, so `n_hat` stays the last input frame's total) |
 | `sinkhorn_vol` | `10 * transport + 1 * volume` |
 | `sinkhorn_vol_uw` | the vector (transport, volume), combined with learned uncertainty weights (Kendall et al. 2018): `sum_i exp(-s_i) L_i + s_i`. `s_i` starts at `log L_i` of the first batch, is trained without weight decay and is saved in the checkpoint; W&B logs the weights as `epoch/train_weight_sinkhorn` / `_volume` |
+| `sinkhorn_adaptive` | all three terms, reweighted like Adam: every 10 steps (`--adapt-every`) each term's gradient on the model's parameters is measured, running averages of the squared norms (`--adapt-beta 0.95`, bias-corrected) set `w_i = sqrt(v_l1 / v_i)`, so each term pushes as hard as the L1 term; `--l1 / --l2 / --l3` scale those shares (default 1 each). The averages are saved for `--resume`; W&B logs `epoch/train_weight_*` |
 
 `--l1 / --l2 / --l3` change the weights of the fixed-weight losses, `--eps / --sinkhorn-iters`
 the Sinkhorn settings of any of them. A value that differs from the loss's default is added to
@@ -186,7 +187,16 @@ turns it off.
 ./train_all.sh --batch-size stdcformer=8           # one model's batch size (repeatable; N alone = all)
 ./train_all.sh --workspaces                        # list workspaces
 ./train_all.sh --help
+./train_all.sh --seeds 42 7 123                    # every run once per seed (names get _seedN, except 42)
 ```
+
+`./train_all_new_seeds.sh` is a seed and model-size study of the DistVol / DistVolFormer losses on top of
+`train_all.sh` (same options): mse, sinkhorn, sinkhorn `--l2 0` (no Sinkhorn term) and sinkhorn_adaptive, at
+the default sizes (3.95M / 7.53M params) and at PredFormer's size (`distvol_l`: width 96, 8.72M;
+`distvolformer_l`: dim 256, 8 heads, 9.94M), each with seeds 42, 7, 123 and 2025. It uses its own
+workspace, `new_seeds`, and continues it when rerun; it doesn't change which workspace `./train_all.sh`
+continues. Wrappers like it set `RUNS` (lines may add `train.py` arguments), `SEEDS` and
+`DEFAULT_WORKSPACE`, then source `train_all.sh`.
 
 On `mmnist` (64x64 = 4096 cells) `train_all.sh` skips STDCformer unless you give it a batch size
 (`--batch-size stdcformer=1`): its attention over every cell needs about 40 GB at batch 8. Moving MNIST is fixed

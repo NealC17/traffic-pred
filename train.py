@@ -65,11 +65,16 @@ def parse_args():
     g = ap.add_argument_group(
         "sinkhorn losses",
         "sinkhorn = 1 L1 + 10 Sinkhorn + 1 volume; sinkhorn_only = Sinkhorn; sinkhorn_vol = 10 Sinkhorn + "
-        "1 volume; sinkhorn_vol_uw = (Sinkhorn, volume) with learned uncertainty weights. A weight or "
+        "1 volume; sinkhorn_vol_uw = (Sinkhorn, volume) with learned uncertainty weights; "
+        "sinkhorn_adaptive = all three, reweighted like Adam so each term's parameter gradient matches "
+        "the L1 term's (--l1/--l2/--l3 then scale those shares, default 1 each). A weight or "
         "Sinkhorn setting that differs from the loss's default is added to the run name (e.g. _l1-0)")
-    g.add_argument("--l1", type=float, help="weight on ||X_hat - X||_1 (fixed-weight losses only)")
-    g.add_argument("--l2", type=float, help="weight on Sinkhorn S_eps(p_hat, p) (fixed-weight losses only)")
-    g.add_argument("--l3", type=float, help="weight on |N_hat - N| (fixed-weight losses only)")
+    g.add_argument("--l1", type=float, help="weight on ||X_hat - X||_1 (fixed-weight and adaptive losses)")
+    g.add_argument("--l2", type=float, help="weight on Sinkhorn S_eps(p_hat, p) (fixed-weight and adaptive losses)")
+    g.add_argument("--l3", type=float, help="weight on |N_hat - N| (fixed-weight and adaptive losses)")
+    g.add_argument("--adapt-beta", type=float, help="sinkhorn_adaptive: running-average decay (default 0.95)")
+    g.add_argument("--adapt-every", type=int,
+                   help="sinkhorn_adaptive: measure the gradients every N steps (default 10)")
     g.add_argument("--eps", type=float, help="Sinkhorn blur (default 0.01)")
     g.add_argument("--sinkhorn-iters", type=int, help="default 30")
 
@@ -90,12 +95,14 @@ def choose_loss(args, spec):
 
 def choose_loss_options(args, loss):
     options = default_options(loss)
-    given = {k: getattr(args, k) for k in ("l1", "l2", "l3", "eps", "sinkhorn_iters") if getattr(args, k) is not None}
+    given = {k: getattr(args, k) for k in ("l1", "l2", "l3", "eps", "sinkhorn_iters", "adapt_beta", "adapt_every")
+             if getattr(args, k) is not None}
     unused = sorted(set(given) - set(options))
     if unused:
         flags = ", ".join("--" + k.replace("_", "-") for k in unused)
         raise SystemExit(f"{flags} doesn't apply to --loss {loss}"
-                         + ("; use one of " + ", ".join(WEIGHTED) if loss in PARTS_LOSSES else ""))
+                         + ("; it fits " + ", ".join(sorted({*WEIGHTED, "sinkhorn_adaptive"}))
+                            if loss in PARTS_LOSSES else ""))
     return {**options, **given}
 
 

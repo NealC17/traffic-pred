@@ -113,6 +113,8 @@ class Trainer:
         self.run = run
         self.splits = splits
         self.loss = loss.to(device) if loss is not None else None
+        if hasattr(self.loss, "bind"):  # losses that look at the model's own gradients
+            self.loss.bind(self.net.parameters())
         self.settings = settings
         self.tracker = None
         self.device = device

@@ -27,6 +27,7 @@ train, val and test sets of every run into one table.
                                                    predformer predformer_official stdcformer astgnn)
   ./train_all.sh --quick                           1 epoch each: checks the whole pipeline
   ./train_all.sh --seed 1                          another seed (default 42; names get _seed1)
+  ./train_all.sh --seeds 42 7 123                  every run once per seed (names get _seedN, except 42)
   ./train_all.sh --external                        ST-ResNet runs only, with TaxiBJ's external data
                                                    (weather, calendar) as in the paper; names get _ext
   ./train_all.sh --tin 6 --tout 6                  other horizon (names get _in6_out6)
@@ -55,7 +56,10 @@ uses the official code in external/ASTGNN with its own epoch selection, cannot r
 EOF
 }
 
-RUNS=(
+# One run per line: "name model loss [extra train.py args, e.g. --width 96 or --l2 0]".
+# A script that sources this one (e.g. train_all_new_seeds.sh) can set RUNS, SEEDS and
+# DEFAULT_WORKSPACE first to run its own study with the same machinery.
+[ -n "${RUNS+x}" ] || RUNS=(
     "copy_last copy_last none"
     "cnn_mse cnn mse"
     "cnn_sinkhorn cnn sinkhorn"
@@ -84,13 +88,15 @@ WORKSPACES_DIR="checkpoints/workspaces"
 LATEST_FILE="$WORKSPACES_DIR/LATEST"
 
 ORIG_ARGS="$(printf '%q ' "$@")"
+SCRIPT_NAME="${SCRIPT_NAME:-./train_all.sh}"
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 if [ -z "${VIRTUAL_ENV:-}" ] && [ -f .env/bin/activate ]; then
     source .env/bin/activate
 fi
 PY="${PYTHON:-python}"
 
-DATASET=taxibj EPOCHS="" TIN="" TOUT="" SEED="$DEFAULT_SEED" FORCE=0 NO_SAVE=0 LIST=0 EXTERNAL=0
+DATASET=taxibj EPOCHS="" TIN="" TOUT="" FORCE=0 NO_SAVE=0 LIST=0 EXTERNAL=0
+[ -n "${SEEDS+x}" ] || SEEDS=("$DEFAULT_SEED")
 NEW_WORKSPACE=0 WORKSPACE_NAME="" LIST_WORKSPACES=0
 FILTERS=() TRAIN_FILES=() VAL_FILES=() TEST_FILES=() TRAIN_SIZE="" VAL_SIZE="" TEST_SIZE=""
 BATCH_ALL="" BATCH_SIZES=()
@@ -110,7 +116,11 @@ while [ $# -gt 0 ]; do
         --quick) EPOCHS=1; shift ;;
         --tin) TIN="$2"; shift 2 ;;
         --tout) TOUT="$2"; shift 2 ;;
-        --seed) SEED="$2"; shift 2 ;;
+        --seed) SEEDS=("$2"); shift 2 ;;
+        --seeds)
+            shift; SEEDS=()
+            while [ $# -gt 0 ] && [[ "$1" =~ ^[0-9]+$ ]]; do SEEDS+=("$1"); shift; done
+            [ ${#SEEDS[@]} -eq 0 ] && { echo "--seeds needs at least one seed"; exit 2; } ;;
         --force) FORCE=1; shift ;;
         --external) EXTERNAL=1; shift ;;
         --no_save|--no-save) NO_SAVE=1; shift ;;
@@ -179,6 +189,9 @@ if [ "$NEW_WORKSPACE" = 1 ]; then
         echo "workspace \"$WORKSPACE\" already exists; pick another name, or drop --workspace to continue the latest"
         exit 2
     fi
+elif [ -n "${DEFAULT_WORKSPACE:-}" ]; then
+    WORKSPACE="$(slug "$DEFAULT_WORKSPACE")"
+    [ -d "$WORKSPACES_DIR/$WORKSPACE" ] || NEW_WORKSPACE=1
 else
     WORKSPACE="$(latest_workspace)"
     if [ -z "$WORKSPACE" ] || [ ! -d "$WORKSPACES_DIR/$WORKSPACE" ]; then
@@ -189,7 +202,7 @@ fi
 CK="$WORKSPACES_DIR/$WORKSPACE"
 
 join() { local IFS=-; echo "$*"; }
-ARGS=(--dataset "$DATASET" --seed "$SEED")
+ARGS=(--dataset "$DATASET")
 SUFFIX=""
 [ "$DATASET" != taxibj ] && SUFFIX="_$DATASET"
 if [ -n "$TIN$TOUT" ]; then
@@ -208,12 +221,20 @@ fi
 [ -n "$TRAIN_SIZE" ] && ARGS+=(--train-size "$TRAIN_SIZE") && SUFFIX="${SUFFIX}_ntr$TRAIN_SIZE"
 [ -n "$VAL_SIZE" ] && ARGS+=(--val-size "$VAL_SIZE") && SUFFIX="${SUFFIX}_nva$VAL_SIZE"
 [ -n "$TEST_SIZE" ] && ARGS+=(--test-size "$TEST_SIZE") && SUFFIX="${SUFFIX}_nte$TEST_SIZE"
-[ "$SEED" != "$DEFAULT_SEED" ] && SUFFIX="${SUFFIX}_seed$SEED"
+EXT_SUFFIX=""
 if [ "$EXTERNAL" = 1 ]; then
     [ "$DATASET" != taxibj ] && { echo "--external needs --dataset taxibj (only TaxiBJ has external data)"; exit 2; }
     ARGS+=(--external)
-    SUFFIX="${SUFFIX}_ext"
+    EXT_SUFFIX="_ext"
 fi
+for seed in "${SEEDS[@]}"; do
+    [[ "$seed" =~ ^[0-9]+$ ]] || { echo "seed \"$seed\" is not a non-negative integer"; exit 2; }
+done
+suffix_for() {  # run-name suffix for one seed: <dataset/split options>[_seedN][_ext]
+    local s="$SUFFIX"
+    [ "$1" != "$DEFAULT_SEED" ] && s="${s}_seed$1"
+    echo "$s$EXT_SUFFIX"
+}
 [ -n "$EPOCHS" ] && ARGS+=(--epochs "$EPOCHS")
 
 # Runs that don't fit a dataset by default. STDCformer attends over every grid cell: Moving MNIST's
@@ -236,16 +257,20 @@ selected() {
 if [ "$LIST" = 1 ]; then
     state="continuing"; [ "$NEW_WORKSPACE" = 1 ] && state="new"
     echo "workspace: $CK ($state)"
+    echo "seeds: ${SEEDS[*]}"
+    for seed in "${SEEDS[@]}"; do
     for r in "${RUNS[@]}"; do
-        read -r name model loss <<< "$r"
-        script="train.py --model $model --loss $loss"
+        read -r name model loss extra <<< "$r"
+        [ "$model" = copy_last ] && [ "$seed" != "${SEEDS[0]}" ] && continue  # no randomness: once is enough
+        script="train.py --model $model --loss $loss${extra:+ $extra}"
         [ "$model" = astgnn ] && script="astgnn.py run"
         batch="batch $(batch_size_for "$model")"
         [ "$batch" = "batch " ] && batch="batch default"
         [ "$model" = copy_last ] && batch="-"
         note="$(unsupported "$model")"
         [ -n "$note" ] && batch="skipped: $note"
-        selected "$name" && printf "  %-31s %-55s %-14s -> %s%s.pt\n" "$name" "$script" "$batch" "$name" "$SUFFIX"
+        selected "$name" && printf "  %-31s %-70s %-14s -> %s%s.pt\n" "$name" "$script" "$batch" "$name" "$(suffix_for "$seed")"
+    done
     done
     exit 0
 fi
@@ -273,8 +298,9 @@ open_workspace() {
         n_done=$(find "$CK" -maxdepth 1 -name '*.done' | wc -l | tr -d ' ')
         echo "=== continuing workspace \"$WORKSPACE\" ($n_done runs already finished)  [$CK]"
     fi
-    echo "invoked $(date '+%Y-%m-%d %H:%M:%S')${SLURM_JOB_ID:+ (Slurm job $SLURM_JOB_ID)}: ./train_all.sh $ORIG_ARGS" >> "$CK/workspace.txt"
-    echo "$WORKSPACE" > "$LATEST_FILE"
+    echo "invoked $(date '+%Y-%m-%d %H:%M:%S')${SLURM_JOB_ID:+ (Slurm job $SLURM_JOB_ID)}: $SCRIPT_NAME $ORIG_ARGS" >> "$CK/workspace.txt"
+    # a study with its own default workspace leaves "the most recently used" one to ./train_all.sh
+    [ -z "${DEFAULT_WORKSPACE:-}" ] && echo "$WORKSPACE" > "$LATEST_FILE"
 }
 
 final_values() {
@@ -329,10 +355,12 @@ clean_log() {
 open_workspace
 DONE=() CHECKED=() SKIPPED=() FAILED=() LOGS=()
 START=$(date +%s)
+for seed in "${SEEDS[@]}"; do
 for r in "${RUNS[@]}"; do
-    read -r name model loss <<< "$r"
+    read -r name model loss extra <<< "$r"
     selected "$name" || continue
-    tag="$name$SUFFIX"
+    [ "$model" = copy_last ] && [ "$seed" != "${SEEDS[0]}" ] && continue  # no randomness: once is enough
+    tag="$name$(suffix_for "$seed")"
     note="$(unsupported "$model")"
     if [ -n "$note" ]; then
         echo "=== $tag: skipped on $DATASET ($note)"
@@ -341,9 +369,10 @@ for r in "${RUNS[@]}"; do
     ckpt="$CK/$tag.pt"
     done_mark="$CK/$tag.done"
     if [ "$model" = astgnn ]; then
-        cmd=(astgnn.py run "${ARGS[@]}")
+        cmd=(astgnn.py run "${ARGS[@]}" --seed "$seed")
     else
-        cmd=(train.py --model "$model" --loss "$loss" "${ARGS[@]}" --workers "$WORKERS")
+        read -r -a extra_args <<< "$extra"
+        cmd=(train.py --model "$model" --loss "$loss" "${extra_args[@]}" "${ARGS[@]}" --seed "$seed" --workers "$WORKERS")
     fi
     batch="$(batch_size_for "$model")"
     [ -n "$batch" ] && [ "$model" != copy_last ] && cmd+=(--batch-size "$batch")
@@ -390,6 +419,7 @@ for r in "${RUNS[@]}"; do
     else
         echo "!!! $tag finished but $ckpt was not written"; FAILED+=("$tag")
     fi
+done
 done
 
 log_of() {
