@@ -93,21 +93,27 @@ Losses live in `trafficpred/losses.py`, apart from the models: a model only name
 loss and whether it predicts shape and volume separately. `mse`, `mae` and `masked_mae` work with
 every model. The sinkhorn losses need a model that returns `x_hat = p_hat * n_hat`, with `p_hat` where the flow goes
 (each map sums to 1) and `n_hat` how much there is (`cnn`, `distvol`, `distvolformer`, `stresnet`).
-They are built from three terms: reconstruction `||x_hat - x||_1`, transport `S_eps(p_hat, p)`
-(debiased Sinkhorn divergence) and volume `|n_hat - n| / HW`.
+They are built from four terms: reconstruction `||x_hat - x||_1`, transport `S_eps(p_hat, p)`
+(debiased Sinkhorn divergence), volume `|n_hat - n| / HW` and `KL(p || p_hat)` (the shapes compared
+cell by cell, with no notion of distance between cells).
 
 | `--loss` | trains |
 |---|---|
 | `sinkhorn` | `1 * reconstruction + 10 * transport + 1 * volume` |
 | `sinkhorn_only` | transport alone (the volume head gets no gradient, so `n_hat` stays the last input frame's total) |
 | `sinkhorn_vol` | `10 * transport + 1 * volume` |
+| `kl` | `1 * reconstruction + 0.1 * KL + 1 * volume`: KL in place of Sinkhorn |
+| `sinkhorn_kl` | `1 * reconstruction + 10 * transport + 1 * volume + 0.1 * KL` |
 | `sinkhorn_vol_uw` | the vector (transport, volume), combined with learned uncertainty weights (Kendall et al. 2018): `sum_i exp(-s_i) L_i + s_i`. `s_i` starts at `log L_i` of the first batch, is trained without weight decay and is saved in the checkpoint; W&B logs the weights as `epoch/train_weight_sinkhorn` / `_volume` |
 | `sinkhorn_adaptive` | all three terms, reweighted like Adam: every 10 steps (`--adapt-every`) each term's gradient on the model's parameters is measured, running averages of the squared norms (`--adapt-beta 0.95`, bias-corrected) set `w_i = sqrt(v_l1 / v_i)`, so each term pushes as hard as the L1 term; `--l1 / --l2 / --l3` scale those shares (default 1 each). The averages are saved for `--resume`; W&B logs `epoch/train_weight_*` |
 
-`--l1 / --l2 / --l3` change the weights of the fixed-weight losses, `--eps / --sinkhorn-iters`
+`--l1 / --l2 / --l3 / --l4` change the weights (reconstruction / transport / volume / KL) of the
+fixed-weight losses, `--eps / --sinkhorn-iters`
 the Sinkhorn settings of any of them. A value that differs from the loss's default is added to
 the run name (`--loss sinkhorn --l1 0` -> `distvol_sinkhorn_l1-0`), so it never overwrites the
-default run. Every term is logged whether or not it is trained. `./train_all.sh distvol_` and
+default run. Every term is logged whether or not it is trained (Sinkhorn only when its weight
+is above 0). At the default weights the terms are far apart in size: late in training 10 * Sinkhorn
+is about 3% of the loss on TaxiBJ, while a copy-last prediction has KL ≈ 2x its L1, hence KL's 0.1. `./train_all.sh distvol_` and
 `./train_all.sh distvolformer_` run each of those models with mse and all four sinkhorn losses.
 
 Protocol: every epoch is scored on val, the checkpoint with the lowest val MSE (`--select`) is
@@ -116,6 +122,34 @@ units, plus every metric below). The seed defaults to 42. Checkpoints go to
 `checkpoints/<dataset>/<run>.pt` and hold the weights, everything needed to rebuild the model and
 its data split, and the val / test metrics. `<run>.last.pt` is written every epoch for `--resume`,
 which refuses to continue a run made with different settings.
+
+### Tuning the loss weights
+
+`tune_loss.py` searches the weights of `sinkhorn_kl` with Optuna (TPE): l1 stays 1 and it picks
+`--l2` (Sinkhorn, 0.3-1000, or off), `--l3` (volume, 0.03-30), `--l4` (KL, 0.003-3, or off) and
+`--eps` (0.003-0.1), so it covers `sinkhorn`, `kl` and plain L1 + volume as special cases. Trial 0
+is the default weighting. Each trial is a shortened run (`--epochs 20`, one seed, the one-cycle
+schedule squeezed to fit, no checkpoints, `--curves val`) scored by its best **val** RMSE, and a
+trial behind the median of the earlier ones at the same epoch is pruned. Every trial is a W&B run
+in group `tune_<study>`.
+
+```bash
+python tune_loss.py --trials 40                          # study distvolformer_taxibj
+python tune_loss.py --study dvf_l --trials 40 -- --model distvolformer --dim 256 --heads 8
+python tune_loss.py --fix l4=0 --study no_kl --trials 30 # hold a weight fixed
+python tune_loss.py --report                             # best trials, parameter importances
+python tune_loss.py --confirm 3                          # -> train_tuned_<study>.sh
+sbatch --array=0-3 --gres=gpu:1 --time=08:00:00 --mem=32G --cpus-per-task=4 \
+       --wrap="python tune_loss.py --trials 10"          # 4 workers sharing one study
+```
+
+A study is one journal file, `checkpoints/tuning/<study>.journal`. Rerunning the same command
+continues it, and several workers can share it. A trial a killed worker left running (no progress
+for `--stale-minutes 30`) is failed and its weights are queued again. A study's options (train.py
+arguments, epochs, seed, `--fix`) can't change; use a new `--study` instead. Single-seed 20-epoch
+runs are only a screen: `--confirm K` writes `train_tuned_<study>.sh`, a `train_all.sh` wrapper that
+runs the K best weightings and the default `sinkhorn` at full length on seeds 42, 7, 123 and 2025
+(workspace `tuned_<study>`).
 
 ### External data (`--external`, ST-ResNet on TaxiBJ only)
 
@@ -191,7 +225,8 @@ turns it off.
 ```
 
 `./train_all_new_seeds.sh` is a seed and model-size study of the DistVol / DistVolFormer losses on top of
-`train_all.sh` (same options): mse, sinkhorn, sinkhorn `--l2 0` (no Sinkhorn term) and sinkhorn_adaptive, at
+`train_all.sh` (same options): mse, sinkhorn, sinkhorn `--l2 0` (no Sinkhorn term), sinkhorn_adaptive, kl
+and sinkhorn_kl, at
 the default sizes (3.95M / 7.53M params) and at PredFormer's size (`distvol_l`: width 96, 8.72M;
 `distvolformer_l`: dim 256, 8 heads, 9.94M), each with seeds 42, 7, 123 and 2025. It uses its own
 workspace, `new_seeds`, and continues it when rerun; it doesn't change which workspace `./train_all.sh`

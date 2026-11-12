@@ -187,7 +187,12 @@ class Trainer:
         self.tracker.log_reference(val=self.evaluate(reference, self.val_loader, "  copy-last (val)"),
                                    test=self.evaluate(reference, self.test_loader, "  copy-last (test)"))
 
-    def fit(self, tracker):
+    def fit(self, tracker, epoch_callback=None):
+        """Train, then score the val-selected checkpoint on every split and return those scores.
+
+        epoch_callback(epoch, val_metrics) runs after each epoch (e.g. a tuner's pruner); if it
+        returns True, training stops there, nothing is scored, and fit returns None.
+        """
         self.tracker = tracker
         if self.opt is None:
             return self._score_untrained()
@@ -222,10 +227,14 @@ class Trainer:
             epochs.set_postfix(best_val=f"{self.best:.5f}")
             tqdm.write(f"ep {epoch:3d} | {terms} | {fmt(m)} | {time.time() - t0:.0f}s"
                        + (" *" if improved else ""))
+            if epoch_callback is not None and epoch_callback(epoch, m):
+                tqdm.write(f"stopped after epoch {epoch} by the caller (e.g. pruned by the tuner)")
+                self.tracker.finish()
+                return None
             if s.patience and self.bad_epochs >= s.patience:
                 tqdm.write(f"early stop: no val improvement for {s.patience} epochs")
                 break
-        self._final()
+        return self._final()
 
     def _train_epoch(self, epoch):
         self.model.train()
@@ -272,6 +281,7 @@ class Trainer:
         self._save_best(0, scores["val"], scores)
         self.tracker.log_final(scores, epoch=self.settings.epochs)
         self.tracker.finish()
+        return scores
 
     def _final(self):
         ck = self.best_checkpoint or torch.load(self.best_path, map_location="cpu", weights_only=False)
@@ -282,6 +292,7 @@ class Trainer:
             save_atomic(ck, self.best_path)
         self.tracker.log_final(scores, epoch=self.settings.epochs)
         self.tracker.finish()
+        return scores
 
     def _save_best(self, epoch, val_metrics, scores=None):
         state = {k: v.detach().cpu().clone() for k, v in self.net.state_dict().items()}

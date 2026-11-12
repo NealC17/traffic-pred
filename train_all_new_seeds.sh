@@ -6,7 +6,8 @@
 #
 #   losses   mse | sinkhorn (1 L1 + 10 Sinkhorn + 1 volume) | sinkhorn_l2-0 (the same without the
 #            Sinkhorn term: does it help?) | sinkhorn_adaptive (all three, weights set like Adam so
-#            each term's parameter gradient matches the L1 term's)
+#            each term's parameter gradient matches the L1 term's) | kl (0.1 KL(p || p_hat) in place
+#            of Sinkhorn: does transport need the distance between cells?) | sinkhorn_kl (all four)
 #   sizes    distvol 3.95M (width 64) and distvol_l 8.72M (width 96); distvolformer 7.53M (dim 192,
 #            6 heads) and distvolformer_l 9.94M (dim 256, 8 heads); for scale: predformer 8.44M,
 #            predformer_official 9.49M, astgnn ~0.55M (0.28M per channel)
@@ -14,7 +15,7 @@
 
 case " $* " in
     *" -h "*|*" --help "*)
-        sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+        sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
         echo; echo "Options (from train_all.sh):"; echo
         bash "$(dirname "${BASH_SOURCE[0]}")/train_all.sh" --help | sed -n '/^  \.\/train_all.sh/,/^$/p'
         exit 0 ;;
@@ -33,21 +34,29 @@ RUNS=(
     "distvol_sinkhorn distvol sinkhorn"
     "distvol_sinkhorn_l2-0 distvol sinkhorn --l2 0"
     "distvol_sinkhorn_adaptive distvol sinkhorn_adaptive"
+    "distvol_kl distvol kl"
+    "distvol_sinkhorn_kl distvol sinkhorn_kl"
 
     "distvol_l_mse distvol mse $DISTVOL_L"
     "distvol_l_sinkhorn distvol sinkhorn $DISTVOL_L"
     "distvol_l_sinkhorn_l2-0 distvol sinkhorn --l2 0 $DISTVOL_L"
     "distvol_l_sinkhorn_adaptive distvol sinkhorn_adaptive $DISTVOL_L"
+    "distvol_l_kl distvol kl $DISTVOL_L"
+    "distvol_l_sinkhorn_kl distvol sinkhorn_kl $DISTVOL_L"
 
     "distvolformer_mse distvolformer mse"
     "distvolformer_sinkhorn distvolformer sinkhorn"
     "distvolformer_sinkhorn_l2-0 distvolformer sinkhorn --l2 0"
     "distvolformer_sinkhorn_adaptive distvolformer sinkhorn_adaptive"
+    "distvolformer_kl distvolformer kl"
+    "distvolformer_sinkhorn_kl distvolformer sinkhorn_kl"
 
     "distvolformer_l_mse distvolformer mse $DISTVOLFORMER_L"
     "distvolformer_l_sinkhorn distvolformer sinkhorn $DISTVOLFORMER_L"
     "distvolformer_l_sinkhorn_l2-0 distvolformer sinkhorn --l2 0 $DISTVOLFORMER_L"
     "distvolformer_l_sinkhorn_adaptive distvolformer sinkhorn_adaptive $DISTVOLFORMER_L"
+    "distvolformer_l_kl distvolformer kl $DISTVOLFORMER_L"
+    "distvolformer_l_sinkhorn_kl distvolformer sinkhorn_kl $DISTVOLFORMER_L"
 
     # the strongest baseline over the same seeds (200 epochs each, so off by default):
 #    "predformer_official_mse predformer_official mse"

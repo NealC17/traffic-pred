@@ -8,19 +8,24 @@ Their terms are
     reconstruction  ||x_hat - x||_1
     transport       S_eps(p_hat, p)        debiased Sinkhorn divergence between the shapes
     volume          |n_hat - n| / (H W)
+    kl              KL(p || p_hat)         sum_cells p log(p / p_hat): the shapes compared cell by
+                                           cell, with no notion of distance between cells
 
 and they differ only in which terms are trained and how the terms are combined:
 
     sinkhorn         1 * reconstruction + 10 * transport + 1 * volume   (fixed weights)
     sinkhorn_only    transport alone
     sinkhorn_vol     10 * transport + 1 * volume
+    kl               1 * reconstruction + 0.1 * kl + 1 * volume         (KL in place of Sinkhorn)
+    sinkhorn_kl      1 * reconstruction + 10 * transport + 1 * volume + 0.1 * kl
     sinkhorn_vol_uw  the vector (transport, volume), combined by learned uncertainty weights
                      (Kendall, Gal & Cipolla 2018): sum_i exp(-s_i) * L_i + s_i
     sinkhorn_adaptive  all three terms, weighted so each one's gradient on the model's parameters
                      is as large as the reconstruction term's (times l1 / l2 / l3, default 1 each),
                      from Adam-style running averages of the squared gradient norms
 
-Every term is logged whether or not it is trained.
+--l1 / --l2 / --l3 / --l4 weigh reconstruction / transport / volume / kl. Every term is logged
+whether or not it is trained, except that Sinkhorn is only computed when its weight is above 0.
 """
 import torch
 import torch.nn as nn
@@ -35,11 +40,14 @@ def masked_l1_loss(pred, y):
 
 
 POINTWISE = {"mse": F.mse_loss, "mae": F.l1_loss, "masked_mae": masked_l1_loss}
-WEIGHTED = {  # name -> default (l1, l2, l3): weights on reconstruction, transport, volume
-    "sinkhorn": (1.0, 10.0, 1.0),
-    "sinkhorn_only": (0.0, 10.0, 0.0),
-    "sinkhorn_vol": (0.0, 10.0, 1.0),
+WEIGHTED = {  # name -> default weights: l1 reconstruction, l2 transport, l3 volume, l4 kl
+    "sinkhorn": dict(l1=1.0, l2=10.0, l3=1.0),
+    "sinkhorn_only": dict(l1=0.0, l2=10.0, l3=0.0),
+    "sinkhorn_vol": dict(l1=0.0, l2=10.0, l3=1.0),
+    "kl": dict(l1=1.0, l2=0.0, l3=1.0, l4=0.1),
+    "sinkhorn_kl": dict(l1=1.0, l2=10.0, l3=1.0, l4=0.1),
 }
+KL_FLOOR = 1e-12
 UNCERTAINTY = ("sinkhorn_vol_uw",)
 ADAPTIVE = ("sinkhorn_adaptive",)
 SINKHORN_DEFAULTS = dict(eps=0.01, sinkhorn_iters=30)
@@ -62,6 +70,12 @@ class PointwiseLoss(nn.Module):
         return loss, {self.kind: loss.detach()}
 
 
+def kl_divergence(p, p_hat):
+    """Mean over maps of KL(p || p_hat) = sum_cells p log(p / p_hat), in nats (0 log 0 = 0)."""
+    log_ratio = torch.log(p.clamp_min(KL_FLOOR)) - torch.log(p_hat.clamp_min(KL_FLOOR))
+    return torch.where(p > 0, p * log_ratio, torch.zeros_like(p)).sum(dim=(-2, -1)).mean()
+
+
 class DistVolTerms(nn.Module):
     needs_parts = True
 
@@ -74,7 +88,8 @@ class DistVolTerms(nn.Module):
         H, W = y.shape[-2:]
         p, n = split_flow(y.clamp_min(0))
         out = {"l1": (x_hat - y).abs().mean(),
-               "volume": (n_hat - n).abs().mean() / (H * W)}
+               "volume": (n_hat - n).abs().mean() / (H * W),
+               "kl": kl_divergence(p, p_hat)}
         if transport:
             out["sinkhorn"] = sinkhorn_divergence(p_hat.reshape(-1, H, W), p.reshape(-1, H, W),
                                                   eps=self.eps, iters=self.iters).mean()
@@ -82,11 +97,11 @@ class DistVolTerms(nn.Module):
 
 
 class DistVolLoss(DistVolTerms):
-    """Fixed-weight sum l1 * reconstruction + l2 * transport + l3 * volume."""
+    """Fixed-weight sum l1 * reconstruction + l2 * transport + l3 * volume + l4 * kl."""
 
-    def __init__(self, l1=1.0, l2=10.0, l3=1.0, eps=0.01, iters=30):
+    def __init__(self, l1=1.0, l2=10.0, l3=1.0, l4=0.0, eps=0.01, iters=30):
         super().__init__(eps, iters)
-        self.weights = {"l1": l1, "sinkhorn": l2, "volume": l3}
+        self.weights = {"l1": l1, "sinkhorn": l2, "volume": l3, "kl": l4}
 
     def forward(self, parts, y):
         terms = self.terms(parts, y, transport=self.weights["sinkhorn"] > 0)
@@ -176,7 +191,7 @@ class AdaptiveLoss(DistVolTerms):
             self._measure(terms)
         self.calls += 1
         w = self.weights()
-        total = sum(self.alphas[k] * w[k] * v for k, v in terms.items() if self.alphas[k] > 0)
+        total = sum(self.alphas[k] * w[k] * v for k, v in terms.items() if self.alphas.get(k, 0) > 0)
         logged = {k: v.detach() for k, v in terms.items()}
         for k in self.TERMS:
             if self.alphas[k] > 0:
@@ -191,8 +206,7 @@ def needs_parts(name):
 def default_options(name):
     """The options a loss is built with when nothing is overridden (stored with each run)."""
     if name in WEIGHTED:
-        l1, l2, l3 = WEIGHTED[name]
-        return dict(l1=l1, l2=l2, l3=l3, **SINKHORN_DEFAULTS)
+        return dict(WEIGHTED[name], **SINKHORN_DEFAULTS)
     if name in UNCERTAINTY:
         return dict(SINKHORN_DEFAULTS)
     if name in ADAPTIVE:

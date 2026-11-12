@@ -5,7 +5,7 @@ from dataclasses import asdict
 import torch
 
 from trafficpred.data import DATASETS, add_data_args, splits_from_args
-from trafficpred.losses import LOSSES, PARTS_LOSSES, WEIGHTED, default_options, make_loss, needs_parts
+from trafficpred.losses import LOSSES, PARTS_LOSSES, default_options, make_loss, needs_parts
 from trafficpred.metrics import SELECT
 from trafficpred.models import MODELS, add_model_args, build_model, configure_model
 from trafficpred.tracking import Tracker
@@ -24,7 +24,7 @@ EXAMPLES = """examples:
 """
 
 
-def parse_args():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="Train any model on any dataset, pick the checkpoint "
                                              "on val, score it once on test.",
                                  epilog=EXAMPLES, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -65,13 +65,15 @@ def parse_args():
     g = ap.add_argument_group(
         "sinkhorn losses",
         "sinkhorn = 1 L1 + 10 Sinkhorn + 1 volume; sinkhorn_only = Sinkhorn; sinkhorn_vol = 10 Sinkhorn + "
-        "1 volume; sinkhorn_vol_uw = (Sinkhorn, volume) with learned uncertainty weights; "
+        "1 volume; kl = 1 L1 + 0.1 KL(p || p_hat) + 1 volume; sinkhorn_kl = 1 L1 + 10 Sinkhorn + 1 volume + "
+        "0.1 KL; sinkhorn_vol_uw = (Sinkhorn, volume) with learned uncertainty weights; "
         "sinkhorn_adaptive = all three, reweighted like Adam so each term's parameter gradient matches "
         "the L1 term's (--l1/--l2/--l3 then scale those shares, default 1 each). A weight or "
         "Sinkhorn setting that differs from the loss's default is added to the run name (e.g. _l1-0)")
     g.add_argument("--l1", type=float, help="weight on ||X_hat - X||_1 (fixed-weight and adaptive losses)")
     g.add_argument("--l2", type=float, help="weight on Sinkhorn S_eps(p_hat, p) (fixed-weight and adaptive losses)")
     g.add_argument("--l3", type=float, help="weight on |N_hat - N| (fixed-weight and adaptive losses)")
+    g.add_argument("--l4", type=float, help="weight on KL(p || p_hat) (kl, sinkhorn_kl)")
     g.add_argument("--adapt-beta", type=float, help="sinkhorn_adaptive: running-average decay (default 0.95)")
     g.add_argument("--adapt-every", type=int,
                    help="sinkhorn_adaptive: measure the gradients every N steps (default 10)")
@@ -79,7 +81,7 @@ def parse_args():
     g.add_argument("--sinkhorn-iters", type=int, help="default 30")
 
     add_model_args(ap)
-    return ap.parse_args()
+    return ap.parse_args(argv)
 
 
 def choose_loss(args, spec):
@@ -95,13 +97,13 @@ def choose_loss(args, spec):
 
 def choose_loss_options(args, loss):
     options = default_options(loss)
-    given = {k: getattr(args, k) for k in ("l1", "l2", "l3", "eps", "sinkhorn_iters", "adapt_beta", "adapt_every")
+    given = {k: getattr(args, k) for k in ("l1", "l2", "l3", "l4", "eps", "sinkhorn_iters", "adapt_beta", "adapt_every")
              if getattr(args, k) is not None}
     unused = sorted(set(given) - set(options))
     if unused:
         flags = ", ".join("--" + k.replace("_", "-") for k in unused)
         raise SystemExit(f"{flags} doesn't apply to --loss {loss}"
-                         + ("; it fits " + ", ".join(sorted({*WEIGHTED, "sinkhorn_adaptive"}))
+                         + ("; it fits " + ", ".join(n for n in PARTS_LOSSES if set(unused) <= set(default_options(n)))
                             if loss in PARTS_LOSSES else ""))
     return {**options, **given}
 
@@ -133,8 +135,10 @@ def run_name(args, splits, loss, loss_options):
     return name
 
 
-def main():
-    args = parse_args()
+def main(argv=None, epoch_callback=None):
+    """Run train.py with these arguments (default: the command line). Returns the val-selected
+    checkpoint's scores by split, or None if epoch_callback stopped the run (see Trainer.fit)."""
+    args = parse_args(argv)
     if args.external and args.model != "stresnet":
         raise SystemExit("--external only works with --model stresnet")
     spec = MODELS[args.model]
@@ -151,7 +155,7 @@ def main():
           f"{args.dataset} {C}x{H}x{W}, {splits.t_in} in -> {splits.t_out} out | "
           f"{len(splits.train)} train / {len(splits.val)} val / {len(splits.test)} test windows | {device}")
     if args.params_only:
-        return
+        return None
 
     settings = training_settings(args, spec)
     name = run_name(args, splits, loss_name, loss_options)
@@ -174,7 +178,7 @@ def main():
                       group=tracker_state and tracker_state.get("group"))
     if tracker_state:
         tracker.restore(tracker_state)
-    trainer.fit(tracker)
+    return trainer.fit(tracker, epoch_callback)
 
 
 if __name__ == "__main__":
