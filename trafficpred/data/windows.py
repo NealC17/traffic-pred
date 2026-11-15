@@ -24,6 +24,35 @@ class FlowWindows(Dataset):
         return w[:self.t_in], w[self.t_in:], torch.from_numpy(external.window(self.ext, i, self.t_in, self.t_out))
 
 
+class PeriodicFlowWindows(FlowWindows):
+    """Windows of frames[start:stop] whose input also holds, for every target frame, the frames one
+    period earlier (e.g. the same time yesterday / last week), from anywhere earlier in `frames`.
+
+    Input = [frames P_1 back for each target step, ..., frames P_k back ..., the t_in recent frames]:
+    the most recent frame stays last. Windows without that much history are left out.
+    """
+
+    def __init__(self, frames, t_in, t_out, lo, hi, periods, start=0, stop=None):
+        super().__init__(frames, t_in, t_out, lo, hi)
+        self.periods = tuple(periods)
+        stop = len(frames) if stop is None else stop
+        self.first = max(start, max(self.periods) - t_in)   # target frame i + t_in has P frames before it
+        self.n = max(stop - t_in - t_out + 1 - self.first, 0)
+
+    @property
+    def extra_in(self):
+        return len(self.periods) * self.t_out
+
+    def __getitem__(self, j):
+        i = self.first + j
+        x, y = super().__getitem__(i)
+        targets = np.arange(i + self.t_in, i + self.t_in + self.t_out)
+        rows = np.concatenate([targets - p for p in self.periods])
+        past = np.asarray(self.frames[rows], dtype=np.float32)
+        past = torch.from_numpy((past - self.lo) / self.span)
+        return torch.cat([past, x]), y
+
+
 class MovingMNISTSequences(Dataset):
     def __init__(self, arr, t_in=10):
         self.arr, self.t_in = arr, t_in

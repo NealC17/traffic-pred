@@ -1,0 +1,49 @@
+##### NYCTaxi, STDN protocol (t+1, cells >= 10, per channel)
+test cells with true value >= 10; mean over seeds (± spread when > 1 seed)
+
+== t+1
+  run                                                        n      Start RMSE   MAE   MAPE        End RMSE   MAE   MAPE        all RMSE   MAE   MAPE
+  stresnet_periodic_mse_nyctaxi_in4_out1                     3    23.048±0.01 14.32  17.4%    18.115±0.03 11.17  16.6%    20.451±0.01 12.57  16.9%
+  stresnet_mse_nyctaxi_in4_out1                              3    23.699±0.13 14.55  17.2%    18.278±0.10 11.27  16.6%    20.858±0.10 12.73  16.9%
+  distvolformer_periodic_sinkhorn_l2-0_nyctaxi_in4_out1      3    23.448±0.12 14.05  15.4%    18.880±0.07 11.26  15.7%    21.029±0.03 12.50  15.6%
+  distvol_periodic_sinkhorn_l2-0_nyctaxi_in4_out1            3    23.641±0.18 14.15  15.7%    18.708±0.10 11.17  15.7%    21.040±0.14 12.49  15.7%
+  distvolformer_sinkformer_periodic_sinkhorn_l2-0_nyctaxi_in 3    23.501±0.20 14.08  15.4%    18.877±0.04 11.26  15.7%    21.054±0.10 12.51  15.6%
+  distvol_sinkhorn_l2-0_nyctaxi_in4_out1                     3    23.768±0.08 14.15  15.7%    18.687±0.06 11.18  15.6%    21.093±0.07 12.50  15.7%
+  distvol_periodic_sinkhorn_nyctaxi_in4_out1                 3    23.668±0.16 14.18  15.8%    18.867±0.08 11.23  15.7%    21.132±0.04 12.54  15.7%
+  distvolformer_sinkhorn_l2-0_nyctaxi_in4_out1               3    23.835±0.05 14.16  15.6%    18.794±0.08 11.26  15.7%    21.179±0.06 12.55  15.6%
+  distvolformer_sinkformer_periodic_sinkhorn_nyctaxi_in4_out 3    23.698±0.04 14.22  15.7%    19.026±0.08 11.39  15.9%    21.226±0.06 12.64  15.8%
+  distvolformer_periodic_sinkhorn_nyctaxi_in4_out1           3    23.737±0.09 14.23  15.7%    19.153±0.10 11.39  15.9%    21.309±0.04 12.65  15.8%
+  copy_last_nyctaxi_in4_out1                                 1    36.629      22.30  23.2%    31.193      17.83  23.2%    33.713      19.81  23.2%
+
+##### BikeNYC, DeepSTN+ protocol (t+1, last 14 days, every cell)
+test cells with true value >= 0; mean over seeds (± spread when > 1 seed)
+
+== t+1
+  run                                                        n     Inflow RMSE   MAE   MAPE    Outflow RMSE   MAE   MAPE        all RMSE   MAE   MAPE
+  distvolformer_periodic_sinkhorn_l2-0_bikenyc_in4_out1      3     5.759±0.07  2.12      -     6.099±0.08  2.15      -     5.932±0.07  2.14      -
+  distvolformer_sinkformer_periodic_sinkhorn_bikenyc_in4_out 3     5.785±0.04  2.16      -     6.076±0.05  2.17      -     5.932±0.04  2.16      -
+  distvol_periodic_sinkhorn_bikenyc_in4_out1                 3     5.769±0.07  2.16      -     6.131±0.08  2.19      -     5.953±0.07  2.18      -
+  distvol_periodic_sinkhorn_l2-0_bikenyc_in4_out1            3     5.790±0.06  2.15      -     6.173±0.03  2.18      -     5.985±0.04  2.16      -
+  distvolformer_periodic_sinkhorn_bikenyc_in4_out1           3     5.815±0.09  2.15      -     6.151±0.08  2.17      -     5.985±0.08  2.16      -
+  distvolformer_sinkformer_periodic_sinkhorn_l2-0_bikenyc_in 3     5.843±0.06  2.13      -     6.199±0.07  2.16      -     6.024±0.07  2.15      -
+  distvol_sinkhorn_l2-0_bikenyc_in4_out1                     3     5.886±0.04  2.19      -     6.229±0.05  2.21      -     6.060±0.05  2.20      -
+  stresnet_periodic_mse_bikenyc_in4_out1                     3     5.838±0.11  2.22      -     6.291±0.06  2.27      -     6.069±0.08  2.24      -
+  distvolformer_sinkhorn_l2-0_bikenyc_in4_out1               3     5.972±0.06  2.19      -     6.289±0.10  2.19      -     6.132±0.08  2.19      -
+  stresnet_mse_bikenyc_in4_out1                              3     6.218±0.04  2.34      -     6.623±0.05  2.36      -     6.423±0.04  2.35      -
+  copy_last_bikenyc_in4_out1                                 1    14.717       4.57      -    15.017       4.65      -    14.867       4.61      -
+##### NYCBike (STDN data), STDN protocol (t+1, cells >= 10, per channel)
+test cells with true value >= 10; mean over seeds (± spread when > 1 seed)
+
+== t+1
+  run                                                        n      Start RMSE   MAE   MAPE        End RMSE   MAE   MAPE        all RMSE   MAE   MAPE
+  stresnet_periodic_mse_nycbike2_in4_out1                    3     8.694±0.03  6.24  22.5%     7.895±0.05  5.80  21.1%     8.308±0.04  6.02  21.8%
+  stresnet_mse_nycbike2_in4_out1                             3     8.829±0.07  6.28  22.5%     8.131±0.03  5.94  21.5%     8.490±0.05  6.11  22.0%
+  distvolformer_periodic_sinkhorn_nycbike2_in4_out1          3     8.883±0.26  6.29  22.0%     8.230±0.06  6.02  21.3%     8.566±0.16  6.15  21.7%
+  distvolformer_sinkformer_periodic_sinkhorn_l2-0_nycbike2_i 3     8.924±0.32  6.25  21.7%     8.274±0.07  6.02  21.3%     8.609±0.18  6.14  21.5%
+  distvolformer_sinkhorn_l2-0_nycbike2_in4_out1              3     8.921±0.03  6.33  22.3%     8.387±0.03  6.12  21.7%     8.660±0.01  6.22  22.0%
+  distvolformer_periodic_sinkhorn_l2-0_nycbike2_in4_out1     3     9.048±0.12  6.30  21.8%     8.273±0.06  5.99  21.0%     8.672±0.07  6.15  21.4%
+  distvolformer_sinkformer_periodic_sinkhorn_nycbike2_in4_ou 3     8.938±0.11  6.26  21.7%     8.453±0.13  6.13  21.5%     8.701±0.12  6.20  21.6%
+  distvol_sinkhorn_l2-0_nycbike2_in4_out1                    3     9.193±0.06  6.57  23.9%     8.455±0.06  6.17  22.5%     8.835±0.04  6.37  23.2%
+  distvol_periodic_sinkhorn_nycbike2_in4_out1                3     9.173±0.16  6.55  23.8%     8.639±0.14  6.30  23.0%     8.912±0.15  6.43  23.4%
+  distvol_periodic_sinkhorn_l2-0_nycbike2_in4_out1           3     9.204±0.13  6.57  23.9%     8.700±0.27  6.35  23.2%     8.958±0.20  6.46  23.6%
+  copy_last_nycbike2_in4_out1                                1    13.904       9.45  31.1%    13.355       9.33  30.8%    13.634       9.39  30.9%

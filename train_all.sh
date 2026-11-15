@@ -11,7 +11,10 @@ train, val and test sets of every run into one table.
   ./train_all.sh --workspace=baselines             start a new workspace with that name
   ./train_all.sh --workspaces                      list the workspaces and exit
   ./train_all.sh --dataset bikenyc                 any dataset train.py knows: taxibj (default), bikenyc,
-                                                   mmnist (Moving MNIST, 10 in -> 10 out), synthetic
+                                                   nyctaxi, nycbike2, taxibj21, bousai_tokyo, bousai_osaka,
+                                                   mmnist (Moving MNIST, 10 in -> 10 out), synthetic.
+                                                   W&B project: traffic-pred for taxibj, otherwise
+                                                   traffic-pred-<dataset> (WANDB_PROJECT=... overrides)
   ./train_all.sh cnn distvol                       only runs whose name contains "cnn" or "distvol"
                                                    (so "distvol" also matches the distvolformer runs)
   ./train_all.sh distvolformer                     DistVolFormer only (transformer distribution head)
@@ -147,6 +150,12 @@ done
 KNOWN_DATASETS="$("$PY" -c 'from trafficpred.data import DATASETS; print(*DATASETS)' 2>/dev/null)"
 if [ -n "$KNOWN_DATASETS" ] && [[ " $KNOWN_DATASETS " != *" $DATASET "* ]]; then
     echo "unknown --dataset \"$DATASET\" (datasets: $KNOWN_DATASETS)"; exit 2
+fi
+
+# One W&B project per dataset: TaxiBJ in traffic-pred, others in traffic-pred-<dataset> (also the
+# leaderboard). Set WANDB_PROJECT to choose another.
+if [ -z "${WANDB_PROJECT:-}" ] && [ "$DATASET" != taxibj ]; then
+    export WANDB_PROJECT="traffic-pred-$DATASET"
 fi
 
 MODELS=" $(for r in "${RUNS[@]}"; do read -r _ model _ <<< "$r"; echo "$model"; done | uniq | tr '\n' ' ')"
@@ -299,6 +308,7 @@ open_workspace() {
         echo "=== continuing workspace \"$WORKSPACE\" ($n_done runs already finished)  [$CK]"
     fi
     echo "invoked $(date '+%Y-%m-%d %H:%M:%S')${SLURM_JOB_ID:+ (Slurm job $SLURM_JOB_ID)}: $SCRIPT_NAME $ORIG_ARGS" >> "$CK/workspace.txt"
+    [ "${WANDB_MODE:-}" != disabled ] && echo "    W&B: project ${WANDB_PROJECT:-traffic-pred}, group $WORKSPACE"
     # a study with its own default workspace leaves "the most recently used" one to ./train_all.sh
     [ -z "${DEFAULT_WORKSPACE:-}" ] && echo "$WORKSPACE" > "$LATEST_FILE"
 }
@@ -336,6 +346,8 @@ update_leaderboard() {
     [ "${WANDB_MODE:-}" = disabled ] && return
     "$PY" tools/leaderboard.py --workspace "$CK" > "$CK/logs/leaderboard.log" 2>&1 \
         || echo "!!! couldn't update the W&B leaderboard; see $CK/logs/leaderboard.log"
+    # saved views that show the 10 best runs (made once per project; needs wandb-workspaces)
+    "$PY" tools/wandb_views.py --once --project "${WANDB_PROJECT:-traffic-pred}" >> "$CK/logs/leaderboard.log" 2>&1 || true
 }
 
 print_table() {

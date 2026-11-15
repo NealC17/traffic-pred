@@ -9,9 +9,10 @@ from torch.utils.data import ConcatDataset
 from trafficpred.data import external as ext_data
 from trafficpred.data import files, mmnist
 from trafficpred.data.windows import (FlowWindows, MovingMNISTGenerator, MovingMNISTSequences,
-                                      base_datasets, limit)
+                                      PeriodicFlowWindows, base_datasets, limit)
 
-SPLIT_KEYS = ("train_files", "val_files", "test_files", "train_size", "val_size", "test_size", "external")
+SPLIT_KEYS = ("train_files", "val_files", "test_files", "train_size", "val_size", "test_size", "external",
+              "periods", "test_days")
 
 
 @dataclass
@@ -29,6 +30,11 @@ class Splits:
     train_is_fixed: bool = True
     spatial_features: object = None
     ext_dim: int = 0
+    extra_in: int = 0   # input frames besides the t_in recent ones (e.g. --periods day week)
+
+    @property
+    def in_frames(self):
+        return self.t_in + self.extra_in
 
     @property
     def span(self):
@@ -52,12 +58,14 @@ class Splits:
 
 class GridFlowData:
     def __init__(self, title, pattern, channels, steps_per_day, test_days, val_days, horizon=(4, 4),
-                 spatial_file=None, has_external=False):
+                 spatial_file=None, has_external=False, source=None):
         self.title = title
+        self.source = source   # where to get the files, shown when they are missing
         self.has_external = has_external
         self.spatial_file = spatial_file
         self.pattern = re.compile(pattern)
         self.channels = channels
+        self.steps_per_day = steps_per_day
         self.test_frames = test_days * steps_per_day
         self.val_frames = val_days * steps_per_day
         self.horizon = horizon
@@ -65,17 +73,29 @@ class GridFlowData:
     def files(self):
         return [n for n in files.available() if self.pattern.fullmatch(n)]
 
+    def period_steps(self, periods):
+        """'day' / 'week' / a number of steps -> steps, largest first."""
+        named = {"day": self.steps_per_day, "week": 7 * self.steps_per_day}
+        steps = []
+        for p in periods:
+            steps.append(named[p] if p in named else int(p))
+            if steps[-1] <= 0:
+                raise ValueError(f"period {p!r} must be a positive number of steps, 'day' or 'week'")
+        return sorted(set(steps), reverse=True)
+
     def splits(self, name, t_in, t_out, train_files=None, val_files=None, test_files=None,
-               train_size=None, val_size=None, test_size=None, external=False):
+               train_size=None, val_size=None, test_size=None, external=False, periods=None,
+               test_days=None):
         names = self.files()
         if not names:
-            raise FileNotFoundError(f"no {self.title} files under {files.ROOT}")
+            hint = f"; {self.source}" if self.source else ""
+            raise FileNotFoundError(f"no {self.title} files under {files.ROOT}{hint}")
         if external and not self.has_external:
             raise ValueError(f"{self.title} has no external data (weather / calendar); drop --external")
         if train_files or val_files or test_files:
             parts = self._by_file(names, train_files, val_files, test_files)
         else:
-            parts = self._by_time(names)
+            parts = self._by_time(names, test_days)
         frames = [[files.load(n)[rows] for n, rows in group] for group in parts]
         lo = min(float(a.min()) for a in frames[0])
         hi = max(float(a.max()) for a in frames[0])
@@ -86,14 +106,29 @@ class GridFlowData:
             ext = [[ext_data.features(raw[n], mean, std)[rows] for n, rows in group] for group in parts]
         windows = lambda i: ConcatDataset([FlowWindows(a, t_in, t_out, lo, hi, e)
                                            for a, e in zip(frames[i], ext[i])])
+        extra_in = 0
+        if periods:
+            if external:
+                raise ValueError("--periods together with --external isn't supported")
+            steps = self.period_steps(periods)
+            extra_in = len(steps) * t_out
+
+            def windows(i):   # the whole file, so the periodic frames can reach back past the split
+                return ConcatDataset([PeriodicFlowWindows(files.load(n), t_in, t_out, lo, hi, steps,
+                                                          rows.start or 0, rows.stop)
+                                      for n, rows in parts[i]])
         split = dict(train_files=train_files, val_files=val_files, test_files=test_files,
                      train_size=train_size, val_size=val_size, test_size=test_size)
         if external:
             split["external"] = True
+        if periods:
+            split["periods"] = list(periods)
+        if test_days:
+            split["test_days"] = test_days
         return Splits(name, limit(windows(0), train_size, "train"),
                       limit(windows(1), val_size, "val"), limit(windows(2), test_size, "test"),
                       lo, hi, self.channels, t_in, t_out, split, spatial_features=self._spatial(),
-                      ext_dim=ext_data.DIM if external else 0)
+                      ext_dim=ext_data.DIM if external else 0, extra_in=extra_in)
 
     def _spatial(self):
         if self.spatial_file is None:
@@ -102,9 +137,10 @@ class GridFlowData:
         f = f.reshape(f.shape[0], -1).T
         return (f - f.mean(0)) / (f.std(0) + 1e-6)
 
-    def _by_time(self, names):
+    def _by_time(self, names, test_days=None):
         *head, last = names
-        cut_test = len(files.load(last)) - self.test_frames
+        test_frames = round(test_days * self.steps_per_day) if test_days else self.test_frames
+        cut_test = len(files.load(last)) - test_frames
         cut_val = cut_test - self.val_frames
         if cut_val <= 0:
             raise ValueError(f"{last} is too short for the val and test periods")
@@ -190,12 +226,33 @@ class SyntheticData:
         return f + rng.uniform(0, 0.02, f.shape).astype(np.float32)
 
 
+BOUSAI_SOURCE = ("apply for Yahoo! Bousai Crowd Data at https://randd.yahoo.co.jp/en/softwaredata, then "
+                 "convert flowio_*.npy with tools/import_grid.py (see its --help)")
+
 DATASETS = {
     "taxibj": GridFlowData("TaxiBJ", r"TaxiBJ/TaxiBJ20\d\d(_\d+)?\.npy", ("Inflow", "Outflow"),
                            steps_per_day=48, test_days=28, val_days=28, has_external=True),
     "bikenyc": GridFlowData("BikeNYC", r"BikeNYC/flow_data\.npy", ("Inflow", "Outflow"),
                             steps_per_day=24, test_days=10, val_days=10,
                             spatial_file="BikeNYC/poi_data.npy"),
+    # NYC taxi trips and Citi Bike, Jan-Mar 2015 / Jul-Aug 2016, from STDN (Yao et al., AAAI'19);
+    # the last 20 days are test, as in STDN. STDN calls the channels start / end volume.
+    "nyctaxi": GridFlowData("NYCTaxi", r"NYCTaxi/volume\.npy", ("Start", "End"),
+                            steps_per_day=48, test_days=20, val_days=10),
+    "nycbike2": GridFlowData("NYCBike2", r"NYCBike2/volume\.npy", ("Start", "End"),
+                             steps_per_day=48, test_days=20, val_days=10),
+    # 89 days of Beijing taxi flow; the published file is already scaled to 0-1, so its "raw
+    # units" are that scale, not counts.
+    "taxibj21": GridFlowData("TaxiBJ21", r"TaxiBJ/TaxiBJ21\.npy", ("Inflow", "Outflow"),
+                             steps_per_day=48, test_days=14, val_days=14),
+    # Yahoo! Bousai Crowd Data (DeepCrowd): smartphone GPS crowd flow in Tokyo / Osaka, 450 m cells,
+    # 2017-04-01 .. 07-09. Given out on application only; import with tools/import_grid.py.
+    "bousai_tokyo": GridFlowData("BousaiTYO", r"Bousai/flowio_tokyo\.npy", ("Inflow", "Outflow"),
+                                 steps_per_day=48, test_days=14, val_days=14,
+                                 source=BOUSAI_SOURCE),
+    "bousai_osaka": GridFlowData("BousaiOSA", r"Bousai/flowio_osaka\.npy", ("Inflow", "Outflow"),
+                                 steps_per_day=48, test_days=14, val_days=14,
+                                 source=BOUSAI_SOURCE),
     "mmnist": MovingMNISTData(),
     "synthetic": SyntheticData(),
 }
@@ -206,6 +263,14 @@ def get_splits(dataset="taxibj", t_in=None, t_out=None, **split):
     t_in = t_in or spec.horizon[0]
     t_out = t_out or spec.horizon[1]
     split = {k: v for k, v in split.items() if k in SPLIT_KEYS}
+    if not split.get("periods"):
+        split.pop("periods", None)
+    if not split.get("test_days"):
+        split.pop("test_days", None)
+    elif not isinstance(spec, GridFlowData):
+        raise ValueError(f"--test-days needs a grid flow dataset with a time axis, not {dataset}")
+    elif not isinstance(spec, GridFlowData):
+        raise ValueError(f"--periods needs a grid flow dataset with a time axis, not {dataset}")
     return spec.splits(dataset, t_in, t_out, **split)
 
 
@@ -221,8 +286,9 @@ def _size(text):
 def add_data_args(ap):
     g = ap.add_argument_group(
         "data",
-        "Default split: the last 4 weeks (taxibj) or 10 days (bikenyc) are test, the same "
-        "length before that is val, the rest is train. Name files to split by file instead, "
+        "Default split: the last weeks or days of the data are test (4 weeks for taxibj, 10 days "
+        "for bikenyc; see the README for the others), the same or a shorter period before that is "
+        "val, the rest is train. Name files to split by file instead, "
         "e.g. --train-files 2013 --val-files 2014 --test-files 2015 2016. Sizes keep the "
         "first N windows (or a fraction, e.g. 0.5).")
     g.add_argument("--dataset", choices=list(DATASETS), default="taxibj")
@@ -234,6 +300,12 @@ def add_data_args(ap):
     g.add_argument("--train-size", type=_size, metavar="N")
     g.add_argument("--val-size", type=_size, metavar="N")
     g.add_argument("--test-size", type=_size, metavar="N")
+    g.add_argument("--test-days", type=float, metavar="D",
+                   help="test on the last D days instead of the dataset's default (val stays the same length "
+                        "and moves back; e.g. 14 for DeepSTN+'s BikeNYC split)")
+    g.add_argument("--periods", nargs="+", metavar="P",
+                   help="also feed, for every target frame, the frame P earlier: day, week or a number of "
+                        "steps (e.g. --periods day week). Windows without that much history are dropped")
     g.add_argument("--external", action="store_true",
                    help="stresnet only: feed TaxiBJ's external data (TaxiBJext: day of week, weekend, "
                         "time of day, temperature, wind, weather type) to its external component")

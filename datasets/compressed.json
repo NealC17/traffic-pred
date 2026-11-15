@@ -121,5 +121,27 @@
    27
   ],
   "sha256": "d33ef5a9e27c560a0a7a1560fa358d4b20c5548d1d218481c3bded4035977fcf"
+ },
+ "NYCTaxi/volume.npy.xz": {
+  "dtype": "float64",
+  "stored_dtype": "uint16",
+  "shape": [
+   2880,
+   2,
+   10,
+   20
+  ],
+  "sha256": "05c678ed40e30964edbe4556a2432bfcdfce10d9e4357523b794dd3a6edcd271"
+ },
+ "NYCBike2/volume.npy.xz": {
+  "dtype": "float64",
+  "stored_dtype": "uint16",
+  "shape": [
+   2880,
+   2,
+   10,
+   20
+  ],
+  "sha256": "81227aa93b45312d4b1eaa3c01cfa07f6f4ce0ad2d69b7c9a2d1adbdbd055705"
  }
 }

@@ -13,3 +13,5 @@ datasets/**/*.part
 datasets/MovingMNIST/
 datasets/MNIST_raw/
 .DS_Store
+logs/.seeds_then_tune.*
+logs/hyperparameter_tuning_*.out

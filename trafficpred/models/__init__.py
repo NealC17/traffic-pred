@@ -30,15 +30,24 @@ def _pick(args, name, default):
 
 def _grid(splits):
     C, H, W = splits.shape
-    return dict(T_in=splits.t_in, T_out=splits.t_out, C=C, H=H, W=W)
+    return dict(T_in=splits.in_frames, T_out=splits.t_out, C=C, H=H, W=W)
 
 
 def _configure_cnn(args, splits):
     return dict(_grid(splits), width=_pick(args, "width", 64), blocks=_pick(args, "blocks", 6))
 
 
+def _residual(args, splits):   # only stored when on, so older checkpoints' kwargs stay valid
+    radius = getattr(args, "transport", None) or 0
+    if radius and getattr(args, "dist_residual", False):
+        raise SystemExit("--transport and --dist-residual are two different distribution heads; pick one")
+    if radius:
+        return {"transport": radius, "n_periodic": splits.extra_in // splits.t_out}
+    return {"dist_residual": True} if getattr(args, "dist_residual", False) else {}
+
+
 def _configure_distvol(args, splits):
-    return dict(_grid(splits), width=_pick(args, "width", 64))
+    return dict(_grid(splits), width=_pick(args, "width", 64), **_residual(args, splits))
 
 
 def _configure_distvolformer(args, splits):
@@ -46,7 +55,8 @@ def _configure_distvolformer(args, splits):
     return dict(_grid(splits), width=_pick(args, "width", 64),
                 patch=_pick(args, "patch_size", 2), dim=dim,
                 depth=_pick(args, "num_blocks", 6), heads=_pick(args, "heads", 6),
-                mlp_dim=_pick(args, "mlp_dim", 4 * dim), drop=_pick(args, "drop", 0.1))
+                mlp_dim=_pick(args, "mlp_dim", 4 * dim), drop=_pick(args, "drop", 0.1), **_residual(args, splits),
+                **({"sinkformer": args.sinkformer} if getattr(args, "sinkformer", None) else {}))
 
 
 def _configure_stresnet(args, splits):
@@ -58,7 +68,7 @@ def _configure_stresnet(args, splits):
 
 def _configure_mlp(args, splits):
     C, H, W = splits.shape
-    return dict(t_in=splits.t_in, t_out=splits.t_out, channels=C, height=H, width=W,
+    return dict(t_in=splits.in_frames, t_out=splits.t_out, channels=C, height=H, width=W,
                 hidden=_pick(args, "hidden", 512), depth=_pick(args, "depth", 3),
                 dropout=_pick(args, "dropout", 0.1))
 
@@ -77,12 +87,12 @@ def _configure_predformer(args, splits):
     num_blocks = _pick(args, "num_blocks", 24 if paper_mmnist else 8)
     if variant not in ("full", "fac_st", "fac_ts"):
         num_blocks -= num_blocks % len(variant)
-    cfg = dict(in_shape=(splits.t_in, C, H, W),
+    cfg = dict(in_shape=(splits.in_frames, C, H, W),
                patch_size=_patch_size(H, W, _pick(args, "patch_size", 8 if paper_mmnist else 4)),
                dim=_pick(args, "dim", 256), heads=_pick(args, "heads", 8),
                mlp_dim=_pick(args, "mlp_dim", 1024), num_blocks=num_blocks, variant=variant,
                attn_drop=drop, drop=drop, drop_path=drop)
-    return dict(t_in=splits.t_in, t_out=splits.t_out, config=cfg)
+    return dict(t_in=splits.in_frames, t_out=splits.t_out, config=cfg)
 
 
 def _build_predformer(t_in, t_out, config):
@@ -93,9 +103,9 @@ def _configure_official(args, splits):
     from trafficpred.models import predformer_official as official
     C, H, W = splits.shape
     variant = _pick(args, "variant", official.DEFAULT_VARIANT[official.config_family(splits.dataset)])
-    cfg = official.official_config(splits.dataset, variant, splits.t_in, splits.t_out, C, H, W)
+    cfg = official.official_config(splits.dataset, variant, splits.in_frames, splits.t_out, C, H, W)
     cfg["patch_size"] = _patch_size(H, W, _pick(args, "patch_size", cfg["patch_size"]))
-    return dict(t_in=splits.t_in, t_out=splits.t_out, variant=variant, config=cfg)
+    return dict(t_in=splits.in_frames, t_out=splits.t_out, variant=variant, config=cfg)
 
 
 def _build_official(t_in, t_out, variant, config):
@@ -158,6 +168,14 @@ def add_model_args(ap):
     g.add_argument("--width", type=int,
                    help="channels (cnn, distvol, distvolformer's volume UNet) or filters (stresnet); default 64")
     g.add_argument("--blocks", type=int, help="cnn residual blocks (default 6)")
+    g.add_argument("--dist-residual", action="store_true",
+                   help="distvol / distvolformer: predict the distribution as softmax(log P_last + change), "
+                        "starting from the last input frame's distribution")
+    g.add_argument("--transport", type=int, metavar="R",
+                   help="distvol / distvolformer: predict where traffic moves instead of the distribution: "
+                        "each cell sends its share to cells within R (e.g. 2), chained over the output steps. "
+                        "With --periods, the same time one period back is moved too and the candidates are "
+                        "mixed per cell")
     g.add_argument("--st-units", type=int, help="stresnet residual units (default 12, the paper's)")
     g.add_argument("--st-bn", action="store_true", help="stresnet: batch norm in residual units")
     g.add_argument("--st-paper-init", action="store_true",
@@ -175,6 +193,9 @@ def add_model_args(ap):
     g.add_argument("--dim", type=int, help="token width (default 256)")
     g.add_argument("--mlp-dim", type=int, help="SwiGLU hidden size (default 1024)")
     g.add_argument("--num-blocks", type=int, help="gated transformer blocks (default 8; 24 on mmnist)")
+    g.add_argument("--sinkformer", type=int, metavar="N",
+                   help="distvolformer: Sinkformer attention, N Sinkhorn normalisations (rows, columns, ...) in "
+                        "place of the softmax (1 = softmax; e.g. 3)")
     g.add_argument("--drop", type=float, help="attention / path dropout (default 0.1; 0 on mmnist)")
 
     g = ap.add_argument_group("stdcformer (official code in external/STDCformer)")

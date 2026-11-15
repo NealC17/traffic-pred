@@ -23,6 +23,13 @@ def leaderboard_rows(results_path):
             for r in baseline + models]
 
 
+def lowest(rows, column, n):
+    """The n runs with the lowest value of a column, best first, labelled by rank so W&B keeps the order."""
+    i = COLUMNS.index(column)
+    best = sorted(rows, key=lambda r: r[i])[:n]
+    return [[f"{k + 1:02d}. {r[0]}", r[i]] for k, r in enumerate(best)]
+
+
 def print_rows(rows):
     print("| " + " | ".join(COLUMNS) + " |")
     print("|---|---|---|---|")
@@ -52,6 +59,8 @@ def main():
                                              "to W&B as the 'leaderboard' table of the workspace's group.")
     ap.add_argument("--workspace", help="workspace directory or name (default: the most recently used)")
     ap.add_argument("--print-only", action="store_true", help="print the table, don't touch W&B")
+    ap.add_argument("--top", type=int, default=10,
+                    help="runs in each test RMSE / MAE / MSE bar chart: the N lowest (default 10)")
     args = ap.parse_args()
     workspace = args.workspace or latest_workspace()
     if not os.path.isdir(workspace):
@@ -66,7 +75,12 @@ def main():
         return
     import wandb
     run = start_run(wandb, workspace, name)
-    run.log({"leaderboard": wandb.Table(columns=COLUMNS, data=rows)})
+    charts = {}
+    for column in COLUMNS[1:]:
+        table = wandb.Table(columns=["run", column], data=lowest(rows, column, args.top))
+        charts[f"lowest {column}"] = wandb.plot.bar(table, "run", column,
+                                                    title=f"{args.top} lowest {column}")
+    run.log({"leaderboard": wandb.Table(columns=COLUMNS, data=rows), **charts})
     run.summary["runs"] = len(rows)
     print(f"[leaderboard] {len(rows)} runs -> {run.url}")
     run.finish()

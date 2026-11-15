@@ -71,6 +71,7 @@ def main():
                                              ".npy.xz small enough for GitHub.")
     ap.add_argument("--include-mnist", action="store_true",
                     help="also compress Moving MNIST (it can be re-downloaded instead)")
+    ap.add_argument("files", nargs="*", help="only these .npy files (default: every one under datasets/)")
     args = ap.parse_args()
 
     manifest = {}
@@ -78,9 +79,11 @@ def main():
         with open(MANIFEST) as f:
             manifest = json.load(f)
     total_in = total_out = 0
-    for path in sorted(glob.glob(os.path.join(ROOT, "**", "*.npy"), recursive=True)):
+    paths = [os.path.abspath(f) for f in args.files] or \
+        sorted(glob.glob(os.path.join(ROOT, "**", "*.npy"), recursive=True))
+    for path in paths:
         rel = os.path.relpath(path, ROOT)
-        if "mnist" in rel.lower() and not args.include_mnist:
+        if "mnist" in rel.lower() and not args.include_mnist and not args.files:
             print(f"skip  {rel}  (downloaded on demand)")
             continue
         out, info = compress(path)

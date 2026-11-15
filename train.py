@@ -74,11 +74,16 @@ def parse_args(argv=None):
     g.add_argument("--l2", type=float, help="weight on Sinkhorn S_eps(p_hat, p) (fixed-weight and adaptive losses)")
     g.add_argument("--l3", type=float, help="weight on |N_hat - N| (fixed-weight and adaptive losses)")
     g.add_argument("--l4", type=float, help="weight on KL(p || p_hat) (kl, sinkhorn_kl)")
+    g.add_argument("--l5", type=float, help="weight on the change transport, Sinkhorn between where the flow "
+                                            "grows / shrinks vs the last input frame (sinkhorn_change, default 0.3)")
     g.add_argument("--adapt-beta", type=float, help="sinkhorn_adaptive: running-average decay (default 0.95)")
     g.add_argument("--adapt-every", type=int,
                    help="sinkhorn_adaptive: measure the gradients every N steps (default 10)")
-    g.add_argument("--eps", type=float, help="Sinkhorn blur (default 0.01)")
-    g.add_argument("--sinkhorn-iters", type=int, help="default 30")
+    g.add_argument("--eps", type=float, help="Sinkhorn blur (default 0.01; sinkhorn_change: 0.002)")
+    g.add_argument("--sinkhorn-iters", type=int, help="default 30 (sinkhorn_change: 60)")
+    g.add_argument("--sinkhorn-anneal", action=argparse.BooleanOptionalAction, default=None,
+                   help="epsilon scaling: lower eps from the grid's largest cost to --eps over the first half of "
+                        "the iterations, so small eps converges (default off; on for sinkhorn_change)")
 
     add_model_args(ap)
     return ap.parse_args(argv)
@@ -97,8 +102,11 @@ def choose_loss(args, spec):
 
 def choose_loss_options(args, loss):
     options = default_options(loss)
-    given = {k: getattr(args, k) for k in ("l1", "l2", "l3", "l4", "eps", "sinkhorn_iters", "adapt_beta", "adapt_every")
+    given = {k: getattr(args, k) for k in ("l1", "l2", "l3", "l4", "l5", "eps", "sinkhorn_iters", "sinkhorn_anneal",
+                                           "adapt_beta", "adapt_every")
              if getattr(args, k) is not None}
+    if "sinkhorn_anneal" in given and "eps" in options:   # every Sinkhorn loss takes it; only
+        options.setdefault("sinkhorn_anneal", False)       # sinkhorn_change stores it by default
     unused = sorted(set(given) - set(options))
     if unused:
         flags = ", ".join("--" + k.replace("_", "-") for k in unused)
@@ -111,7 +119,8 @@ def choose_loss_options(args, loss):
 def option_suffix(loss, options):
     def fmt(v):
         return f"{v:g}" if isinstance(v, float) else str(v)
-    changed = [(k, v) for k, v in options.items() if v != default_options(loss).get(k)]
+    defaults = {"sinkhorn_anneal": False, **default_options(loss)}
+    changed = [(k, v) for k, v in options.items() if v != defaults.get(k)]
     return "".join(f"_{k}-{fmt(v)}" for k, v in changed)
 
 
@@ -132,6 +141,16 @@ def run_name(args, splits, loss, loss_options):
         name += f"_in{splits.t_in}_out{splits.t_out}"
     if splits.ext_dim:
         name += "_ext"
+    if getattr(args, "dist_residual", False):
+        name += "_res"
+    if getattr(args, "transport", None):
+        name += f"_transport{args.transport}"
+    if getattr(args, "sinkformer", None):
+        name += f"_sinkformer{args.sinkformer}"
+    if splits.split.get("test_days"):
+        name += f"_test{splits.split['test_days']:g}d"
+    if splits.split.get("periods"):
+        name += "_periods-" + "-".join(map(str, splits.split["periods"]))
     return name
 
 
@@ -171,7 +190,7 @@ def main(argv=None, epoch_callback=None):
     torch.backends.cudnn.benchmark = device.type == "cuda"
     trainer = Trainer(model, run, splits, loss, settings, save, device)
     tracker_state = trainer.try_resume() if args.resume else None
-    tracker = Tracker(name=name, job_type=args.model, enabled=not args.no_wandb,
+    tracker = Tracker(name=name, job_type=args.model, enabled=not args.no_wandb, dataset=args.dataset,
                       config=dict(vars(args), **run, **asdict(settings), params=count_parameters(model),
                                   **device_info()),
                       run_id=tracker_state and tracker_state.get("run_id"),

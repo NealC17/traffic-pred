@@ -10,6 +10,12 @@ Their terms are
     volume          |n_hat - n| / (H W)
     kl              KL(p || p_hat)         sum_cells p log(p / p_hat): the shapes compared cell by
                                            cell, with no notion of distance between cells
+    change          S_eps(d_hat+, d+) + S_eps(d_hat-, d-), d = flow minus the last input frame:
+                    transport between where the flow grows (and where it shrinks) in the prediction
+                    and in truth, each normalized to a distribution, maps weighted by how much the
+                    true flow changes. The whole-city shape hardly moves between frames and is
+                    dominated by static background, so `transport` barely sees the moving part;
+                    this term sees only it, at full scale
 
 and they differ only in which terms are trained and how the terms are combined:
 
@@ -18,14 +24,17 @@ and they differ only in which terms are trained and how the terms are combined:
     sinkhorn_vol     10 * transport + 1 * volume
     kl               1 * reconstruction + 0.1 * kl + 1 * volume         (KL in place of Sinkhorn)
     sinkhorn_kl      1 * reconstruction + 10 * transport + 1 * volume + 0.1 * kl
+    sinkhorn_change  1 * reconstruction + 1 * volume + 0.3 * change, with sharp, converged Sinkhorn
+                     (eps 0.002 = blur ~1.4 cells, 60 epsilon-scaled iterations)
     sinkhorn_vol_uw  the vector (transport, volume), combined by learned uncertainty weights
                      (Kendall, Gal & Cipolla 2018): sum_i exp(-s_i) * L_i + s_i
     sinkhorn_adaptive  all three terms, weighted so each one's gradient on the model's parameters
                      is as large as the reconstruction term's (times l1 / l2 / l3, default 1 each),
                      from Adam-style running averages of the squared gradient norms
 
---l1 / --l2 / --l3 / --l4 weigh reconstruction / transport / volume / kl. Every term is logged
-whether or not it is trained, except that Sinkhorn is only computed when its weight is above 0.
+--l1 / --l2 / --l3 / --l4 / --l5 weigh reconstruction / transport / volume / kl / change. Every
+term is logged whether or not it is trained, except that the Sinkhorn terms (transport, change)
+are only computed when their weight is above 0. --sinkhorn-anneal turns on epsilon scaling.
 """
 import torch
 import torch.nn as nn
@@ -40,13 +49,17 @@ def masked_l1_loss(pred, y):
 
 
 POINTWISE = {"mse": F.mse_loss, "mae": F.l1_loss, "masked_mae": masked_l1_loss}
+CHANGE_WEIGHT = 0.3
+CHANGE_FLOOR = 1e-2
 WEIGHTED = {  # name -> default weights: l1 reconstruction, l2 transport, l3 volume, l4 kl
     "sinkhorn": dict(l1=1.0, l2=10.0, l3=1.0),
     "sinkhorn_only": dict(l1=0.0, l2=10.0, l3=0.0),
     "sinkhorn_vol": dict(l1=0.0, l2=10.0, l3=1.0),
     "kl": dict(l1=1.0, l2=0.0, l3=1.0, l4=0.1),
     "sinkhorn_kl": dict(l1=1.0, l2=10.0, l3=1.0, l4=0.1),
+    "sinkhorn_change": dict(l1=1.0, l2=0.0, l3=1.0, l5=CHANGE_WEIGHT),
 }
+SHARP_SINKHORN = dict(eps=0.002, sinkhorn_iters=60, sinkhorn_anneal=True)   # sinkhorn_change's
 KL_FLOOR = 1e-12
 UNCERTAINTY = ("sinkhorn_vol_uw",)
 ADAPTIVE = ("sinkhorn_adaptive",)
@@ -76,14 +89,31 @@ def kl_divergence(p, p_hat):
     return torch.where(p > 0, p * log_ratio, torch.zeros_like(p)).sum(dim=(-2, -1)).mean()
 
 
+def change_transport(x_hat, y, x_last, eps, iters, anneal):
+    """Sinkhorn between where the flow grows (and shrinks) relative to the last input frame in
+    the prediction and in truth, each normalized to a distribution; maps weighted by their true
+    change. A floor of CHANGE_FLOOR * the mean true change keeps a map with almost no predicted
+    growth from blowing up the normalization's gradient."""
+    H, W = y.shape[-2:]
+    d_hat = (x_hat - x_last).reshape(-1, H, W)
+    d = (y - x_last).reshape(-1, H, W)
+    a = torch.cat([d_hat.clamp_min(0), (-d_hat).clamp_min(0)])
+    b = torch.cat([d.clamp_min(0), (-d).clamp_min(0)])
+    mass = b.sum(dim=(-2, -1))
+    floor = CHANGE_FLOOR * mass.mean().detach() / (H * W)
+    s = sinkhorn_divergence(a + floor, b + floor, eps=eps, iters=iters, anneal=anneal)
+    return (s * mass).sum() / mass.sum().clamp_min(1e-12)
+
+
 class DistVolTerms(nn.Module):
     needs_parts = True
+    anneal = False   # epsilon scaling in the Sinkhorn terms (set by make_loss)
 
     def __init__(self, eps=0.01, iters=30):
         super().__init__()
         self.eps, self.iters = eps, iters
 
-    def terms(self, parts, y, transport=True):
+    def terms(self, parts, y, transport=True, x=None, change=False):
         x_hat, p_hat, n_hat = (t.float() for t in parts)
         H, W = y.shape[-2:]
         p, n = split_flow(y.clamp_min(0))
@@ -92,19 +122,26 @@ class DistVolTerms(nn.Module):
                "kl": kl_divergence(p, p_hat)}
         if transport:
             out["sinkhorn"] = sinkhorn_divergence(p_hat.reshape(-1, H, W), p.reshape(-1, H, W),
-                                                  eps=self.eps, iters=self.iters).mean()
+                                                  eps=self.eps, iters=self.iters,
+                                                  anneal=self.anneal).mean()
+        if change:
+            if x is None:
+                raise RuntimeError("the change term needs the input frames: loss(parts, y, x=x)")
+            out["change"] = change_transport(x_hat, y, x[:, -1:].float(), self.eps, self.iters, self.anneal)
         return out
 
 
 class DistVolLoss(DistVolTerms):
-    """Fixed-weight sum l1 * reconstruction + l2 * transport + l3 * volume + l4 * kl."""
+    """Fixed-weight sum l1 * reconstruction + l2 * transport + l3 * volume + l4 * kl + l5 * change."""
 
-    def __init__(self, l1=1.0, l2=10.0, l3=1.0, l4=0.0, eps=0.01, iters=30):
+    def __init__(self, l1=1.0, l2=10.0, l3=1.0, l4=0.0, l5=0.0, eps=0.01, iters=30):
         super().__init__(eps, iters)
-        self.weights = {"l1": l1, "sinkhorn": l2, "volume": l3, "kl": l4}
+        self.weights = {"l1": l1, "sinkhorn": l2, "volume": l3, "kl": l4, "change": l5}
+        self.needs_input = l5 > 0
 
-    def forward(self, parts, y):
-        terms = self.terms(parts, y, transport=self.weights["sinkhorn"] > 0)
+    def forward(self, parts, y, x=None):
+        terms = self.terms(parts, y, transport=self.weights["sinkhorn"] > 0, x=x,
+                           change=self.weights["change"] > 0)
         total = sum(self.weights[k] * v for k, v in terms.items() if self.weights[k] > 0)
         return total, {k: v.detach() for k, v in terms.items()}
 
@@ -206,7 +243,7 @@ def needs_parts(name):
 def default_options(name):
     """The options a loss is built with when nothing is overridden (stored with each run)."""
     if name in WEIGHTED:
-        return dict(WEIGHTED[name], **SINKHORN_DEFAULTS)
+        return dict(WEIGHTED[name], **(SHARP_SINKHORN if "l5" in WEIGHTED[name] else SINKHORN_DEFAULTS))
     if name in UNCERTAINTY:
         return dict(SINKHORN_DEFAULTS)
     if name in ADAPTIVE:
@@ -219,11 +256,17 @@ def make_loss(name, **options):
         return PointwiseLoss(name)
     options = {**default_options(name), **options}
     iters = options.pop("sinkhorn_iters")
+    anneal = bool(options.pop("sinkhorn_anneal", False))
     if name in WEIGHTED:
-        return DistVolLoss(iters=iters, **options)
-    if name in UNCERTAINTY:
-        return UncertaintyLoss(iters=iters, **options)
-    if name in ADAPTIVE:
-        return AdaptiveLoss(iters=iters, beta=options.pop("adapt_beta"), every=options.pop("adapt_every"),
+        loss = DistVolLoss(iters=iters, **options)
+    elif name in UNCERTAINTY:
+        loss = UncertaintyLoss(iters=iters, **options)
+    elif name in ADAPTIVE:
+        loss = AdaptiveLoss(iters=iters, beta=options.pop("adapt_beta"), every=options.pop("adapt_every"),
                             **options)
+    else:
+        loss = None
+    if loss is not None:
+        loss.anneal = anneal
+        return loss
     raise ValueError(f"unknown loss {name!r} (losses: {', '.join(LOSSES)})")

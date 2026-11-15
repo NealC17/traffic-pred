@@ -39,7 +39,7 @@ trafficpred/
   astgnn.py               ASTGNN data conversion helpers
   viz.py                  heatmaps, interactive browser, notebook browser
 
-tools/                    compress_data.py, param_sizes.py, convert_checkpoints.py
+tools/                    compress_data.py, import_grid.py, param_sizes.py, convert_checkpoints.py
 notebooks/                visualize.ipynb
 external/                 (gitignored) PredFormer, ASTGNN and STDCformer clones, ASTGNN experiments
 datasets/                 compressed data
@@ -51,6 +51,11 @@ datasets/                 compressed data
 |---|---|---|---|---|
 | `taxibj` | 2 × 32 × 32 | 30 min | 4 → 4 | test = last 4 weeks, val = 4 weeks before, train = rest |
 | `bikenyc` | 2 × 21 × 12 | 1 h | 4 → 4 | test = last 10 days, val = 10 days before, train = rest |
+| `nyctaxi` | 2 × 10 × 20 | 30 min | 4 → 4 | NYC taxi, Jan–Mar 2015 (STDN); test = last 20 days, val = 10 days before |
+| `nycbike2` | 2 × 10 × 20 | 30 min | 4 → 4 | NYC Citi Bike, Jul–Aug 2016 (STDN); test = last 20 days, val = 10 days before |
+| `taxibj21` | 2 × 32 × 32 | 30 min | 4 → 4 | 89 days of Beijing taxi flow, published already scaled to 0–1 (so "raw units" are that scale); test / val = 2 weeks each |
+| `bousai_tokyo` | 2 × 80 × 80 | 30 min | 4 → 4 | Tokyo smartphone-GPS crowd flow, Apr–Jul 2017; test / val = 2 weeks each. Not included: see below |
+| `bousai_osaka` | 2 × 60 × 60 | 30 min | 4 → 4 | the same for Osaka |
 | `mmnist` | 1 × 64 × 64 | – | 10 → 10 | train generated on the fly, val a fixed generated set, test `mnist_test_seq.npy` |
 | `synthetic` | 2 × 32 × 32 | – | 4 → 4 | drifting Gaussian hotspots, 70 / 15 / 15; a smoke test that needs no files |
 
@@ -58,6 +63,17 @@ Every dataset accepts `--t-in / --t-out` and `--train-size / --val-size / --test
 first N windows, or a fraction like `0.5`). File-based datasets can also be split by file:
 `--train-files 2013 --val-files 2014 --test-files 2015 2016`. The min-max scale always comes from
 the training data only. Windows never cross file or split boundaries.
+
+`nyctaxi` / `nycbike2` come from [STDN](https://github.com/tangxianfeng/STDN) (Yao et al., AAAI'19,
+`data.zip`, train and test files joined in time). STDN calls the two channels start and end volume.
+The Bousai sets ([DeepCrowd](https://github.com/deepkashiwa20/DeepCrowd)) are given out by Yahoo!
+Japan on application (https://randd.yahoo.co.jp/en/softwaredata); convert the `flowio_*.npy` files
+they send with `tools/import_grid.py` (its `--help` has the commands). The same tool converts any
+other (T, H, W, 2) or (T, 2, H, W) inflow/outflow array; register the result in
+`trafficpred/data/datasets.py` and compress it with `python tools/compress_data.py <file.npy>`.
+
+W&B: TaxiBJ runs log to project `traffic-pred`, every other dataset to `traffic-pred-<dataset>`
+(e.g. `./train_all.sh --dataset nyctaxi` → `traffic-pred-nyctaxi`); `WANDB_PROJECT=...` overrides.
 
 Moving MNIST downloads on first use. On a cluster node without internet run
 `python -c "from trafficpred.data import mmnist; mmnist.download()"` on a login node first.
@@ -104,16 +120,26 @@ cell by cell, with no notion of distance between cells).
 | `sinkhorn_vol` | `10 * transport + 1 * volume` |
 | `kl` | `1 * reconstruction + 0.1 * KL + 1 * volume`: KL in place of Sinkhorn |
 | `sinkhorn_kl` | `1 * reconstruction + 10 * transport + 1 * volume + 0.1 * KL` |
+| `sinkhorn_change` | `1 * reconstruction + 1 * volume + 0.3 * change`: Sinkhorn between where the flow grows (and shrinks) relative to the last input frame in the prediction and in truth, each normalized to a distribution, maps weighted by their true change; sharp and converged (`--eps 0.002` ≈ 1.4-cell blur, 60 iterations with epsilon scaling) |
 | `sinkhorn_vol_uw` | the vector (transport, volume), combined with learned uncertainty weights (Kendall et al. 2018): `sum_i exp(-s_i) L_i + s_i`. `s_i` starts at `log L_i` of the first batch, is trained without weight decay and is saved in the checkpoint; W&B logs the weights as `epoch/train_weight_sinkhorn` / `_volume` |
 | `sinkhorn_adaptive` | all three terms, reweighted like Adam: every 10 steps (`--adapt-every`) each term's gradient on the model's parameters is measured, running averages of the squared norms (`--adapt-beta 0.95`, bias-corrected) set `w_i = sqrt(v_l1 / v_i)`, so each term pushes as hard as the L1 term; `--l1 / --l2 / --l3` scale those shares (default 1 each). The averages are saved for `--resume`; W&B logs `epoch/train_weight_*` |
 
-`--l1 / --l2 / --l3 / --l4` change the weights (reconstruction / transport / volume / KL) of the
-fixed-weight losses, `--eps / --sinkhorn-iters`
+`--l1 / --l2 / --l3 / --l4 / --l5` change the weights (reconstruction / transport / volume / KL /
+change) of the fixed-weight losses, `--sinkhorn-anneal` turns on epsilon scaling in any Sinkhorn
+loss (needed for `--eps` below ~0.005 to converge), `--eps / --sinkhorn-iters`
 the Sinkhorn settings of any of them. A value that differs from the loss's default is added to
 the run name (`--loss sinkhorn --l1 0` -> `distvol_sinkhorn_l1-0`), so it never overwrites the
 default run. Every term is logged whether or not it is trained (Sinkhorn only when its weight
 is above 0). At the default weights the terms are far apart in size: late in training 10 * Sinkhorn
-is about 3% of the loss on TaxiBJ, while a copy-last prediction has KL ≈ 2x its L1, hence KL's 0.1. `./train_all.sh distvol_` and
+is about 3% of the loss on TaxiBJ, while a copy-last prediction has KL ≈ 2x its L1, hence KL's 0.1.
+
+Why `sinkhorn_change`: the whole-city shape hardly moves between frames and is mostly static
+background, and at `eps 0.01` (≈ 3-cell blur) Sinkhorn charges a 1-cell blur of the map ~50x less
+than a 1-cell shift. So the `transport` term barely sees the errors models make: the `sinkhorn`
+runs end with no lower test Sinkhorn than the same loss without it (`--l2 0`). The change term
+looks only at the moving part, at full scale (on a trained distvolformer it is ~30% of L1 with
+2.4x L1's gradient). Below `eps` ≈ 0.006 the log-domain solver is `torch.compile`d on CUDA
+(~12x faster; `TRAFFICPRED_NO_COMPILE=1` turns it off). `./train_all.sh distvol_` and
 `./train_all.sh distvolformer_` run each of those models with mse and all four sinkhorn losses.
 
 Protocol: every epoch is scored on val, the checkpoint with the lowest val MSE (`--select`) is
@@ -125,17 +151,35 @@ which refuses to continue a run made with different settings.
 
 ### Tuning the loss weights
 
-`tune_loss.py` searches the weights of `sinkhorn_kl` with Optuna (TPE): l1 stays 1 and it picks
+`tune_loss.py` searches loss weights with Optuna (TPE). `--space kl` (default, study
+`<model>_<dataset>`) searches `sinkhorn_kl`; `--space change` (study `<model>_<dataset>_change`)
+searches `sinkhorn_change` (`--l2` Sinkhorn or off, `--l3`, `--l5` change or off, `--eps`
+0.0005-0.01) and also queues `1 L1 + 0.034 volume`, the kl study's best plain weighting, as a
+control. In the kl space l1 stays 1 and it picks
 `--l2` (Sinkhorn, 0.3-1000, or off), `--l3` (volume, 0.03-30), `--l4` (KL, 0.003-3, or off) and
 `--eps` (0.003-0.1), so it covers `sinkhorn`, `kl` and plain L1 + volume as special cases. Trial 0
 is the default weighting. Each trial is a shortened run (`--epochs 20`, one seed, the one-cycle
 schedule squeezed to fit, no checkpoints, `--curves val`) scored by its best **val** RMSE, and a
 trial behind the median of the earlier ones at the same epoch is pruned. Every trial is a W&B run
-in group `tune_<study>`.
+`hyperparameter_tuning_<study>_t<N>` in group `hyperparameter_tuning_<study>`, tagged
+`hyperparameter_tuning`, in its own W&B project `traffic-pred-hyperparameter-tuning`
+(`--wandb-project`), so trials never mix with the training runs in `traffic-pred`.
+
+On one machine, `./tuning.sh` runs it in the background (default `--until 40`, log
+`logs/hyperparameter_tuning_<study>.out`) and won't start a second copy while one is running:
+
+```bash
+./tuning.sh                  # start, or continue, the study (options go to tune_loss.py)
+./tuning.sh status           # running? best trials so far
+./tuning.sh log              # follow the log
+./tuning.sh stop             # stop; the current trial is queued again
+./tuning.sh confirm 3        # -> train_tuned_<study>.sh
+```
 
 ```bash
 python tune_loss.py --trials 40                          # study distvolformer_taxibj
 python tune_loss.py --study dvf_l --trials 40 -- --model distvolformer --dim 256 --heads 8
+python tune_loss.py --space change --until 40            # sinkhorn_change: l2, l3, l5, eps
 python tune_loss.py --fix l4=0 --study no_kl --trials 30 # hold a weight fixed
 python tune_loss.py --report                             # best trials, parameter importances
 python tune_loss.py --confirm 3                          # -> train_tuned_<study>.sh
@@ -150,6 +194,12 @@ arguments, epochs, seed, `--fix`) can't change; use a new `--study` instead. Sin
 runs are only a screen: `--confirm K` writes `train_tuned_<study>.sh`, a `train_all.sh` wrapper that
 runs the K best weightings and the default `sinkhorn` at full length on seeds 42, 7, 123 and 2025
 (workspace `tuned_<study>`).
+
+`slurm/seeds_then_tune.sbatch` chains the two on Sol: it finishes `./train_all_new_seeds.sh`
+(every run with a `.done` marker), then runs `tune_loss.py --until 40` and `--confirm 3`. 15 min
+before each job's time limit it stops, resubmits itself to start after it ends (an interrupted
+trial is queued again), so it carries on across as many jobs as needed. How to submit it after a
+running job without touching that job's code is in the script's header.
 
 ### External data (`--external`, ST-ResNet on TaxiBJ only)
 

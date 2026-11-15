@@ -248,7 +248,10 @@ class Trainer:
                     pred = predict(self.model, x, ext, return_parts=True)
                 else:
                     pred = predict(self.model, x, ext)
-            loss, parts = self.loss(pred, y)
+            if getattr(self.loss, "needs_input", False):   # e.g. the change term: d = y - last frame
+                loss, parts = self.loss(pred, y, x=x)
+            else:
+                loss, parts = self.loss(pred, y)
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
             if self.settings.clip > 0:

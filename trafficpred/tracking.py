@@ -13,8 +13,15 @@ PROGRESS_POINTS = 20
 VIZ_EVERY = 10
 
 
+def wandb_project(dataset=None):
+    """$WANDB_PROJECT if set; else traffic-pred for TaxiBJ, traffic-pred-<dataset> for the others."""
+    if os.environ.get("WANDB_PROJECT"):
+        return os.environ["WANDB_PROJECT"]
+    return "traffic-pred" if dataset in (None, "taxibj") else f"traffic-pred-{dataset}"
+
+
 class Tracker:
-    def __init__(self, name, config, job_type, enabled=True, run_id=None, group=None):
+    def __init__(self, name, config, job_type, enabled=True, run_id=None, group=None, dataset=None):
         self.run = None
         self.wandb = None
         self.run_id = run_id
@@ -34,7 +41,7 @@ class Tracker:
             print("[wandb] not installed (pip install wandb); continuing without it")
             return
         self.wandb = wandb
-        kwargs = dict(project=os.environ.get("WANDB_PROJECT", "traffic-pred"), name=self.name,
+        kwargs = dict(project=wandb_project(dataset), name=self.name,
                       group=self.group, job_type=job_type, config=config)
         if run_id is not None:
             kwargs.update(id=run_id, resume="allow")

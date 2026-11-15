@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from trafficpred.models.distvol import EPS, ConvBlock
+from trafficpred.models.distvol import EPS, ConvBlock, log_last_distribution
+from trafficpred.models.transport import TransportHead
 from trafficpred.sinkhorn import split_flow
 
 
@@ -32,9 +33,26 @@ class VolumeUNet(nn.Module):
         return self.proj(pooled)
 
 
+def sinkhorn_attention(attn, x, iters):
+    """Self-attention with nn.MultiheadAttention `attn`'s weights, the softmax replaced by `iters`
+    Sinkhorn normalisations in log space (rows, columns, rows, ...; 1 = the usual softmax), so the
+    attention matrix is close to doubly stochastic (Sinkformers, Sander et al., AISTATS 2022)."""
+    B, N, D = x.shape
+    h = attn.num_heads
+    q, k, v = F.linear(x, attn.in_proj_weight, attn.in_proj_bias).chunk(3, dim=-1)
+    q, k, v = (t.reshape(B, N, h, D // h).transpose(1, 2) for t in (q, k, v))
+    logits = q @ k.transpose(-2, -1) / (D // h) ** 0.5
+    for i in range(iters):
+        logits = logits - logits.logsumexp(dim=-1 if i % 2 == 0 else -2, keepdim=True)
+    weights = F.dropout(logits.exp(), attn.dropout, attn.training)
+    out = (weights @ v).transpose(1, 2).reshape(B, N, D)
+    return attn.out_proj(out)
+
+
 class AdaLNBlock(nn.Module):
-    def __init__(self, dim, heads, mlp_dim, cond_dim, drop):
+    def __init__(self, dim, heads, mlp_dim, cond_dim, drop, sinkformer=0):
         super().__init__()
+        self.sinkformer = sinkformer
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
         self.attn = nn.MultiheadAttention(dim, heads, dropout=drop, batch_first=True)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
@@ -47,20 +65,24 @@ class AdaLNBlock(nn.Module):
     def forward(self, x, cond):
         shift1, scale1, gate1, shift2, scale2, gate2 = self.ada(cond)[:, None].chunk(6, dim=-1)
         h = self.norm1(x) * (1 + scale1) + shift1
-        x = x + (1 + gate1) * self.attn(h, h, h, need_weights=False)[0]
+        if self.sinkformer:
+            a = sinkhorn_attention(self.attn, h, self.sinkformer)
+        else:
+            a = self.attn(h, h, h, need_weights=False)[0]
+        x = x + (1 + gate1) * a
         h = self.norm2(x) * (1 + scale2) + shift2
         return x + (1 + gate2) * self.mlp(h)
 
 
 class DistTransformer(nn.Module):
-    def __init__(self, cin, cout, grid, patch, dim, depth, heads, mlp_dim, cond_dim, drop):
+    def __init__(self, cin, cout, grid, patch, dim, depth, heads, mlp_dim, cond_dim, drop, sinkformer=0):
         super().__init__()
         self.patch, self.cout = patch, cout
         self.embed = nn.Conv2d(cin, dim, patch, stride=patch)
         tokens = (grid[0] // patch) * (grid[1] // patch)
         self.pos = nn.Parameter(torch.zeros(1, tokens, dim))
         nn.init.trunc_normal_(self.pos, std=0.02)
-        self.blocks = nn.ModuleList(AdaLNBlock(dim, heads, mlp_dim, cond_dim, drop) for _ in range(depth))
+        self.blocks = nn.ModuleList(AdaLNBlock(dim, heads, mlp_dim, cond_dim, drop, sinkformer) for _ in range(depth))
         self.norm = nn.LayerNorm(dim, elementwise_affine=False)
         self.final_ada = nn.Linear(cond_dim, 2 * dim)
         nn.init.zeros_(self.final_ada.weight)
@@ -81,7 +103,8 @@ class DistTransformer(nn.Module):
 
 class DistVolFormer(nn.Module):
     def __init__(self, T_in=4, T_out=4, C=2, H=32, W=32, width=64, patch=2, dim=192, depth=6,
-                 heads=6, mlp_dim=768, drop=0.1, code_dim=128):
+                 heads=6, mlp_dim=768, drop=0.1, code_dim=128, dist_residual=False,
+                 transport=0, n_periodic=0, sinkformer=0):
         super().__init__()
         self.T_in, self.T_out, self.C, self.H, self.W = T_in, T_out, C, H, W
         k_in, k_out = T_in * C, T_out * C
@@ -90,8 +113,18 @@ class DistVolFormer(nn.Module):
         self.pad_w += -(W + self.pad_w) % patch
         grid = (H + self.pad_h, W + self.pad_w)
         self.vol_enc = VolumeUNet(3 * k_in, width, code_dim)
-        self.dist_enc = DistTransformer(2 * k_in, k_out, grid, patch, dim, depth, heads, mlp_dim,
-                                        code_dim, drop)
+        self.transport = TransportHead(T_out, C, transport, n_periodic) if transport else None
+        self.dist_enc = DistTransformer(2 * k_in, self.transport.channels if transport else k_out, grid, patch, dim, depth, heads, mlp_dim,
+                                        code_dim, drop, sinkformer)
+        self.dist_residual = dist_residual
+        if transport:
+            p2 = patch * patch   # head outputs (patch*patch*cout) are pixel-shuffled: channel-major
+            self.transport.init_head(self.dist_enc.head.weight, self.dist_enc.head.bias.view(-1, p2)[:, 0])
+            with torch.no_grad():
+                self.dist_enc.head.bias.view(-1, p2)[:] = self.dist_enc.head.bias.view(-1, p2)[:, :1]
+        elif dist_residual:   # starts as "the last frame's distribution", learns the change
+            nn.init.zeros_(self.dist_enc.head.weight)
+            nn.init.zeros_(self.dist_enc.head.bias)
         self.vol_head = nn.Sequential(nn.Linear(code_dim + k_in, 256), nn.GELU(), nn.Linear(256, k_out))
         nn.init.zeros_(self.vol_head[-1].weight)
         nn.init.zeros_(self.vol_head[-1].bias)
@@ -108,8 +141,13 @@ class DistVolFormer(nn.Module):
         volume_maps = log_n[..., None, None].expand(-1, -1, *features.shape[-2:])
         code = self.vol_enc(torch.cat([features, volume_maps], dim=1))
 
-        logits = self.dist_enc(features, code)[..., :H, :W].reshape(B, self.T_out, C, H * W)
-        p_hat = logits.softmax(dim=-1).reshape(B, self.T_out, C, H, W)
+        if self.transport is not None:
+            p_hat = self.transport(self.dist_enc(features, code)[..., :H, :W], p_in, H, W)
+        else:
+            logits = self.dist_enc(features, code)[..., :H, :W].reshape(B, self.T_out, C, H * W)
+            if self.dist_residual:
+                logits = logits + log_last_distribution(p_in)
+            p_hat = logits.softmax(dim=-1).reshape(B, self.T_out, C, H, W)
 
         delta = self.vol_head(torch.cat([code, log_n], dim=-1)).reshape(B, self.T_out, C)
         n_hat = n_in[:, -1:, :] * torch.exp(delta.clamp(-5, 5))

@@ -1,16 +1,23 @@
 """Search the DistVol loss weights with Optuna, then confirm the best ones over seeds.
 
-Every trial trains with the sinkhorn_kl loss,
+--space picks the loss whose weights are searched:
 
-    1 * L1  +  l2 * Sinkhorn  +  l3 * volume  +  l4 * KL(p || p_hat),
+  kl (default)  sinkhorn_kl:      1 L1 + l2 Sinkhorn + l3 volume + l4 KL(p || p_hat); l2, l3, l4, eps
+  change        sinkhorn_change:  1 L1 + l2 Sinkhorn + l3 volume + l5 change, with sharp, converged
+                Sinkhorn (eps-scaled, 60 iterations); l2, l3, l5, eps. "change" is transport between
+                where the flow grows / shrinks relative to the last input frame (see losses.py)
 
-and the sampler picks l2 / l3 / l4 / eps (Sinkhorn's blur). Sinkhorn and KL can each be switched
-off (weight 0), so the search also covers the sinkhorn, kl and plain L1 + volume losses. l1 stays
-at 1: with Adam only the ratios between the weights matter, apart from gradient clipping.
+Sinkhorn, KL and change can each be switched off (weight 0), so a space also covers its simpler
+losses (e.g. plain L1 + volume). l1 stays at 1: with Adam only the ratios between the weights
+matter, apart from gradient clipping. Trial 0 is the space's default weighting; the change space
+also queues the best plain weighting of the kl study (1 L1 + 0.034 volume) as a control.
 
 A trial is a shortened train.py run (--epochs, default 20, with the one-cycle schedule squeezed to
 fit) on one seed, scored by its best val RMSE; test is never looked at. Trials that are behind the
-median of the earlier ones at the same epoch are stopped early (pruned). The study lives in one
+median of the earlier ones at the same epoch are stopped early (pruned). Trials log to their own
+W&B project, traffic-pred-hyperparameter-tuning (--wandb-project), as run
+hyperparameter_tuning_<study>_tN in group hyperparameter_tuning_<study>, tagged hyperparameter_tuning.
+The study lives in one
 journal file, so several workers (e.g. a Slurm array) can share it, and rerunning the same command
 continues it: trials a killed worker left behind are failed and run again.
 
@@ -20,6 +27,7 @@ sinkhorn loss at full length on seeds 42 / 7 / 123 / 2025.
 
 examples:
   python tune_loss.py --trials 40                                  # distvolformer on TaxiBJ
+  python tune_loss.py --space change --until 40                    # study distvolformer_taxibj_change
   python tune_loss.py --study dvf_l --trials 40 -- --model distvolformer --dim 256 --heads 8
   python tune_loss.py --fix l4=0 --study no_kl --trials 30         # Sinkhorn family only
   python tune_loss.py --report                                     # best trials, importances
@@ -31,6 +39,7 @@ import argparse
 import gc
 import math
 import os
+import signal
 import socket
 import stat
 import time
@@ -43,39 +52,72 @@ from optuna.trial import TrialState
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TUNING_DIR = os.path.join(ROOT, "checkpoints", "tuning")
-LOSS = "sinkhorn_kl"
 OBJECTIVE = "rmse_flow"
-DEFAULTS = dict(l1=1.0, l2=10.0, l3=1.0, l4=0.1, eps=0.01)   # the sinkhorn_kl defaults, trial 0
-RANGES = dict(l2=(0.3, 1000.0), l3=(0.03, 30.0), l4=(0.003, 3.0), eps=(0.003, 0.1))
-SWITCHABLE = dict(l2="use_sinkhorn", l4="use_kl")
+SPACES = {
+    "kl": dict(loss="sinkhorn_kl",
+               defaults=dict(l1=1.0, l2=10.0, l3=1.0, l4=0.1, eps=0.01),
+               ranges=dict(l2=(0.3, 1000.0), l3=(0.03, 30.0), l4=(0.003, 3.0), eps=(0.003, 0.1)),
+               switchable=dict(l2="use_sinkhorn", l4="use_kl"),
+               controls=[]),
+    "change": dict(loss="sinkhorn_change",
+                   defaults=dict(l1=1.0, l2=0.0, l3=1.0, l5=0.3, eps=0.002),
+                   ranges=dict(l2=(0.3, 100.0), l3=(0.01, 10.0), l5=(0.01, 10.0), eps=(0.0005, 0.01)),
+                   switchable=dict(l2="use_sinkhorn", l5="use_change"),
+                   controls=[dict(l1=1.0, l2=0.0, l3=0.034, l5=0.0, eps=0.002),    # best plain kl trial
+                             dict(l1=1.0, l2=0.0, l3=0.034, l5=0.3, eps=0.002)]),  # ... + change
+}
+TRANSPORT = ("l2", "l5")   # weights whose terms use eps
+NAMES = dict(l2="Sinkhorn", l3="volume", l4="KL", l5="change")
+LOSS = DEFAULTS = RANGES = SWITCHABLE = KEYS = None   # set by use_space()
+
+
+def use_space(name):
+    global LOSS, DEFAULTS, RANGES, SWITCHABLE, KEYS
+    sp = SPACES[name]
+    LOSS, DEFAULTS, RANGES, SWITCHABLE = sp["loss"], sp["defaults"], sp["ranges"], sp["switchable"]
+    KEYS = tuple(k for k in DEFAULTS if k != "l1")   # e.g. l2, l3, l4, eps
+
+
+def uses_eps(w):
+    return any(w.get(k, 0) > 0 for k in TRANSPORT)
 SEEDS = (42, 7, 123, 2025)
+WANDB_PREFIX = "hyperparameter_tuning"   # W&B group / run names / tag, apart from the training runs
+WANDB_PROJECT = "traffic-pred-hyperparameter-tuning"   # its own W&B project, not traffic-pred
 
 
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], epilog=__doc__.split("\n\n", 1)[1],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--study", help="default: <model>_<dataset>, e.g. distvolformer_taxibj")
-    ap.add_argument("--trials", type=int, default=20, help="trials this worker runs (default 20)")
+    ap.add_argument("--study", help="default: <model>_<dataset>[_<space>], e.g. distvolformer_taxibj")
+    ap.add_argument("--space", choices=list(SPACES), default="kl", help="the loss whose weights are searched (default kl)")
+    ap.add_argument("--trials", type=int, help="trials this worker runs (default 20, or no cap with --until)")
+    ap.add_argument("--until", type=int, metavar="N",
+                    help="stop once the study has N finished (complete or pruned) trials, counting every "
+                         "worker's; with it, --trials only caps this worker")
     ap.add_argument("--epochs", type=int, default=20, help="epochs per trial (default 20)")
     ap.add_argument("--seed", type=int, default=42, help="training seed of every trial (default 42)")
     ap.add_argument("--fix", action="append", default=[], metavar="KEY=VALUE",
-                    help="hold a weight fixed instead of searching it (l1, l2, l3, l4, eps; repeatable)")
+                    help="hold a weight fixed instead of searching it (e.g. l3=0.1; the space's weights or eps; repeatable)")
     ap.add_argument("--no-prune", action="store_true", help="run every trial to the end")
+    ap.add_argument("--wandb-project", default=WANDB_PROJECT,
+                    help=f"W&B project of the trials (default {WANDB_PROJECT}; the training runs use traffic-pred)")
     ap.add_argument("--stale-minutes", type=float, default=30.0,
                     help="a running trial with no progress for this long is from a killed worker (default 30)")
     ap.add_argument("--report", action="store_true", help="print the study's best trials and exit")
+    ap.add_argument("--print-study", action="store_true", help="print the study name these options give and exit")
     ap.add_argument("--confirm", type=int, metavar="K",
                     help="write train_tuned_<study>.sh with the K best trials and exit")
     ap.add_argument("train_args", nargs="*",
                     help="after --: train.py arguments for every trial (default --model distvolformer)")
     args = ap.parse_args()
+    use_space(args.space)
     args.fixed = {}
     for item in args.fix:
         key, _, value = item.partition("=")
         if key not in DEFAULTS or not value:
             raise SystemExit(f"--fix {item}: expected KEY=VALUE with KEY one of {', '.join(DEFAULTS)}")
         args.fixed[key] = float(value)
-    for flag in ("--loss", "--l1", "--l2", "--l3", "--l4", "--eps", "--epochs", "--seed", "--save", "--resume"):
+    for flag in ("--loss", "--l1", "--l2", "--l3", "--l4", "--l5", "--eps", "--epochs", "--seed", "--save", "--resume"):
         if flag in args.train_args:
             raise SystemExit(f"{flag} is set by tune_loss.py; use its own options instead")
     if "--model" not in args.train_args:
@@ -83,7 +125,7 @@ def parse_args():
     if args.study is None:
         model = args.train_args[args.train_args.index("--model") + 1]
         dataset = args.train_args[args.train_args.index("--dataset") + 1] if "--dataset" in args.train_args else "taxibj"
-        args.study = f"{model}_{dataset}"
+        args.study = f"{model}_{dataset}" + ("" if args.space == "kl" else f"_{args.space}")
     return args
 
 
@@ -97,11 +139,16 @@ def open_study(args):
               optuna.pruners.MedianPruner(n_startup_trials=8, n_warmup_steps=max(1, args.epochs // 3)))
     study = optuna.create_study(study_name=args.study, storage=storage, direction="minimize",
                                 sampler=sampler, pruner=pruner, load_if_exists=True)
-    setup = dict(train_args=args.train_args, epochs=args.epochs, seed=args.seed, fixed=args.fixed)
+    setup = dict(train_args=args.train_args, epochs=args.epochs, seed=args.seed, fixed=args.fixed, space=args.space)
     known = study.user_attrs.get("setup")
+    if known is not None:
+        known = {"space": "kl", **known}   # studies from before --space searched kl
+        use_space(known["space"])          # --report / --confirm follow the study, whatever --space says
     if known is None:
         study.set_user_attr("setup", setup)
         study.enqueue_trial(sample_params(DEFAULTS, args.fixed), user_attrs={"note": "default weights"})
+        for control in SPACES[args.space]["controls"]:
+            study.enqueue_trial(sample_params(control, args.fixed), user_attrs={"note": "control"})
     elif known != setup and not (args.report or args.confirm):
         raise SystemExit(f"study {args.study} was started with {known}; this run asks for {setup}. "
                          f"Use the same options, or a new --study name")
@@ -111,28 +158,28 @@ def open_study(args):
 def sample_params(values, fixed):
     """Values as Optuna params (the inverse of weights_from)."""
     params = {}
-    for key in ("l2", "l3", "l4", "eps"):
+    for key in KEYS:
         if key in fixed:
             continue
         if key in SWITCHABLE:
             params[SWITCHABLE[key]] = values[key] > 0
             if values[key] > 0:
                 params[key] = values[key]
-        elif key != "eps" or values["l2"] > 0:
+        elif key != "eps" or uses_eps({**values, **fixed}):
             params[key] = values[key]
     return params
 
 
 def suggest(trial, fixed):
     w = {"l1": 1.0, **DEFAULTS, **fixed}
-    for key in ("l2", "l3", "l4"):
-        if key in fixed:
+    for key in KEYS:
+        if key in fixed or key == "eps":
             continue
         if key in SWITCHABLE and not trial.suggest_categorical(SWITCHABLE[key], [True, False]):
             w[key] = 0.0
         else:
             w[key] = trial.suggest_float(key, *RANGES[key], log=True)
-    if "eps" not in fixed and w["l2"] > 0:
+    if "eps" not in fixed and uses_eps(w):
         w["eps"] = trial.suggest_float("eps", *RANGES["eps"], log=True)
     return w
 
@@ -140,7 +187,7 @@ def suggest(trial, fixed):
 def weights_from(trial, fixed):
     w = {**DEFAULTS, **fixed}
     p = trial.params
-    for key in ("l2", "l3", "l4", "eps"):
+    for key in KEYS:
         if key in fixed:
             continue
         if key in SWITCHABLE and not p.get(SWITCHABLE[key], True):
@@ -152,17 +199,18 @@ def weights_from(trial, fixed):
 
 def weight_args(w):
     out = []
-    for key in ("l1", "l2", "l3", "l4"):
-        out += [f"--{key}", f"{w[key]:.4g}"]
-    if w["l2"] > 0:
+    for key in DEFAULTS:
+        if key != "eps":
+            out += [f"--{key}", f"{w[key]:.4g}"]
+    if uses_eps(w):
         out += ["--eps", f"{w['eps']:.4g}"]
     return out
 
 
 def describe(w):
-    parts = [f"{w['l2']:.3g} Sinkhorn (eps {w['eps']:.3g})" if w["l2"] > 0 else None,
-             f"{w['l3']:.3g} volume", f"{w['l4']:.3g} KL" if w["l4"] > 0 else None]
-    return f"{w['l1']:.3g} L1 + " + " + ".join(p for p in parts if p)
+    parts = [f"{w[k]:.3g} {NAMES[k]}" for k in DEFAULTS if k in NAMES and (w[k] > 0 or k == "l3")]
+    text = f"{w['l1']:.3g} L1 + " + " + ".join(parts)
+    return text + (f" (eps {w['eps']:.3g})" if uses_eps(w) else "")
 
 
 def fail_stale(study, args):
@@ -177,6 +225,35 @@ def fail_stale(study, args):
             study.enqueue_trial(t.params, user_attrs={"note": f"rerun of trial {t.number}"})
 
 
+def finished_count(study):
+    return sum(t.state in (TrialState.COMPLETE, TrialState.PRUNED) for t in study.get_trials(deepcopy=False))
+
+
+def stop_at(n):
+    def callback(study, trial):
+        if finished_count(study) >= n:
+            study.stop()
+    return callback
+
+
+def interrupt(signum, frame):
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
+def requeue_interrupted(study, number):
+    """Queue again the weights of the trial a SIGTERM / Ctrl-C cut short (Optuna failed it)."""
+    if number is None:
+        return
+    t = study.trials[number]
+    study.enqueue_trial(t.params, user_attrs={"note": f"rerun of interrupted trial {number}"})
+    print(f"trial {number} was interrupted; its weights are queued again", flush=True)
+
+
+def worker_name():
+    return f"{socket.gethostname()}:{os.getpid()}" + (f" job {os.environ['SLURM_JOB_ID']}"
+                                                    if "SLURM_JOB_ID" in os.environ else "")
+
+
 def objective(args):
     import torch
     import wandb
@@ -185,12 +262,13 @@ def objective(args):
 
     def run(trial):
         w = suggest(trial, args.fixed)
-        worker = f"{socket.gethostname()}:{os.getpid()}" + (f" job {os.environ['SLURM_JOB_ID']}"
-                                                          if "SLURM_JOB_ID" in os.environ else "")
-        trial.set_user_attr("worker", worker)
+        args.current_trial = trial.number
+        trial.set_user_attr("worker", worker_name())
         trial.set_user_attr("heartbeat", time.time())
-        os.environ["WANDB_RUN_GROUP"] = f"tune_{args.study}"
-        os.environ["WANDB_NAME"] = f"{args.study}_t{trial.number}"
+        os.environ["WANDB_PROJECT"] = args.wandb_project
+        os.environ["WANDB_RUN_GROUP"] = f"{WANDB_PREFIX}_{args.study}"
+        os.environ["WANDB_NAME"] = f"{WANDB_PREFIX}_{args.study}_t{trial.number}"
+        os.environ["WANDB_TAGS"] = WANDB_PREFIX
         print(f"\n=== {args.study} trial {trial.number}: {describe(w)}", flush=True)
         best = [math.inf]
 
@@ -212,6 +290,7 @@ def objective(args):
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+        args.current_trial = None
         if scores is None:
             raise optuna.TrialPruned()
         for key in ("rmse_flow", "mae_flow"):
@@ -241,7 +320,8 @@ def report(study, args, path):
     default = next((t for t in done if t.user_attrs.get("note") == "default weights"), None)
     print(f"\n{'trial':>5}  {'val RMSE':>8}  {'val MAE':>7}  weights")
     for t in done[:15]:
-        mark = "  (default)" if t is default else ""
+        note = t.user_attrs.get("note", "")
+        mark = "  (default)" if t is default else "  (control)" if note == "control" else ""
         print(f"{t.number:5d}  {t.value:8.3f}  {t.user_attrs.get('val_mae_flow', float('nan')):7.3f}  "
               f"{describe(weights_from(t, fixed))}{mark}")
     if default is not None and default not in done[:15]:
@@ -270,7 +350,8 @@ def write_confirm(study, args, k):
     i = train_args.index("--model")
     extra = train_args[:i] + train_args[i + 2:]
     tail = (" " + " ".join(extra)) if extra else ""   # train_all.sh splits RUNS lines on spaces
-    lines = [f'    "{model}_sinkhorn {model} sinkhorn{tail}"']
+    lines = [f'    "{model}_sinkhorn {model} sinkhorn{tail}"',
+             f'    "{model}_sinkhorn_l2-0 {model} sinkhorn --l2 0{tail}"   # the same without Sinkhorn']
     for rank, t in enumerate(done, 1):
         w = weights_from(t, setup.get("fixed", {}))
         lines.append(f'    "{model}_tuned{rank}_t{t.number} {model} {LOSS} {" ".join(weight_args(w))}{tail}"'
@@ -300,6 +381,10 @@ source "$(dirname "${{BASH_SOURCE[0]}}")/train_all.sh" "$@"
 
 def main():
     args = parse_args()
+    if args.trials is None and not args.until:
+        args.trials = 20
+    if args.print_study:
+        return print(args.study)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
     study, path = open_study(args)
@@ -309,7 +394,17 @@ def main():
         return write_confirm(study, args, args.confirm)
     os.chdir(ROOT)
     fail_stale(study, args)
-    study.optimize(objective(args), n_trials=args.trials, catch=(FloatingPointError, RuntimeError))
+    if args.until and finished_count(study) >= args.until:
+        print(f"study {args.study} already has {finished_count(study)} finished trials (--until {args.until})")
+        return report(study, args, path)
+    args.current_trial = None
+    signal.signal(signal.SIGTERM, interrupt)   # e.g. Slurm's time limit: stop like Ctrl-C
+    try:
+        study.optimize(objective(args), n_trials=args.trials, catch=(FloatingPointError, RuntimeError),
+                       callbacks=[stop_at(args.until)] if args.until else None)
+    except KeyboardInterrupt:
+        requeue_interrupted(study, args.current_trial)
+        raise SystemExit(130)
     report(study, args, path)
 
 

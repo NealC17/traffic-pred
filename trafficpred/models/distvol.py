@@ -2,8 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from trafficpred.models.transport import TransportHead
 from trafficpred.sinkhorn import split_flow
 
+RESIDUAL_FLOOR = 1e-6   # keeps log P finite where the last frame had no traffic
 EPS = 1e-6
 
 
@@ -58,14 +60,28 @@ class MultiscaleEncoder(nn.Module):
         return u, bottleneck
 
 
+def log_last_distribution(p_in):
+    """log P of the last input frame, (B, 1, C, H*W): the persistence prior for residual logits."""
+    B, _, C, H, W = p_in.shape
+    return torch.log(p_in[:, -1:].reshape(B, 1, C, H * W) + RESIDUAL_FLOOR)
+
+
 class DistVolNet(nn.Module):
-    def __init__(self, T_in=4, T_out=4, C=2, H=32, W=32, width=64):
+    def __init__(self, T_in=4, T_out=4, C=2, H=32, W=32, width=64, dist_residual=False,
+                 transport=0, n_periodic=0):
         super().__init__()
         self.T_in, self.T_out, self.C, self.H, self.W = T_in, T_out, C, H, W
+        self.dist_residual = dist_residual
         k_in, k_out = T_in * C, T_out * C
         self.vol_enc = nn.Sequential(nn.Linear(k_in, 128), nn.GELU(), nn.Linear(128, 128))
         self.encoder = MultiscaleEncoder(2 * k_in, width, cond_dim=128)
-        self.dist_head = nn.Conv2d(width, k_out, 1)
+        self.transport = TransportHead(T_out, C, transport, n_periodic) if transport else None
+        self.dist_head = nn.Conv2d(width, self.transport.channels if transport else k_out, 1)
+        if transport:
+            self.transport.init_head(self.dist_head.weight, self.dist_head.bias)
+        elif dist_residual:   # starts as "the last frame's distribution", learns the change
+            nn.init.zeros_(self.dist_head.weight)
+            nn.init.zeros_(self.dist_head.bias)
         self.vol_head = nn.Sequential(
             nn.Linear(self.encoder.mid_ch + 128, 256), nn.GELU(), nn.Linear(256, k_out)
         )
@@ -83,8 +99,13 @@ class DistVolNet(nn.Module):
         features = F.pad(features, (0, -W % 4, 0, -H % 4))
         u, bottleneck = self.encoder(features, cond)
 
-        logits = self.dist_head(u)[..., :H, :W].reshape(B, self.T_out, C, H * W)
-        p_hat = logits.softmax(dim=-1).reshape(B, self.T_out, C, H, W)
+        if self.transport is not None:
+            p_hat = self.transport(self.dist_head(u)[..., :H, :W], p_in, H, W)
+        else:
+            logits = self.dist_head(u)[..., :H, :W].reshape(B, self.T_out, C, H * W)
+            if self.dist_residual:
+                logits = logits + log_last_distribution(p_in)
+            p_hat = logits.softmax(dim=-1).reshape(B, self.T_out, C, H, W)
 
         pooled = bottleneck.mean(dim=(-2, -1))
         delta = self.vol_head(torch.cat([pooled, cond], dim=-1)).reshape(B, self.T_out, C)
