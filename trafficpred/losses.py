@@ -6,6 +6,7 @@ p_hat is where the flow goes (each map sums to 1), n_hat how much of it there is
 Their terms are
 
     reconstruction  ||x_hat - x||_1
+    squared         ||x_hat - x||_2^2      (mean; off by default, --l6: an MSE term next to L1)
     transport       S_eps(p_hat, p)        debiased Sinkhorn divergence between the shapes
     volume          |n_hat - n| / (H W)
     kl              KL(p || p_hat)         sum_cells p log(p / p_hat): the shapes compared cell by
@@ -32,7 +33,8 @@ and they differ only in which terms are trained and how the terms are combined:
                      is as large as the reconstruction term's (times l1 / l2 / l3, default 1 each),
                      from Adam-style running averages of the squared gradient norms
 
---l1 / --l2 / --l3 / --l4 / --l5 weigh reconstruction / transport / volume / kl / change. Every
+--l1 / --l2 / --l3 / --l4 / --l5 / --l6 weigh reconstruction / transport / volume / kl / change /
+squared (the fixed-weight losses; --l6 defaults to 0). Every
 term is logged whether or not it is trained, except that the Sinkhorn terms (transport, change)
 are only computed when their weight is above 0. --sinkhorn-anneal turns on epsilon scaling.
 """
@@ -118,6 +120,7 @@ class DistVolTerms(nn.Module):
         H, W = y.shape[-2:]
         p, n = split_flow(y.clamp_min(0))
         out = {"l1": (x_hat - y).abs().mean(),
+               "mse": (x_hat - y).pow(2).mean(),
                "volume": (n_hat - n).abs().mean() / (H * W),
                "kl": kl_divergence(p, p_hat)}
         if transport:
@@ -132,11 +135,12 @@ class DistVolTerms(nn.Module):
 
 
 class DistVolLoss(DistVolTerms):
-    """Fixed-weight sum l1 * reconstruction + l2 * transport + l3 * volume + l4 * kl + l5 * change."""
+    """Fixed-weight sum l1 * reconstruction + l2 * transport + l3 * volume + l4 * kl + l5 * change
+    + l6 * squared error."""
 
-    def __init__(self, l1=1.0, l2=10.0, l3=1.0, l4=0.0, l5=0.0, eps=0.01, iters=30):
+    def __init__(self, l1=1.0, l2=10.0, l3=1.0, l4=0.0, l5=0.0, l6=0.0, eps=0.01, iters=30):
         super().__init__(eps, iters)
-        self.weights = {"l1": l1, "sinkhorn": l2, "volume": l3, "kl": l4, "change": l5}
+        self.weights = {"l1": l1, "sinkhorn": l2, "volume": l3, "kl": l4, "change": l5, "mse": l6}
         self.needs_input = l5 > 0
 
     def forward(self, parts, y, x=None):
@@ -243,7 +247,8 @@ def needs_parts(name):
 def default_options(name):
     """The options a loss is built with when nothing is overridden (stored with each run)."""
     if name in WEIGHTED:
-        return dict(WEIGHTED[name], **(SHARP_SINKHORN if "l5" in WEIGHTED[name] else SINKHORN_DEFAULTS))
+        return dict(WEIGHTED[name], l6=0.0,
+                    **(SHARP_SINKHORN if "l5" in WEIGHTED[name] else SINKHORN_DEFAULTS))
     if name in UNCERTAINTY:
         return dict(SINKHORN_DEFAULTS)
     if name in ADAPTIVE:

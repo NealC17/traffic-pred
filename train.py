@@ -76,6 +76,8 @@ def parse_args(argv=None):
     g.add_argument("--l4", type=float, help="weight on KL(p || p_hat) (kl, sinkhorn_kl)")
     g.add_argument("--l5", type=float, help="weight on the change transport, Sinkhorn between where the flow "
                                             "grows / shrinks vs the last input frame (sinkhorn_change, default 0.3)")
+    g.add_argument("--l6", type=float, help="weight on the squared error mean (X_hat - X)^2 on the scaled data, "
+                                            "next to the L1 term (fixed-weight losses, default 0)")
     g.add_argument("--adapt-beta", type=float, help="sinkhorn_adaptive: running-average decay (default 0.95)")
     g.add_argument("--adapt-every", type=int,
                    help="sinkhorn_adaptive: measure the gradients every N steps (default 10)")
@@ -102,7 +104,7 @@ def choose_loss(args, spec):
 
 def choose_loss_options(args, loss):
     options = default_options(loss)
-    given = {k: getattr(args, k) for k in ("l1", "l2", "l3", "l4", "l5", "eps", "sinkhorn_iters", "sinkhorn_anneal",
+    given = {k: getattr(args, k) for k in ("l1", "l2", "l3", "l4", "l5", "l6", "eps", "sinkhorn_iters", "sinkhorn_anneal",
                                            "adapt_beta", "adapt_every")
              if getattr(args, k) is not None}
     if "sinkhorn_anneal" in given and "eps" in options:   # every Sinkhorn loss takes it; only

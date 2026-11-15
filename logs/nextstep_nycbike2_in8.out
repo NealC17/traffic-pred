@@ -1,0 +1,585 @@
+=== new workspace "nextstep_nycbike2_in8"  [checkpoints/workspaces/nextstep_nycbike2_in8]
+    W&B: project traffic-pred-nycbike2, group nextstep_nycbike2_in8
+=== stresnet_periodic_mse_nycbike2_in8_out1: python train.py --model stresnet --loss mse --periods day week --dataset nycbike2 --t-in 8 --t-out 1 --seed 42 --workers 2 --save checkpoints/workspaces/nextstep_nycbike2_in8/stresnet_periodic_mse_nycbike2_in8_out1.pt --resume
+    log: checkpoints/workspaces/nextstep_nycbike2_in8/logs/stresnet_periodic_mse_nycbike2_in8_out1.log
+stresnet (mse loss): 0.90M params | nycbike2 2x10x20, 8 in -> 1 out | 1104 train / 472 val / 952 test windows | cuda
+  copying data to the GPU:   0%|          | 0/3 [00:00<?, ?it/s]                                                                  copying data to the GPU:   0%|          | 0/1 [00:00<?, ?it/s]                                                                  copying data to the GPU:   0%|          | 0/2 [00:00<?, ?it/s]                                                                no checkpoints/workspaces/nextstep_nycbike2_in8/stresnet_periodic_mse_nycbike2_in8_out1.last.pt; starting from scratch
+wandb: [wandb.login()] Loaded credentials for https://api.forge.coreweave.com from /home/nealc/.netrc.
+wandb: Currently logged in as: nealxchandra (nec17) to https://api.forge.coreweave.com. Use `wandb login --relogin` to force relogin
+wandb: Tracking run with wandb version 0.31.0
+wandb: Run data is saved locally in /home/nealc/Documents/proj/traffic_pred/wandb/run-20261114_212402-5j43b4e0
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run stresnet_periodic_mse_nycbike2_in8_out1
+wandb: ⭐️ View project at https://forge.coreweave.com/wandb/nec17/traffic-pred-nycbike2
+wandb: 🚀 View run at https://forge.coreweave.com/wandb/nec17/traffic-pred-nycbike2/runs/5j43b4e0
+  copy-last (val):   0%|          | 0/4 [00:00<?, ?it/s]                                                          copy-last (test):   0%|          | 0/8 [00:00<?, ?it/s]                                                         copy-last-frame reference: val MSE 0.00030  Sinkhorn 0.00071  TV 0.2268  volume err 17.35%  | MAE 1.590 RMSE 5.138 (raw units)  frame MSE 0.118
+copy-last-frame reference: test MSE 0.00027  Sinkhorn 0.00071  TV 0.2288  volume err 16.72%  | MAE 1.569 RMSE 4.900 (raw units)  frame MSE 0.107
+stresnet_periodic_mse_nycbike2_in8_out1:   0%|          | 0/50 [00:00<?, ?ep/s]
+  epoch 1:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 1:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00104][A
+                                                               [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:   0%|          | 0/50 [00:02<?, ?ep/s, best_val=0.00124]                                                                                                 ep   1 | mse 0.00184 | val MSE 0.00124  Sinkhorn 0.03130  TV 0.5125  volume err 46.20%  | MAE 4.734 RMSE 10.550 (raw units)  frame MSE 0.498 | 2s *
+stresnet_periodic_mse_nycbike2_in8_out1:   0%|          | 0/50 [00:02<?, ?ep/s, best_val=0.00124]stresnet_periodic_mse_nycbike2_in8_out1:   2%|▏         | 1/50 [00:02<02:01,  2.47s/ep, best_val=0.00124]
+  epoch 2:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 2:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00043][A
+                                                               [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:   2%|▏         | 1/50 [00:03<02:01,  2.47s/ep, best_val=0.00053]                                                                                                         ep   2 | mse 0.00059 | val MSE 0.00053  Sinkhorn 0.01338  TV 0.3647  volume err 16.43%  | MAE 2.524 RMSE 6.879 (raw units)  frame MSE 0.212 | 1s *
+stresnet_periodic_mse_nycbike2_in8_out1:   2%|▏         | 1/50 [00:03<02:01,  2.47s/ep, best_val=0.00053]
+  epoch 3:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 3:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00034][A
+                                                               [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:   2%|▏         | 1/50 [00:04<02:01,  2.47s/ep, best_val=0.00041]                                                                                                         ep   3 | mse 0.00044 | val MSE 0.00041  Sinkhorn 0.01063  TV 0.3360  volume err 14.16%  | MAE 2.263 RMSE 6.051 (raw units)  frame MSE 0.164 | 1s *
+stresnet_periodic_mse_nycbike2_in8_out1:   2%|▏         | 1/50 [00:04<02:01,  2.47s/ep, best_val=0.00041]stresnet_periodic_mse_nycbike2_in8_out1:   6%|▌         | 3/50 [00:04<00:57,  1.23s/ep, best_val=0.00041]
+  epoch 4:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 4:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00044][A
+                                                               [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:   6%|▌         | 3/50 [00:04<00:57,  1.23s/ep, best_val=0.00027]                                                                                                         ep   4 | mse 0.00031 | val MSE 0.00027  Sinkhorn 0.00807  TV 0.2940  volume err 11.95%  | MAE 1.693 RMSE 4.911 (raw units)  frame MSE 0.108 | 1s *
+stresnet_periodic_mse_nycbike2_in8_out1:   6%|▌         | 3/50 [00:04<00:57,  1.23s/ep, best_val=0.00027]
+  epoch 5:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 5:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00022][A
+                                                               [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:   6%|▌         | 3/50 [00:05<00:57,  1.23s/ep, best_val=0.00027]                                                                                                         ep   5 | mse 0.00025 | val MSE 0.00038  Sinkhorn 0.00907  TV 0.2872  volume err 20.80%  | MAE 1.911 RMSE 5.808 (raw units)  frame MSE 0.151 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:   6%|▌         | 3/50 [00:05<00:57,  1.23s/ep, best_val=0.00027]stresnet_periodic_mse_nycbike2_in8_out1:  10%|█         | 5/50 [00:05<00:44,  1.01ep/s, best_val=0.00027]
+  epoch 6:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 6:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00018][A
+                                                               [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  10%|█         | 5/50 [00:06<00:44,  1.01ep/s, best_val=0.00025]                                                                                                         ep   6 | mse 0.00024 | val MSE 0.00025  Sinkhorn 0.00812  TV 0.2759  volume err 13.98%  | MAE 1.626 RMSE 4.771 (raw units)  frame MSE 0.102 | 1s *
+stresnet_periodic_mse_nycbike2_in8_out1:  10%|█         | 5/50 [00:06<00:44,  1.01ep/s, best_val=0.00025]
+  epoch 7:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 7:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00026][A
+                                                               [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  10%|█         | 5/50 [00:07<00:44,  1.01ep/s, best_val=0.00025]                                                                                                         ep   7 | mse 0.00020 | val MSE 0.00034  Sinkhorn 0.00696  TV 0.2774  volume err 24.45%  | MAE 1.726 RMSE 5.534 (raw units)  frame MSE 0.137 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  10%|█         | 5/50 [00:07<00:44,  1.01ep/s, best_val=0.00025]stresnet_periodic_mse_nycbike2_in8_out1:  14%|█▍        | 7/50 [00:07<00:38,  1.11ep/s, best_val=0.00025]
+  epoch 8:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 8:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00010][A
+                                                               [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  14%|█▍        | 7/50 [00:07<00:38,  1.11ep/s, best_val=0.00015]                                                                                                         ep   8 | mse 0.00018 | val MSE 0.00015  Sinkhorn 0.00530  TV 0.2380  volume err 9.19%  | MAE 1.375 RMSE 3.671 (raw units)  frame MSE 0.060 | 1s *
+stresnet_periodic_mse_nycbike2_in8_out1:  14%|█▍        | 7/50 [00:07<00:38,  1.11ep/s, best_val=0.00015]
+  epoch 9:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 9:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00036][A
+                                                               [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  14%|█▍        | 7/50 [00:08<00:38,  1.11ep/s, best_val=0.00015]                                                                                                         ep   9 | mse 0.00036 | val MSE 0.00038  Sinkhorn 0.00734  TV 0.2789  volume err 23.85%  | MAE 1.778 RMSE 5.851 (raw units)  frame MSE 0.153 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  14%|█▍        | 7/50 [00:08<00:38,  1.11ep/s, best_val=0.00015]stresnet_periodic_mse_nycbike2_in8_out1:  18%|█▊        | 9/50 [00:08<00:35,  1.15ep/s, best_val=0.00015]
+  epoch 10:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 10:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00010][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  18%|█▊        | 9/50 [00:09<00:35,  1.15ep/s, best_val=0.00015]                                                                                                         ep  10 | mse 0.00020 | val MSE 0.00023  Sinkhorn 0.00462  TV 0.2351  volume err 18.32%  | MAE 1.490 RMSE 4.540 (raw units)  frame MSE 0.092 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  18%|█▊        | 9/50 [00:09<00:35,  1.15ep/s, best_val=0.00015]
+  epoch 11:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 11:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00016][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  18%|█▊        | 9/50 [00:10<00:35,  1.15ep/s, best_val=0.00015]                                                                                                         ep  11 | mse 0.00016 | val MSE 0.00018  Sinkhorn 0.00406  TV 0.2219  volume err 15.41%  | MAE 1.471 RMSE 4.022 (raw units)  frame MSE 0.072 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  18%|█▊        | 9/50 [00:10<00:35,  1.15ep/s, best_val=0.00015]stresnet_periodic_mse_nycbike2_in8_out1:  22%|██▏       | 11/50 [00:10<00:34,  1.12ep/s, best_val=0.00015]
+  epoch 12:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 12:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00012][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  22%|██▏       | 11/50 [00:11<00:34,  1.12ep/s, best_val=0.00015]                                                                                                          ep  12 | mse 0.00018 | val MSE 0.00019  Sinkhorn 0.00332  TV 0.2198  volume err 18.80%  | MAE 1.557 RMSE 4.090 (raw units)  frame MSE 0.075 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  22%|██▏       | 11/50 [00:11<00:34,  1.12ep/s, best_val=0.00015]
+  epoch 13:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 13:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00009][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  22%|██▏       | 11/50 [00:12<00:34,  1.12ep/s, best_val=0.00014]                                                                                                          ep  13 | mse 0.00016 | val MSE 0.00014  Sinkhorn 0.00234  TV 0.2102  volume err 11.34%  | MAE 1.291 RMSE 3.576 (raw units)  frame MSE 0.057 | 1s *
+stresnet_periodic_mse_nycbike2_in8_out1:  22%|██▏       | 11/50 [00:12<00:34,  1.12ep/s, best_val=0.00014]stresnet_periodic_mse_nycbike2_in8_out1:  26%|██▌       | 13/50 [00:12<00:31,  1.18ep/s, best_val=0.00014]
+  epoch 14:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 14:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00008][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  26%|██▌       | 13/50 [00:12<00:31,  1.18ep/s, best_val=0.00014]                                                                                                          ep  14 | mse 0.00013 | val MSE 0.00015  Sinkhorn 0.00250  TV 0.2087  volume err 12.06%  | MAE 1.226 RMSE 3.687 (raw units)  frame MSE 0.061 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  26%|██▌       | 13/50 [00:12<00:31,  1.18ep/s, best_val=0.00014]
+  epoch 15:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 15:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00011][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  26%|██▌       | 13/50 [00:13<00:31,  1.18ep/s, best_val=0.00014]                                                                                                          ep  15 | mse 0.00014 | val MSE 0.00014  Sinkhorn 0.00162  TV 0.1984  volume err 9.93%  | MAE 1.250 RMSE 3.567 (raw units)  frame MSE 0.057 | 1s *
+stresnet_periodic_mse_nycbike2_in8_out1:  26%|██▌       | 13/50 [00:13<00:31,  1.18ep/s, best_val=0.00014]stresnet_periodic_mse_nycbike2_in8_out1:  30%|███       | 15/50 [00:13<00:28,  1.21ep/s, best_val=0.00014]
+  epoch 16:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 16:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00022][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  30%|███       | 15/50 [00:14<00:28,  1.21ep/s, best_val=0.00014]                                                                                                          ep  16 | mse 0.00014 | val MSE 0.00014  Sinkhorn 0.00250  TV 0.2100  volume err 10.67%  | MAE 1.233 RMSE 3.512 (raw units)  frame MSE 0.055 | 1s *
+stresnet_periodic_mse_nycbike2_in8_out1:  30%|███       | 15/50 [00:14<00:28,  1.21ep/s, best_val=0.00014]
+  epoch 17:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 17:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00013][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  30%|███       | 15/50 [00:15<00:28,  1.21ep/s, best_val=0.00014]                                                                                                          ep  17 | mse 0.00012 | val MSE 0.00017  Sinkhorn 0.00248  TV 0.2106  volume err 15.94%  | MAE 1.335 RMSE 3.850 (raw units)  frame MSE 0.066 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  30%|███       | 15/50 [00:15<00:28,  1.21ep/s, best_val=0.00014]stresnet_periodic_mse_nycbike2_in8_out1:  34%|███▍      | 17/50 [00:15<00:26,  1.22ep/s, best_val=0.00014]
+  epoch 18:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 18:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00007][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  34%|███▍      | 17/50 [00:16<00:26,  1.22ep/s, best_val=0.00012]                                                                                                          ep  18 | mse 0.00012 | val MSE 0.00012  Sinkhorn 0.00180  TV 0.1986  volume err 8.11%  | MAE 1.160 RMSE 3.271 (raw units)  frame MSE 0.048 | 1s *
+stresnet_periodic_mse_nycbike2_in8_out1:  34%|███▍      | 17/50 [00:16<00:26,  1.22ep/s, best_val=0.00012]
+  epoch 19:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 19:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00009][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  34%|███▍      | 17/50 [00:16<00:26,  1.22ep/s, best_val=0.00012]                                                                                                          ep  19 | mse 0.00011 | val MSE 0.00016  Sinkhorn 0.00155  TV 0.1980  volume err 11.92%  | MAE 1.298 RMSE 3.749 (raw units)  frame MSE 0.063 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  34%|███▍      | 17/50 [00:16<00:26,  1.22ep/s, best_val=0.00012]stresnet_periodic_mse_nycbike2_in8_out1:  38%|███▊      | 19/50 [00:16<00:25,  1.24ep/s, best_val=0.00012]
+  epoch 20:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 20:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00012][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  38%|███▊      | 19/50 [00:17<00:25,  1.24ep/s, best_val=0.00012]                                                                                                          ep  20 | mse 0.00013 | val MSE 0.00012  Sinkhorn 0.00148  TV 0.1956  volume err 8.18%  | MAE 1.139 RMSE 3.299 (raw units)  frame MSE 0.049 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  38%|███▊      | 19/50 [00:17<00:25,  1.24ep/s, best_val=0.00012]
+  epoch 21:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 21:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00015][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  38%|███▊      | 19/50 [00:19<00:25,  1.24ep/s, best_val=0.00012]                                                                                                          ep  21 | mse 0.00014 | val MSE 0.00020  Sinkhorn 0.00635  TV 0.2536  volume err 13.24%  | MAE 1.624 RMSE 4.208 (raw units)  frame MSE 0.079 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  38%|███▊      | 19/50 [00:19<00:25,  1.24ep/s, best_val=0.00012]stresnet_periodic_mse_nycbike2_in8_out1:  42%|████▏     | 21/50 [00:19<00:25,  1.13ep/s, best_val=0.00012]
+  epoch 22:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 22:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00011][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  42%|████▏     | 21/50 [00:19<00:25,  1.13ep/s, best_val=0.00012]                                                                                                          ep  22 | mse 0.00011 | val MSE 0.00013  Sinkhorn 0.00169  TV 0.2026  volume err 9.43%  | MAE 1.244 RMSE 3.442 (raw units)  frame MSE 0.053 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  42%|████▏     | 21/50 [00:19<00:25,  1.13ep/s, best_val=0.00012]
+  epoch 23:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 23:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00011][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  42%|████▏     | 21/50 [00:20<00:25,  1.13ep/s, best_val=0.00012]                                                                                                          ep  23 | mse 0.00011 | val MSE 0.00012  Sinkhorn 0.00107  TV 0.1891  volume err 7.76%  | MAE 1.122 RMSE 3.294 (raw units)  frame MSE 0.049 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  42%|████▏     | 21/50 [00:20<00:25,  1.13ep/s, best_val=0.00012]stresnet_periodic_mse_nycbike2_in8_out1:  46%|████▌     | 23/50 [00:20<00:23,  1.16ep/s, best_val=0.00012]
+  epoch 24:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 24:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00006][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  46%|████▌     | 23/50 [00:21<00:23,  1.16ep/s, best_val=0.00012]                                                                                                          ep  24 | mse 0.00010 | val MSE 0.00012  Sinkhorn 0.00105  TV 0.1875  volume err 6.94%  | MAE 1.128 RMSE 3.230 (raw units)  frame MSE 0.047 | 1s *
+stresnet_periodic_mse_nycbike2_in8_out1:  46%|████▌     | 23/50 [00:21<00:23,  1.16ep/s, best_val=0.00012]
+  epoch 25:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 25:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00005][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  46%|████▌     | 23/50 [00:22<00:23,  1.16ep/s, best_val=0.00011]                                                                                                          ep  25 | mse 0.00010 | val MSE 0.00011  Sinkhorn 0.00187  TV 0.1972  volume err 6.43%  | MAE 1.126 RMSE 3.111 (raw units)  frame MSE 0.043 | 1s *
+stresnet_periodic_mse_nycbike2_in8_out1:  46%|████▌     | 23/50 [00:22<00:23,  1.16ep/s, best_val=0.00011]stresnet_periodic_mse_nycbike2_in8_out1:  50%|█████     | 25/50 [00:22<00:21,  1.17ep/s, best_val=0.00011]
+  epoch 26:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 26:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00018][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  50%|█████     | 25/50 [00:23<00:21,  1.17ep/s, best_val=0.00011]                                                                                                          ep  26 | mse 0.00011 | val MSE 0.00011  Sinkhorn 0.00162  TV 0.1934  volume err 7.42%  | MAE 1.108 RMSE 3.164 (raw units)  frame MSE 0.045 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  50%|█████     | 25/50 [00:23<00:21,  1.17ep/s, best_val=0.00011]
+  epoch 27:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 27:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00007][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  50%|█████     | 25/50 [00:24<00:21,  1.17ep/s, best_val=0.00011]                                                                                                          ep  27 | mse 0.00009 | val MSE 0.00011  Sinkhorn 0.00143  TV 0.1923  volume err 6.24%  | MAE 1.087 RMSE 3.094 (raw units)  frame MSE 0.043 | 1s *
+stresnet_periodic_mse_nycbike2_in8_out1:  50%|█████     | 25/50 [00:24<00:21,  1.17ep/s, best_val=0.00011]stresnet_periodic_mse_nycbike2_in8_out1:  54%|█████▍    | 27/50 [00:24<00:19,  1.15ep/s, best_val=0.00011]
+  epoch 28:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 28:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00005][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  54%|█████▍    | 27/50 [00:24<00:19,  1.15ep/s, best_val=0.00011]                                                                                                          ep  28 | mse 0.00010 | val MSE 0.00012  Sinkhorn 0.00110  TV 0.1883  volume err 8.20%  | MAE 1.145 RMSE 3.237 (raw units)  frame MSE 0.047 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  54%|█████▍    | 27/50 [00:24<00:19,  1.15ep/s, best_val=0.00011]
+  epoch 29:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 29:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00011][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  54%|█████▍    | 27/50 [00:25<00:19,  1.15ep/s, best_val=0.00011]                                                                                                          ep  29 | mse 0.00009 | val MSE 0.00011  Sinkhorn 0.00114  TV 0.1880  volume err 6.46%  | MAE 1.101 RMSE 3.075 (raw units)  frame MSE 0.042 | 1s *
+stresnet_periodic_mse_nycbike2_in8_out1:  54%|█████▍    | 27/50 [00:25<00:19,  1.15ep/s, best_val=0.00011]stresnet_periodic_mse_nycbike2_in8_out1:  58%|█████▊    | 29/50 [00:25<00:17,  1.19ep/s, best_val=0.00011]
+  epoch 30:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 30:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00006][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  58%|█████▊    | 29/50 [00:26<00:17,  1.19ep/s, best_val=0.00011]                                                                                                          ep  30 | mse 0.00009 | val MSE 0.00012  Sinkhorn 0.00112  TV 0.1875  volume err 9.52%  | MAE 1.167 RMSE 3.219 (raw units)  frame MSE 0.046 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  58%|█████▊    | 29/50 [00:26<00:17,  1.19ep/s, best_val=0.00011]
+  epoch 31:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 31:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00007][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  58%|█████▊    | 29/50 [00:27<00:17,  1.19ep/s, best_val=0.00011]                                                                                                          ep  31 | mse 0.00009 | val MSE 0.00011  Sinkhorn 0.00093  TV 0.1838  volume err 6.35%  | MAE 1.074 RMSE 3.096 (raw units)  frame MSE 0.043 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  58%|█████▊    | 29/50 [00:27<00:17,  1.19ep/s, best_val=0.00011]stresnet_periodic_mse_nycbike2_in8_out1:  62%|██████▏   | 31/50 [00:27<00:16,  1.14ep/s, best_val=0.00011]
+  epoch 32:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 32:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00010][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  62%|██████▏   | 31/50 [00:28<00:16,  1.14ep/s, best_val=0.00011]                                                                                                          ep  32 | mse 0.00008 | val MSE 0.00011  Sinkhorn 0.00087  TV 0.1832  volume err 6.44%  | MAE 1.067 RMSE 3.104 (raw units)  frame MSE 0.043 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  62%|██████▏   | 31/50 [00:28<00:16,  1.14ep/s, best_val=0.00011]
+  epoch 33:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 33:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00007][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  62%|██████▏   | 31/50 [00:29<00:16,  1.14ep/s, best_val=0.00011]                                                                                                          ep  33 | mse 0.00008 | val MSE 0.00011  Sinkhorn 0.00078  TV 0.1829  volume err 6.13%  | MAE 1.062 RMSE 3.092 (raw units)  frame MSE 0.043 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  62%|██████▏   | 31/50 [00:29<00:16,  1.14ep/s, best_val=0.00011]stresnet_periodic_mse_nycbike2_in8_out1:  66%|██████▌   | 33/50 [00:29<00:14,  1.17ep/s, best_val=0.00011]
+  epoch 34:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 34:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00008][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  66%|██████▌   | 33/50 [00:29<00:14,  1.17ep/s, best_val=0.00010]                                                                                                          ep  34 | mse 0.00008 | val MSE 0.00010  Sinkhorn 0.00101  TV 0.1850  volume err 6.02%  | MAE 1.061 RMSE 3.055 (raw units)  frame MSE 0.042 | 1s *
+stresnet_periodic_mse_nycbike2_in8_out1:  66%|██████▌   | 33/50 [00:29<00:14,  1.17ep/s, best_val=0.00010]
+  epoch 35:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 35:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00009][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  66%|██████▌   | 33/50 [00:30<00:14,  1.17ep/s, best_val=0.00010]                                                                                                          ep  35 | mse 0.00008 | val MSE 0.00011  Sinkhorn 0.00089  TV 0.1843  volume err 5.83%  | MAE 1.069 RMSE 3.072 (raw units)  frame MSE 0.042 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  66%|██████▌   | 33/50 [00:30<00:14,  1.17ep/s, best_val=0.00010]stresnet_periodic_mse_nycbike2_in8_out1:  70%|███████   | 35/50 [00:30<00:12,  1.20ep/s, best_val=0.00010]
+  epoch 36:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 36:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00009][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  70%|███████   | 35/50 [00:31<00:12,  1.20ep/s, best_val=0.00010]                                                                                                          ep  36 | mse 0.00008 | val MSE 0.00011  Sinkhorn 0.00088  TV 0.1833  volume err 6.46%  | MAE 1.060 RMSE 3.069 (raw units)  frame MSE 0.042 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  70%|███████   | 35/50 [00:31<00:12,  1.20ep/s, best_val=0.00010]
+  epoch 37:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 37:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00010][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  70%|███████   | 35/50 [00:32<00:12,  1.20ep/s, best_val=0.00010]                                                                                                          ep  37 | mse 0.00007 | val MSE 0.00010  Sinkhorn 0.00076  TV 0.1817  volume err 5.59%  | MAE 1.061 RMSE 3.019 (raw units)  frame MSE 0.041 | 1s *
+stresnet_periodic_mse_nycbike2_in8_out1:  70%|███████   | 35/50 [00:32<00:12,  1.20ep/s, best_val=0.00010]stresnet_periodic_mse_nycbike2_in8_out1:  74%|███████▍  | 37/50 [00:32<00:10,  1.22ep/s, best_val=0.00010]
+  epoch 38:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 38:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00008][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  74%|███████▍  | 37/50 [00:33<00:10,  1.22ep/s, best_val=0.00010]                                                                                                          ep  38 | mse 0.00008 | val MSE 0.00011  Sinkhorn 0.00080  TV 0.1826  volume err 6.75%  | MAE 1.058 RMSE 3.076 (raw units)  frame MSE 0.042 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  74%|███████▍  | 37/50 [00:33<00:10,  1.22ep/s, best_val=0.00010]
+  epoch 39:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 39:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00008][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  74%|███████▍  | 37/50 [00:33<00:10,  1.22ep/s, best_val=0.00010]                                                                                                          ep  39 | mse 0.00007 | val MSE 0.00010  Sinkhorn 0.00074  TV 0.1813  volume err 6.17%  | MAE 1.049 RMSE 3.051 (raw units)  frame MSE 0.042 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  74%|███████▍  | 37/50 [00:33<00:10,  1.22ep/s, best_val=0.00010]stresnet_periodic_mse_nycbike2_in8_out1:  78%|███████▊  | 39/50 [00:33<00:08,  1.25ep/s, best_val=0.00010]
+  epoch 40:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 40:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00007][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  78%|███████▊  | 39/50 [00:34<00:08,  1.25ep/s, best_val=0.00010]                                                                                                          ep  40 | mse 0.00007 | val MSE 0.00011  Sinkhorn 0.00086  TV 0.1828  volume err 6.19%  | MAE 1.058 RMSE 3.065 (raw units)  frame MSE 0.042 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  78%|███████▊  | 39/50 [00:34<00:08,  1.25ep/s, best_val=0.00010]
+  epoch 41:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 41:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00008][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  78%|███████▊  | 39/50 [00:35<00:08,  1.25ep/s, best_val=0.00010]                                                                                                          ep  41 | mse 0.00007 | val MSE 0.00010  Sinkhorn 0.00079  TV 0.1821  volume err 5.59%  | MAE 1.049 RMSE 3.024 (raw units)  frame MSE 0.041 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  78%|███████▊  | 39/50 [00:35<00:08,  1.25ep/s, best_val=0.00010]stresnet_periodic_mse_nycbike2_in8_out1:  82%|████████▏ | 41/50 [00:35<00:07,  1.20ep/s, best_val=0.00010]
+  epoch 42:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 42:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00008][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  82%|████████▏ | 41/50 [00:36<00:07,  1.20ep/s, best_val=0.00010]                                                                                                          ep  42 | mse 0.00007 | val MSE 0.00010  Sinkhorn 0.00068  TV 0.1806  volume err 5.65%  | MAE 1.045 RMSE 3.044 (raw units)  frame MSE 0.041 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  82%|████████▏ | 41/50 [00:36<00:07,  1.20ep/s, best_val=0.00010]
+  epoch 43:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 43:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00007][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  82%|████████▏ | 41/50 [00:37<00:07,  1.20ep/s, best_val=0.00010]                                                                                                          ep  43 | mse 0.00007 | val MSE 0.00010  Sinkhorn 0.00072  TV 0.1813  volume err 6.01%  | MAE 1.048 RMSE 3.053 (raw units)  frame MSE 0.042 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  82%|████████▏ | 41/50 [00:37<00:07,  1.20ep/s, best_val=0.00010]stresnet_periodic_mse_nycbike2_in8_out1:  86%|████████▌ | 43/50 [00:37<00:05,  1.22ep/s, best_val=0.00010]
+  epoch 44:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 44:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00006][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  86%|████████▌ | 43/50 [00:38<00:05,  1.22ep/s, best_val=0.00010]                                                                                                          ep  44 | mse 0.00007 | val MSE 0.00010  Sinkhorn 0.00070  TV 0.1807  volume err 5.57%  | MAE 1.044 RMSE 3.027 (raw units)  frame MSE 0.041 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  86%|████████▌ | 43/50 [00:38<00:05,  1.22ep/s, best_val=0.00010]
+  epoch 45:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 45:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00007][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  86%|████████▌ | 43/50 [00:38<00:05,  1.22ep/s, best_val=0.00010]                                                                                                          ep  45 | mse 0.00007 | val MSE 0.00010  Sinkhorn 0.00068  TV 0.1805  volume err 5.87%  | MAE 1.044 RMSE 3.044 (raw units)  frame MSE 0.041 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  86%|████████▌ | 43/50 [00:38<00:05,  1.22ep/s, best_val=0.00010]stresnet_periodic_mse_nycbike2_in8_out1:  90%|█████████ | 45/50 [00:38<00:04,  1.24ep/s, best_val=0.00010]
+  epoch 46:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 46:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00006][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  90%|█████████ | 45/50 [00:39<00:04,  1.24ep/s, best_val=0.00010]                                                                                                          ep  46 | mse 0.00007 | val MSE 0.00010  Sinkhorn 0.00072  TV 0.1812  volume err 5.90%  | MAE 1.046 RMSE 3.043 (raw units)  frame MSE 0.041 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  90%|█████████ | 45/50 [00:39<00:04,  1.24ep/s, best_val=0.00010]
+  epoch 47:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 47:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00007][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  90%|█████████ | 45/50 [00:40<00:04,  1.24ep/s, best_val=0.00010]                                                                                                          ep  47 | mse 0.00007 | val MSE 0.00010  Sinkhorn 0.00067  TV 0.1805  volume err 5.66%  | MAE 1.045 RMSE 3.040 (raw units)  frame MSE 0.041 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  90%|█████████ | 45/50 [00:40<00:04,  1.24ep/s, best_val=0.00010]stresnet_periodic_mse_nycbike2_in8_out1:  94%|█████████▍| 47/50 [00:40<00:02,  1.25ep/s, best_val=0.00010]
+  epoch 48:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 48:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00005][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  94%|█████████▍| 47/50 [00:41<00:02,  1.25ep/s, best_val=0.00010]                                                                                                          ep  48 | mse 0.00007 | val MSE 0.00010  Sinkhorn 0.00069  TV 0.1807  volume err 5.58%  | MAE 1.045 RMSE 3.033 (raw units)  frame MSE 0.041 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  94%|█████████▍| 47/50 [00:41<00:02,  1.25ep/s, best_val=0.00010]
+  epoch 49:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 49:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00006][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  94%|█████████▍| 47/50 [00:41<00:02,  1.25ep/s, best_val=0.00010]                                                                                                          ep  49 | mse 0.00007 | val MSE 0.00010  Sinkhorn 0.00069  TV 0.1807  volume err 5.69%  | MAE 1.045 RMSE 3.038 (raw units)  frame MSE 0.041 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  94%|█████████▍| 47/50 [00:41<00:02,  1.25ep/s, best_val=0.00010]stresnet_periodic_mse_nycbike2_in8_out1:  98%|█████████▊| 49/50 [00:41<00:00,  1.26ep/s, best_val=0.00010]
+  epoch 50:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 50:   0%|          | 0/69 [00:00<?, ?it/s, loss=0.00005][A
+                                                                [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                            [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [Astresnet_periodic_mse_nycbike2_in8_out1:  98%|█████████▊| 49/50 [00:43<00:00,  1.26ep/s, best_val=0.00010]                                                                                                          ep  50 | mse 0.00007 | val MSE 0.00010  Sinkhorn 0.00068  TV 0.1806  volume err 5.65%  | MAE 1.045 RMSE 3.036 (raw units)  frame MSE 0.041 | 1s
+stresnet_periodic_mse_nycbike2_in8_out1:  98%|█████████▊| 49/50 [00:43<00:00,  1.26ep/s, best_val=0.00010]stresnet_periodic_mse_nycbike2_in8_out1: 100%|██████████| 50/50 [00:43<00:00,  1.16ep/s, best_val=0.00010]
+  train:   0%|          | 0/9 [00:00<?, ?it/s]                                                val:   0%|          | 0/4 [00:00<?, ?it/s]                                              test:   0%|          | 0/8 [00:00<?, ?it/s]                                             selected checkpoint (epoch 37) on test: test MSE 0.00010  Sinkhorn 0.00073  TV 0.1861  volume err 5.69%  | MAE 1.103 RMSE 3.050 (raw units)  frame MSE 0.042
+                 MSE        RMSE         MAE   (raw units)
+train         6.5071      2.5509      0.9239
+val           9.1162      3.0193      1.0609
+test          9.3021      3.0499      1.1033
+FINAL stresnet_periodic_mse_nycbike2_in8_out1  train_mse=6.507101  train_rmse=2.550902  train_mae=0.923869  val_mse=9.116185  val_rmse=3.019302  val_mae=1.060942  test_mse=9.302121  test_rmse=3.049938  test_mae=1.103311  best_epoch=37
+wandb: uploading artifact run-5j43b4e0-results; updating run metadata
+wandb: uploading artifact run-5j43b4e0-results
+wandb: uploading artifact run-5j43b4e0-results; uploading history steps 810-1200, summary, console lines 3-3
+wandb: uploading console lines 19-59
+wandb: 
+wandb: Run history:
+wandb:  Frame MSE/test █▃▃▂▂▂▁▂▂▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb: Frame MSE/train █▄▃▂▃▂▁▃▂▂▁▁▁▁▁▁▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:   Frame MSE/val █▄▂▃▂▃▂▁▂▁▁▁▁▁▁▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:        MAE/test █▄▃▂▂▂▂▂▂▂▁▁▁▁▁▁▁▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:       MAE/train █▄▃▃▂▂▂▂▂▂▂▁▂▁▂▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:         MAE/val █▇▄▅▄▃▄▃▃▃▂▂▂▂▂▄▂▁▁▁▁▁▁▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:        MSE/test █▃▃▂▂▁▂▂▂▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:       MSE/train █▄▃▂▃▂▁▃▂▂▁▁▁▁▁▁▁▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:         MSE/val █▄▃▂▃▂▁▃▂▁▁▁▁▁▁▁▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:       RMSE/test █▄▃▂▃▃▁▃▂▂▂▁▂▁▂▂▁▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:             +56 ...
+wandb: 
+wandb: Run summary:
+wandb:  Frame MSE/test 0.04162
+wandb: Frame MSE/train 0.02911
+wandb:   Frame MSE/val 0.04079
+wandb:        MAE/test 1.10331
+wandb:       MAE/train 0.92387
+wandb:         MAE/val 1.06094
+wandb:        MSE/test 9.30212
+wandb:       MSE/train 6.5071
+wandb:         MSE/val 9.11618
+wandb:       RMSE/test 3.04994
+wandb:            +125 ...
+wandb: 
+wandb: 🚀 View run stresnet_periodic_mse_nycbike2_in8_out1 at: https://forge.coreweave.com/wandb/nec17/traffic-pred-nycbike2/runs/5j43b4e0
+wandb: ⭐️ View project at: https://forge.coreweave.com/wandb/nec17/traffic-pred-nycbike2
+wandb: Synced 5 W&B file(s), 7 media file(s), 2 artifact file(s) and 0 other file(s)
+wandb: Find logs at: ./wandb/run-20261114_212402-5j43b4e0/logs
+=== distvolformer_periodic_sinkhorn_nycbike2_in8_out1: python train.py --model distvolformer --loss sinkhorn --periods day week --dataset nycbike2 --t-in 8 --t-out 1 --seed 42 --workers 2 --save checkpoints/workspaces/nextstep_nycbike2_in8/distvolformer_periodic_sinkhorn_nycbike2_in8_out1.pt --resume
+    log: checkpoints/workspaces/nextstep_nycbike2_in8/logs/distvolformer_periodic_sinkhorn_nycbike2_in8_out1.log
+distvolformer (sinkhorn loss): 7.53M params | nycbike2 2x10x20, 8 in -> 1 out | 1104 train / 472 val / 952 test windows | cuda
+  copying data to the GPU:   0%|          | 0/3 [00:00<?, ?it/s]                                                                  copying data to the GPU:   0%|          | 0/1 [00:00<?, ?it/s]                                                                  copying data to the GPU:   0%|          | 0/2 [00:00<?, ?it/s]                                                                no checkpoints/workspaces/nextstep_nycbike2_in8/distvolformer_periodic_sinkhorn_nycbike2_in8_out1.last.pt; starting from scratch
+wandb: [wandb.login()] Loaded credentials for https://api.forge.coreweave.com from /home/nealc/.netrc.
+wandb: Currently logged in as: nealxchandra (nec17) to https://api.forge.coreweave.com. Use `wandb login --relogin` to force relogin
+wandb: Tracking run with wandb version 0.31.0
+wandb: Run data is saved locally in /home/nealc/Documents/proj/traffic_pred/wandb/run-20261114_212458-iky16zc1
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run distvolformer_periodic_sinkhorn_nycbike2_in8_out1
+wandb: ⭐️ View project at https://forge.coreweave.com/wandb/nec17/traffic-pred-nycbike2
+wandb: 🚀 View run at https://forge.coreweave.com/wandb/nec17/traffic-pred-nycbike2/runs/iky16zc1
+  copy-last (val):   0%|          | 0/4 [00:00<?, ?it/s]                                                          copy-last (test):   0%|          | 0/8 [00:00<?, ?it/s]                                                         copy-last-frame reference: val MSE 0.00030  Sinkhorn 0.00071  TV 0.2268  volume err 17.35%  | MAE 1.590 RMSE 5.138 (raw units)  frame MSE 0.118
+copy-last-frame reference: test MSE 0.00027  Sinkhorn 0.00071  TV 0.2288  volume err 16.72%  | MAE 1.569 RMSE 4.900 (raw units)  frame MSE 0.107
+distvolformer_periodic_sinkhorn_nycbike2_in8_out1:   0%|          | 0/50 [00:00<?, ?ep/s]
+  epoch 1:   0%|          | 0/69 [00:00<?, ?it/s][A
+  epoch 1:   1%|▏         | 1/69 [00:01<01:09,  1.02s/it][A
+  epoch 1:  52%|█████▏    | 36/69 [00:02<00:01, 20.76it/s][A
+  epoch 1:  52%|█████▏    | 36/69 [00:02<00:01, 20.76it/s, loss=0.03246][A
+                                                                        [A
+  val:   0%|          | 0/4 [00:00<?, ?it/s][A
+  val: 100%|██████████| 4/4 [00:01<00:00,  3.42it/s][A
+                                                    [A
+  train sample:   0%|          | 0/4 [00:00<?, ?it/s][A
+                                                     [A
+  test:   0%|          | 0/8 [00:00<?, ?it/s][A
+                                             [A

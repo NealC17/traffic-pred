@@ -7,7 +7,7 @@ checkpoints/
 figs*/
 *.pt
 slurm-*.out
-
+*.sh
 datasets/**/*.npy
 datasets/**/*.part
 datasets/MovingMNIST/
