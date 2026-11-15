@@ -7,6 +7,7 @@ checkpoints/
 figs*/
 *.pt
 slurm-*.out
+logs/
 *.sh
 datasets/**/*.npy
 datasets/**/*.part
