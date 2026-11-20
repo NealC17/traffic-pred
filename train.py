@@ -5,8 +5,8 @@ from dataclasses import asdict
 import torch
 
 from trafficpred.data import DATASETS, add_data_args, splits_from_args
-from trafficpred.losses import LOSSES, PARTS_LOSSES, default_options, make_loss, needs_parts
-from trafficpred.metrics import SELECT
+from trafficpred.losses import LOSSES, PARTS_LOSSES, WEIGHTED, default_options, make_loss, needs_parts
+from trafficpred.metrics import SELECT, THRESHOLD
 from trafficpred.models import MODELS, add_model_args, build_model, configure_model
 from trafficpred.tracking import Tracker
 from trafficpred.training import Trainer, TrainSettings
@@ -49,6 +49,9 @@ def parse_args(argv=None):
     g.add_argument("--amp", action="store_true", help="bf16 autocast on CUDA")
     g.add_argument("--compile", action="store_true", help="torch.compile the model")
     g.add_argument("--workers", type=int, default=2)
+    g.add_argument("--grad-checkpoint", action="store_true",
+                   help="distvolformer*: recompute each transformer block in the backward pass (less memory, "
+                        "~30%% slower, same results)")
     g.add_argument("--eval-batch-size", type=int, help="default 128 (stdcformer: its training batch size)")
     g.add_argument("--data-on-gpu", choices=("auto", "yes", "no"), default="auto")
     g.add_argument("--curves", choices=("all", "val"), default="all",
@@ -67,6 +70,8 @@ def parse_args(argv=None):
         "sinkhorn = 1 L1 + 10 Sinkhorn + 1 volume; sinkhorn_only = Sinkhorn; sinkhorn_vol = 10 Sinkhorn + "
         "1 volume; kl = 1 L1 + 0.1 KL(p || p_hat) + 1 volume; sinkhorn_kl = 1 L1 + 10 Sinkhorn + 1 volume + "
         "0.1 KL; sinkhorn_vol_uw = (Sinkhorn, volume) with learned uncertainty weights; "
+        "sinkhorn_vol_mse = 10 Sinkhorn + 500 squared volume error; sinkhorn_vol_mse_uw = (Sinkhorn, squared "
+        "volume error) with learned uncertainty weights; "
         "sinkhorn_adaptive = all three, reweighted like Adam so each term's parameter gradient matches "
         "the L1 term's (--l1/--l2/--l3 then scale those shares, default 1 each). A weight or "
         "Sinkhorn setting that differs from the loss's default is added to the run name (e.g. _l1-0)")
@@ -78,6 +83,16 @@ def parse_args(argv=None):
                                             "grows / shrinks vs the last input frame (sinkhorn_change, default 0.3)")
     g.add_argument("--l6", type=float, help="weight on the squared error mean (X_hat - X)^2 on the scaled data, "
                                             "next to the L1 term (fixed-weight losses, default 0)")
+    g.add_argument("--l7", type=float, help="weight on the Huber loss of X_hat - X on the scaled data "
+                                            "(fixed-weight losses, default 0)")
+    g.add_argument("--l8", type=float, help="weight on the squared volume error ((N_hat - N) / HW)^2 "
+                                            "(sinkhorn_vol_mse, default 500; other fixed-weight losses 0)")
+    g.add_argument("--low-weight", type=float, metavar="A",
+                   help="mse / mae / huber: cells whose true flow is below the scored threshold (10, the STDN "
+                        "protocol) count A times as much as the rest (default 1; 0 = scored cells only)")
+    g.add_argument("--huber-delta", type=float,
+                   help="where the Huber term turns from squared to linear, on the [0, 1] scaled data "
+                        "(default 0.01: about one RMSE on NYCTaxi / NYCBike)")
     g.add_argument("--adapt-beta", type=float, help="sinkhorn_adaptive: running-average decay (default 0.95)")
     g.add_argument("--adapt-every", type=int,
                    help="sinkhorn_adaptive: measure the gradients every N steps (default 10)")
@@ -104,7 +119,7 @@ def choose_loss(args, spec):
 
 def choose_loss_options(args, loss):
     options = default_options(loss)
-    given = {k: getattr(args, k) for k in ("l1", "l2", "l3", "l4", "l5", "l6", "eps", "sinkhorn_iters", "sinkhorn_anneal",
+    given = {k: getattr(args, k) for k in ("l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "huber_delta", "eps", "sinkhorn_iters", "sinkhorn_anneal",
                                            "adapt_beta", "adapt_every")
              if getattr(args, k) is not None}
     if "sinkhorn_anneal" in given and "eps" in options:   # every Sinkhorn loss takes it; only
@@ -115,6 +130,12 @@ def choose_loss_options(args, loss):
         raise SystemExit(f"{flags} doesn't apply to --loss {loss}"
                          + ("; it fits " + ", ".join(n for n in PARTS_LOSSES if set(unused) <= set(default_options(n)))
                             if loss in PARTS_LOSSES else ""))
+    low = getattr(args, "low_weight", None)
+    if low is not None and low != 1.0:
+        if loss not in ("mse", "mae", "huber", *WEIGHTED):
+            raise SystemExit(f"--low-weight works with --loss mse / mae / huber and the fixed-weight "
+                             f"losses ({', '.join(WEIGHTED)}), not {loss}")
+        given["low_weight"] = low
     return {**options, **given}
 
 
@@ -149,10 +170,18 @@ def run_name(args, splits, loss, loss_options):
         name += f"_transport{args.transport}"
     if getattr(args, "sinkformer", None):
         name += f"_sinkformer{args.sinkformer}"
+    if getattr(args, "time_tokens", False):
+        name += "_timetokens"
+    if getattr(args, "log_counts", False):
+        name += "_logcounts"
     if splits.split.get("test_days"):
         name += f"_test{splits.split['test_days']:g}d"
     if splits.split.get("periods"):
         name += "_periods-" + "-".join(map(str, splits.split["periods"]))
+    if splits.split.get("period_shift"):
+        name += f"_shift{splits.split['period_shift']}"
+    if getattr(args, "st_branches", False):
+        name += "_stbranches"
     return name
 
 
@@ -162,6 +191,8 @@ def main(argv=None, epoch_callback=None):
     args = parse_args(argv)
     if args.external and args.model != "stresnet":
         raise SystemExit("--external only works with --model stresnet")
+    if args.st_branches and args.model != "stresnet":
+        raise SystemExit("--st-branches only works with --model stresnet")
     spec = MODELS[args.model]
     loss_name = choose_loss(args, spec)
     loss_options = choose_loss_options(args, loss_name)
@@ -170,6 +201,13 @@ def main(argv=None, epoch_callback=None):
     splits = splits_from_args(args)
     model_kwargs = configure_model(args.model, args, splits)
     model = build_model(args.model, model_kwargs)
+    if args.grad_checkpoint:
+        from trafficpred.models.distvolformer import AdaLNBlock
+        blocks = [m for m in model.modules() if isinstance(m, AdaLNBlock)]
+        if not blocks:
+            raise SystemExit(f"--grad-checkpoint: --model {args.model} has no transformer blocks to checkpoint")
+        for m in blocks:
+            m.grad_checkpoint = True
     device = pick_device()
     C, H, W = splits.shape
     print(f"{args.model} ({loss_name} loss): {count_parameters(model) / 1e6:.2f}M params | "
@@ -187,7 +225,8 @@ def main(argv=None, epoch_callback=None):
                t_in=splits.t_in, t_out=splits.t_out, split=splits.split,
                scale=(splits.lo, splits.hi), channels=splits.channels, loss=loss_name,
                loss_options=loss_options, seed=args.seed)
-    loss = None if loss_name == "none" else make_loss(loss_name, **loss_options)
+    threshold = (THRESHOLD - splits.lo) / splits.span   # the scored cut in scaled units (--low-weight)
+    loss = None if loss_name == "none" else make_loss(loss_name, threshold=threshold, **loss_options)
 
     torch.backends.cudnn.benchmark = device.type == "cuda"
     trainer = Trainer(model, run, splits, loss, settings, save, device)

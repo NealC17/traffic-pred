@@ -10,6 +10,7 @@ SINKHORN_ITERS = 30
 HEADLINE = ("mse", "sinkhorn", "dist_tv", "volume_err")
 SELECT = "mse"
 SPLITS = ("train", "val", "test")
+THRESHOLD = 10.0   # STDN protocol: RMSE over cells whose true flow is >= 10 (rmse_flow_ge10)
 REPORTED = ("mse_flow", "rmse_flow", "mae_flow")
 REPORTED_NAMES = {"mse_flow": "mse", "rmse_flow": "rmse", "mae_flow": "mae"}
 PANELS = {"RMSE": "rmse_flow", "MAE": "mae_flow", "MSE": "mse_flow", "Sinkhorn": "sinkhorn",
@@ -21,7 +22,7 @@ def panel_metrics(by_split):
 
 
 class _Totals:
-    NAMES = ("se", "ae", "sinkhorn", "volume_abs", "volume_total", "dist_se", "tv")
+    NAMES = ("se", "ae", "sinkhorn", "volume_abs", "volume_total", "dist_se", "tv", "se_ge", "n_ge")
 
     def __init__(self, steps, device):
         dtype = torch.float32 if device.type == "mps" else torch.float64
@@ -50,6 +51,9 @@ def evaluate(model, loader, device, span, lo=0.0, amp=False, desc="  eval"):
         diff = pred - y
         totals.add("se", diff.pow(2).sum(dim=(0, 2, 3, 4)))
         totals.add("ae", diff.abs().sum(dim=(0, 2, 3, 4)))
+        keep = (y * span + lo >= THRESHOLD).to(diff.dtype)
+        totals.add("se_ge", (diff.pow(2) * keep).sum(dim=(0, 2, 3, 4)))
+        totals.add("n_ge", keep.sum(dim=(0, 2, 3, 4)))
 
         p_hat, _ = split_flow(pred)
         p, _ = split_flow(y.clamp_min(0))
@@ -86,6 +90,8 @@ def _summarise(totals, span):
         "mae_frame": mae * cells_per_frame,
         "mse_flow": mse * span ** 2,
         "rmse_flow": float(np.sqrt(mse)) * span,
+        "rmse_flow_ge10": (float(np.sqrt(s["se_ge"].sum().item() / s["n_ge"].sum().item())) * span
+                           if s["n_ge"].sum().item() > 0 else float("nan")),
         "mae_flow": mae * span,
         "sinkhorn": s["sinkhorn"].sum().item() / maps,
         "dist_mse": s["dist_se"].sum().item() / cells,

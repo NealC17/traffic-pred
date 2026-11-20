@@ -103,9 +103,11 @@ def block_order(variant, num_blocks):
 
 class PredFormer(nn.Module):
     def __init__(self, in_shape, patch_size, dim=256, heads=8, mlp_dim=1024, num_blocks=24,
-                 variant="TSST", attn_drop=0.0, drop=0.0, drop_path=0.0):
+                 variant="TSST", attn_drop=0.0, drop=0.0, drop_path=0.0, aux=0):
+        """in_shape: (T, C, H, W) of the flow; aux: extra input channels per frame (--od), not predicted."""
         super().__init__()
         T, C, H, W = in_shape
+        self.aux = aux
         p = patch_size
         assert H % p == 0 and W % p == 0, f"H and W ({H}x{W}) must be divisible by patch_size {p}"
         assert variant in VARIANTS, f"variant must be one of {VARIANTS}"
@@ -113,7 +115,7 @@ class PredFormer(nn.Module):
         self.Hp, self.Wp = H // p, W // p
         self.N = self.Hp * self.Wp
 
-        self.patch_embed = nn.Linear(p * p * C, dim)
+        self.patch_embed = nn.Linear(p * p * (C + aux), dim)
         self.patch_norm = nn.LayerNorm(dim)
         self.register_buffer("pos_embed", sinusoidal_table(T * self.N, dim).view(1, T, self.N, dim),
                              persistent=False)
@@ -135,9 +137,9 @@ class PredFormer(nn.Module):
             nn.init.zeros_(m.bias)
 
     def patchify(self, x):
-        B, p = x.shape[0], self.p
-        x = x.reshape(B, self.T, self.C, self.Hp, p, self.Wp, p).permute(0, 1, 3, 5, 4, 6, 2)
-        return x.reshape(B, self.T, self.N, p * p * self.C)
+        B, p, C = x.shape[0], self.p, x.shape[2]
+        x = x.reshape(B, self.T, C, self.Hp, p, self.Wp, p).permute(0, 1, 3, 5, 4, 6, 2)
+        return x.reshape(B, self.T, self.N, p * p * C)
 
     def unpatchify(self, x):
         B, p = x.shape[0], self.p

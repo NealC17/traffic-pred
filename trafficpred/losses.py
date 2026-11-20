@@ -7,8 +7,11 @@ Their terms are
 
     reconstruction  ||x_hat - x||_1
     squared         ||x_hat - x||_2^2      (mean; off by default, --l6: an MSE term next to L1)
+    huber           Huber(x_hat - x)       (mean; off by default, --l7: squared below --huber-delta,
+                                            linear above, so busy-cell outliers don't dominate)
     transport       S_eps(p_hat, p)        debiased Sinkhorn divergence between the shapes
     volume          |n_hat - n| / (H W)
+    volume_mse      ((n_hat - n) / (H W))^2   (the volume error squared; --l8)
     kl              KL(p || p_hat)         sum_cells p log(p / p_hat): the shapes compared cell by
                                            cell, with no notion of distance between cells
     change          S_eps(d_hat+, d+) + S_eps(d_hat-, d-), d = flow minus the last input frame:
@@ -23,18 +26,21 @@ and they differ only in which terms are trained and how the terms are combined:
     sinkhorn         1 * reconstruction + 10 * transport + 1 * volume   (fixed weights)
     sinkhorn_only    transport alone
     sinkhorn_vol     10 * transport + 1 * volume
+    sinkhorn_vol_mse 10 * transport + 500 * volume_mse   (500 = 1 / (2 * volume error) of tuned DistVol on
+                     NYCTaxi / NYCBike2: the squared term pushes the totals about as hard as the L1 one)
     kl               1 * reconstruction + 0.1 * kl + 1 * volume         (KL in place of Sinkhorn)
     sinkhorn_kl      1 * reconstruction + 10 * transport + 1 * volume + 0.1 * kl
     sinkhorn_change  1 * reconstruction + 1 * volume + 0.3 * change, with sharp, converged Sinkhorn
                      (eps 0.002 = blur ~1.4 cells, 60 epsilon-scaled iterations)
     sinkhorn_vol_uw  the vector (transport, volume), combined by learned uncertainty weights
                      (Kendall, Gal & Cipolla 2018): sum_i exp(-s_i) * L_i + s_i
+    sinkhorn_vol_mse_uw  the vector (transport, volume_mse), the same uncertainty weights
     sinkhorn_adaptive  all three terms, weighted so each one's gradient on the model's parameters
                      is as large as the reconstruction term's (times l1 / l2 / l3, default 1 each),
                      from Adam-style running averages of the squared gradient norms
 
---l1 / --l2 / --l3 / --l4 / --l5 / --l6 weigh reconstruction / transport / volume / kl / change /
-squared (the fixed-weight losses; --l6 defaults to 0). Every
+--l1 / --l2 / --l3 / --l4 / --l5 / --l6 / --l7 / --l8 weigh reconstruction / transport / volume / kl /
+change / squared / huber / volume_mse (the fixed-weight losses; --l6, --l7 and --l8 default to 0). Every
 term is logged whether or not it is trained, except that the Sinkhorn terms (transport, change)
 are only computed when their weight is above 0. --sinkhorn-anneal turns on epsilon scaling.
 """
@@ -50,7 +56,13 @@ def masked_l1_loss(pred, y):
     return ((pred - y).abs() * mask).sum() / mask.sum().clamp_min(1.0)
 
 
-POINTWISE = {"mse": F.mse_loss, "mae": F.l1_loss, "masked_mae": masked_l1_loss}
+def huber_loss(pred, y):   # delta 0.01 of the scaled data, the same as --l7's default
+    return F.huber_loss(pred, y, delta=0.01)
+
+
+POINTWISE = {"mse": F.mse_loss, "mae": F.l1_loss, "masked_mae": masked_l1_loss, "huber": huber_loss}
+ELEMENTWISE = {"mse": lambda p, y: (p - y) ** 2, "mae": lambda p, y: (p - y).abs(),
+               "huber": lambda p, y: F.huber_loss(p, y, delta=0.01, reduction="none")}
 CHANGE_WEIGHT = 0.3
 CHANGE_FLOOR = 1e-2
 WEIGHTED = {  # name -> default weights: l1 reconstruction, l2 transport, l3 volume, l4 kl
@@ -60,10 +72,11 @@ WEIGHTED = {  # name -> default weights: l1 reconstruction, l2 transport, l3 vol
     "kl": dict(l1=1.0, l2=0.0, l3=1.0, l4=0.1),
     "sinkhorn_kl": dict(l1=1.0, l2=10.0, l3=1.0, l4=0.1),
     "sinkhorn_change": dict(l1=1.0, l2=0.0, l3=1.0, l5=CHANGE_WEIGHT),
+    "sinkhorn_vol_mse": dict(l1=0.0, l2=10.0, l3=0.0, l8=500.0),
 }
 SHARP_SINKHORN = dict(eps=0.002, sinkhorn_iters=60, sinkhorn_anneal=True)   # sinkhorn_change's
 KL_FLOOR = 1e-12
-UNCERTAINTY = ("sinkhorn_vol_uw",)
+UNCERTAINTY = {"sinkhorn_vol_uw": ("sinkhorn", "volume"), "sinkhorn_vol_mse_uw": ("sinkhorn", "volume_mse")}
 ADAPTIVE = ("sinkhorn_adaptive",)
 SINKHORN_DEFAULTS = dict(eps=0.01, sinkhorn_iters=30)
 ADAPTIVE_DEFAULTS = dict(l1=1.0, l2=1.0, l3=1.0, adapt_beta=0.95, adapt_every=10)
@@ -73,15 +86,25 @@ LOSSES = (*POINTWISE, *PARTS_LOSSES)
 
 
 class PointwiseLoss(nn.Module):
+    """A pointwise loss; with low_weight != 1, cells whose true value is below `threshold` (scaled
+    units; the scored cut, e.g. 10 under the STDN protocol) count low_weight times as much as the
+    scored cells (0 = train on the scored cells only). The weights depend on the target only."""
     needs_parts = False
 
-    def __init__(self, kind):
+    def __init__(self, kind, low_weight=1.0, threshold=None):
         super().__init__()
-        self.kind = kind
+        self.kind, self.low_weight, self.threshold = kind, low_weight, threshold
         self.fn = POINTWISE[kind]
+        if low_weight != 1.0:
+            if kind not in ELEMENTWISE or threshold is None:
+                raise ValueError(f"--low-weight works with {', '.join(ELEMENTWISE)} and needs the threshold")
 
     def forward(self, pred, y):
-        loss = self.fn(pred.float(), y)
+        if self.low_weight == 1.0:
+            loss = self.fn(pred.float(), y)
+        else:
+            w = torch.where(y >= self.threshold, 1.0, self.low_weight)
+            loss = (ELEMENTWISE[self.kind](pred.float(), y) * w).sum() / w.sum().clamp_min(1.0)
         return loss, {self.kind: loss.detach()}
 
 
@@ -110,18 +133,26 @@ def change_transport(x_hat, y, x_last, eps, iters, anneal):
 class DistVolTerms(nn.Module):
     needs_parts = True
     anneal = False   # epsilon scaling in the Sinkhorn terms (set by make_loss)
+    low_weight, threshold = 1.0, None   # --low-weight on the reconstruction terms (set by make_loss)
 
-    def __init__(self, eps=0.01, iters=30):
+    def __init__(self, eps=0.01, iters=30, huber_delta=0.01):
         super().__init__()
-        self.eps, self.iters = eps, iters
+        self.eps, self.iters, self.huber_delta = eps, iters, huber_delta
 
     def terms(self, parts, y, transport=True, x=None, change=False):
         x_hat, p_hat, n_hat = (t.float() for t in parts)
         H, W = y.shape[-2:]
         p, n = split_flow(y.clamp_min(0))
-        out = {"l1": (x_hat - y).abs().mean(),
-               "mse": (x_hat - y).pow(2).mean(),
+        if self.low_weight == 1.0:
+            mean = torch.mean
+        else:   # cells below the scored threshold count low_weight times as much
+            w = torch.where(y >= self.threshold, 1.0, self.low_weight)
+            mean = lambda v: (v * w).sum() / w.sum().clamp_min(1.0)
+        out = {"l1": mean((x_hat - y).abs()),
+               "mse": mean((x_hat - y).pow(2)),
+               "huber": mean(F.huber_loss(x_hat, y, delta=self.huber_delta, reduction="none")),
                "volume": (n_hat - n).abs().mean() / (H * W),
+               "volume_mse": ((n_hat - n) / (H * W)).pow(2).mean(),
                "kl": kl_divergence(p, p_hat)}
         if transport:
             out["sinkhorn"] = sinkhorn_divergence(p_hat.reshape(-1, H, W), p.reshape(-1, H, W),
@@ -130,17 +161,19 @@ class DistVolTerms(nn.Module):
         if change:
             if x is None:
                 raise RuntimeError("the change term needs the input frames: loss(parts, y, x=x)")
-            out["change"] = change_transport(x_hat, y, x[:, -1:].float(), self.eps, self.iters, self.anneal)
+            out["change"] = change_transport(x_hat, y, x[:, -1:, :y.shape[2]].float(), self.eps, self.iters, self.anneal)
         return out
 
 
 class DistVolLoss(DistVolTerms):
     """Fixed-weight sum l1 * reconstruction + l2 * transport + l3 * volume + l4 * kl + l5 * change
-    + l6 * squared error."""
+    + l6 * squared error + l7 * huber."""
 
-    def __init__(self, l1=1.0, l2=10.0, l3=1.0, l4=0.0, l5=0.0, l6=0.0, eps=0.01, iters=30):
-        super().__init__(eps, iters)
-        self.weights = {"l1": l1, "sinkhorn": l2, "volume": l3, "kl": l4, "change": l5, "mse": l6}
+    def __init__(self, l1=1.0, l2=10.0, l3=1.0, l4=0.0, l5=0.0, l6=0.0, l7=0.0, l8=0.0, huber_delta=0.01,
+                 eps=0.01, iters=30):
+        super().__init__(eps, iters, huber_delta)
+        self.weights = {"l1": l1, "sinkhorn": l2, "volume": l3, "kl": l4, "change": l5, "mse": l6,
+                        "huber": l7, "volume_mse": l8}
         self.needs_input = l5 > 0
 
     def forward(self, parts, y, x=None):
@@ -159,10 +192,9 @@ class UncertaintyLoss(DistVolTerms):
     training starts balanced instead of spending epochs moving s from 0 to about log(1e-3).
     """
 
-    VECTOR = ("sinkhorn", "volume")
-
-    def __init__(self, eps=0.01, iters=30):
+    def __init__(self, eps=0.01, iters=30, vector=("sinkhorn", "volume")):
         super().__init__(eps, iters)
+        self.VECTOR = tuple(vector)
         self.log_vars = nn.Parameter(torch.zeros(len(self.VECTOR)))
         self.register_buffer("initialized", torch.tensor(False))
 
@@ -247,7 +279,7 @@ def needs_parts(name):
 def default_options(name):
     """The options a loss is built with when nothing is overridden (stored with each run)."""
     if name in WEIGHTED:
-        return dict(WEIGHTED[name], l6=0.0,
+        return dict({"l6": 0.0, "l7": 0.0, "l8": 0.0, **WEIGHTED[name]}, huber_delta=0.01,
                     **(SHARP_SINKHORN if "l5" in WEIGHTED[name] else SINKHORN_DEFAULTS))
     if name in UNCERTAINTY:
         return dict(SINKHORN_DEFAULTS)
@@ -256,16 +288,17 @@ def default_options(name):
     return {}
 
 
-def make_loss(name, **options):
+def make_loss(name, threshold=None, **options):
     if name in POINTWISE:
-        return PointwiseLoss(name)
+        return PointwiseLoss(name, options.get("low_weight", 1.0), threshold)
     options = {**default_options(name), **options}
+    low_weight = options.pop("low_weight", 1.0)
     iters = options.pop("sinkhorn_iters")
     anneal = bool(options.pop("sinkhorn_anneal", False))
     if name in WEIGHTED:
         loss = DistVolLoss(iters=iters, **options)
     elif name in UNCERTAINTY:
-        loss = UncertaintyLoss(iters=iters, **options)
+        loss = UncertaintyLoss(iters=iters, vector=UNCERTAINTY[name], **options)
     elif name in ADAPTIVE:
         loss = AdaptiveLoss(iters=iters, beta=options.pop("adapt_beta"), every=options.pop("adapt_every"),
                             **options)
@@ -273,5 +306,9 @@ def make_loss(name, **options):
         loss = None
     if loss is not None:
         loss.anneal = anneal
+        if low_weight != 1.0:
+            if name not in WEIGHTED or threshold is None:
+                raise ValueError("--low-weight works with mse / mae / huber and the fixed-weight losses")
+            loss.low_weight, loss.threshold = low_weight, threshold
         return loss
     raise ValueError(f"unknown loss {name!r} (losses: {', '.join(LOSSES)})")

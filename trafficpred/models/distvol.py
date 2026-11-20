@@ -1,9 +1,18 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from trafficpred.models.transport import TransportHead
 from trafficpred.sinkhorn import split_flow
+
+def log_flow(x, count_scale=0.0, count_offset=0.0):
+    """The log-flow input feature. count_scale = 0: log1p of the scaled data, as first trained (on
+    0-1 scaled data that is nearly linear: log1p(0.01) = 0.00995). count_scale = span, count_offset
+    = lo: log1p of the raw counts, which compresses the heavy-tailed flow as intended."""
+    x = x.clamp_min(0)
+    return torch.log1p((x * count_scale + count_offset).clamp_min(0) if count_scale else x)
+
 
 RESIDUAL_FLOOR = 1e-6   # keeps log P finite where the last frame had no traffic
 EPS = 1e-6
@@ -66,17 +75,64 @@ def log_last_distribution(p_in):
     return torch.log(p_in[:, -1:].reshape(B, 1, C, H * W) + RESIDUAL_FLOOR)
 
 
+class ODTransportHead(nn.Module):
+    """End(t+1) gets the arrivals of the trips under way at t, moved by a transport plan.
+
+    r_i = trips under way from origin i at the last input frame (the first --od map; known at t).
+    plan_ij = r_i * softmax_j(log K_ij + D_ij + g_j): every row carries exactly r_i (the known mass is
+    conserved); K = the train split's all-day destination kernel (fixed prior), D = a learned
+    correction (weight decay pulls it back to the prior), g = a destination potential predicted per
+    sample from the encoder features: the dual variable of a singly constrained transport / gravity
+    model, which lets the plan follow the time of day and conditions. arrivals_j = sum_i plan_ij.
+    D and g start at 0, so the head starts as the historical kernel."""
+
+    def __init__(self, kernel, width, H, W):
+        """width: features to read the potential from with a 1x1 conv (DistVol); None when the caller
+        predicts the potential itself and passes it as g (DistVolFormer's distribution head)."""
+        super().__init__()
+        N = H * W
+        k = torch.as_tensor(kernel, dtype=torch.float32).reshape(N, N)
+        self.register_buffer("log_prior", torch.log(k.clamp_min(1e-8)))
+        self.correction = nn.Parameter(torch.zeros(N, N))
+        self.potential = None
+        if width:
+            self.potential = nn.Conv2d(width, 1, 1)
+            nn.init.zeros_(self.potential.weight)
+            nn.init.zeros_(self.potential.bias)
+        self.H, self.W = H, W
+
+    def forward(self, u, in_progress, g=None):
+        """u: (B, width, >=H, >=W) features (or None with g: (B, H, W) potentials); in_progress:
+        (B, H, W) -> arrivals (B, H, W)."""
+        B = in_progress.shape[0]
+        if g is None:
+            g = self.potential(u)[:, 0]
+        g = g[:, :self.H, :self.W].reshape(B, 1, -1)
+        plan = (self.log_prior + self.correction + g).softmax(-1)              # (B, N, N), rows sum to 1
+        arrivals = torch.bmm(in_progress.reshape(B, 1, -1).clamp_min(0), plan)  # (B, 1, N)
+        return arrivals.reshape(B, self.H, self.W)
+
+
 class DistVolNet(nn.Module):
     def __init__(self, T_in=4, T_out=4, C=2, H=32, W=32, width=64, dist_residual=False,
-                 transport=0, n_periodic=0):
+                 transport=0, n_periodic=0, count_scale=0.0, count_offset=0.0, aux=0, od_head=None):
+        """aux: extra input maps per frame after the C flow channels (--od). They go in as log-flow maps
+        next to the flow's, and their log totals next to the flow's totals; they are not predicted."""
         super().__init__()
+        self.count_scale, self.count_offset = count_scale, count_offset
         self.T_in, self.T_out, self.C, self.H, self.W = T_in, T_out, C, H, W
+        self.aux = aux
         self.dist_residual = dist_residual
         k_in, k_out = T_in * C, T_out * C
-        self.vol_enc = nn.Sequential(nn.Linear(k_in, 128), nn.GELU(), nn.Linear(128, 128))
-        self.encoder = MultiscaleEncoder(2 * k_in, width, cond_dim=128)
+        self.vol_enc = nn.Sequential(nn.Linear(k_in + T_in * aux, 128), nn.GELU(), nn.Linear(128, 128))
+        self.encoder = MultiscaleEncoder(2 * k_in + T_in * aux, width, cond_dim=128)
         self.transport = TransportHead(T_out, C, transport, n_periodic) if transport else None
         self.dist_head = nn.Conv2d(width, self.transport.channels if transport else k_out, 1)
+        self.od_head = None
+        if od_head is not None:   # the --od-head kernel file; End = within-slot part + transported trips
+            if aux < 1 or T_out != 1 or C != 2:
+                raise ValueError("od_head needs --od, --t-out 1 and the Start / End channels")
+            self.od_head = ODTransportHead(np.load(od_head), width, H, W)
         if transport:
             self.transport.init_head(self.dist_head.weight, self.dist_head.bias)
         elif dist_residual:   # starts as "the last frame's distribution", learns the change
@@ -89,13 +145,20 @@ class DistVolNet(nn.Module):
         nn.init.zeros_(self.vol_head[-1].bias)
 
     def forward(self, x, return_parts=False):
-        B, T, C, H, W = x.shape
+        B, T, _, H, W = x.shape
+        C = self.C
+        x, extra = x[:, :, :C], x[:, :, C:]
         p_in, n_in = split_flow(x.clamp_min(0))
-        features = torch.cat([
+        features = [
             (p_in * H * W).reshape(B, T * C, H, W),
-            torch.log1p(x.clamp_min(0)).reshape(B, T * C, H, W),
-        ], dim=1)
-        cond = self.vol_enc(torch.log(n_in + EPS).reshape(B, T * C))
+            log_flow(x, self.count_scale, self.count_offset).reshape(B, T * C, H, W),
+        ]
+        log_totals = [torch.log(n_in + EPS).reshape(B, T * C)]
+        if self.aux:
+            features.append(log_flow(extra, self.count_scale, self.count_offset).reshape(B, T * self.aux, H, W))
+            log_totals.append(torch.log(extra.clamp_min(0).sum((-2, -1)) + EPS).reshape(B, T * self.aux))
+        features = torch.cat(features, dim=1)
+        cond = self.vol_enc(torch.cat(log_totals, -1))
         features = F.pad(features, (0, -W % 4, 0, -H % 4))
         u, bottleneck = self.encoder(features, cond)
 
@@ -112,6 +175,11 @@ class DistVolNet(nn.Module):
         n_hat = n_in[:, -1:, :] * torch.exp(delta.clamp(-5, 5))
 
         x_hat = p_hat * n_hat[..., None, None]
+        if self.od_head is not None:   # End(t+1) = within-slot part (above) + arrivals of trips under way
+            arrivals = self.od_head(u, extra[:, -1, 0])
+            x_hat = torch.stack([x_hat[:, :, 0], x_hat[:, :, 1] + arrivals[:, None]], 2)
+            if return_parts:
+                return (x_hat, *split_flow(x_hat))
         if return_parts:
             return x_hat, p_hat, n_hat
         return x_hat

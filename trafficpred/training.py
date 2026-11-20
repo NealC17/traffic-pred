@@ -183,7 +183,7 @@ class Trainer:
         return evaluate(model, loader, self.device, self.splits.span, self.splits.lo, self.amp, desc)
 
     def log_reference(self):
-        reference = CopyLast(self.splits.t_out)
+        reference = CopyLast(self.splits.t_out, self.splits.shape[0] if self.splits.aux_in else None)
         self.tracker.log_reference(val=self.evaluate(reference, self.val_loader, "  copy-last (val)"),
                                    test=self.evaluate(reference, self.test_loader, "  copy-last (test)"))
 

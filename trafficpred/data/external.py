@@ -48,6 +48,19 @@ def features(raw, mean, std):
     return np.concatenate([calendar, weather], axis=1).astype(np.float32)
 
 
+def calendar(start, n, steps_per_day, holidays=()):
+    """Calendar-only features (CALENDAR_NAMES) for n steps from date `start` (YYYY-MM-DD): day of week,
+    a day-off flag (weekend or public holiday) and the time of day. Known ahead, so no weather."""
+    import datetime as dt
+    first = dt.date.fromisoformat(start)
+    off = {dt.date.fromisoformat(d) for d in holidays}
+    days = [first + dt.timedelta(days=int(k)) for k in np.arange(n) // steps_per_day]
+    dow = np.eye(7, dtype=np.float32)[[d.weekday() for d in days]]
+    day_off = np.array([d.weekday() >= 5 or d in off for d in days], np.float32)[:, None]
+    angle = 2 * np.pi * (np.arange(n) % steps_per_day) / steps_per_day
+    return np.concatenate([dow, day_off, np.sin(angle)[:, None], np.cos(angle)[:, None]], 1).astype(np.float32)
+
+
 def window(feats, i, t_in, t_out):
     w = feats[i:i + t_in + t_out].copy()
     w[t_in:, len(CALENDAR_NAMES):] = w[t_in - 1, len(CALENDAR_NAMES):]

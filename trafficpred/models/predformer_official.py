@@ -3,6 +3,8 @@ import os
 import runpy
 import sys
 
+import torch
+
 from trafficpred import EXTERNAL
 
 ROOT = os.environ.get("PREDFORMER_ROOT", os.path.join(EXTERNAL, "PredFormer"))
@@ -56,3 +58,20 @@ def build_official(variant, config):
     _importable()
     module = importlib.import_module(f"openstl.models.PredFormer_{MODULES[variant]}")
     return module.PredFormer_Model(config)
+
+
+class AuxInput(torch.nn.Module):
+    """For models that take C channels in and out: add a learned 1x1 mix of each frame's extra maps
+    (--od) to its flow channels before the model (zero at the start, so it begins as the model alone)."""
+
+    def __init__(self, model, C, aux):
+        super().__init__()
+        self.model, self.C = model, C
+        self.mix = torch.nn.Conv2d(aux, C, 1)
+        torch.nn.init.zeros_(self.mix.weight)
+        torch.nn.init.zeros_(self.mix.bias)
+
+    def forward(self, x):
+        B, T, _, H, W = x.shape
+        flow, extra = x[:, :, :self.C], x[:, :, self.C:]
+        return self.model(flow + self.mix(extra.flatten(0, 1)).reshape(B, T, self.C, H, W))

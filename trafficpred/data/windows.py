@@ -6,9 +6,13 @@ from trafficpred.data import external
 
 
 class FlowWindows(Dataset):
-    def __init__(self, frames, t_in, t_out, lo, hi, ext=None):
+    """aux: (T, K, H, W) extra per-frame input maps (e.g. --od), scaled like the flow and appended to
+    the input frames' channels; the targets stay the flow channels."""
+
+    def __init__(self, frames, t_in, t_out, lo, hi, ext=None, aux=None):
         self.frames = frames
         self.ext = ext
+        self.aux = aux
         self.t_in, self.t_out = t_in, t_out
         self.lo, self.span = lo, max(hi - lo, 1e-8)
         self.n = max(len(frames) - t_in - t_out + 1, 0)
@@ -19,9 +23,15 @@ class FlowWindows(Dataset):
     def __getitem__(self, i):
         w = np.asarray(self.frames[i:i + self.t_in + self.t_out], dtype=np.float32)
         w = torch.from_numpy((w - self.lo) / self.span)
+        x = w[:self.t_in]
+        if self.aux is not None:
+            x = torch.cat([x, self._aux(np.arange(i, i + self.t_in))], 1)
         if self.ext is None:
-            return w[:self.t_in], w[self.t_in:]
-        return w[:self.t_in], w[self.t_in:], torch.from_numpy(external.window(self.ext, i, self.t_in, self.t_out))
+            return x, w[self.t_in:]
+        return x, w[self.t_in:], torch.from_numpy(external.window(self.ext, i, self.t_in, self.t_out))
+
+    def _aux(self, rows):
+        return torch.from_numpy((np.asarray(self.aux[rows], dtype=np.float32) - self.lo) / self.span)
 
 
 class PeriodicFlowWindows(FlowWindows):
@@ -32,8 +42,8 @@ class PeriodicFlowWindows(FlowWindows):
     the most recent frame stays last. Windows without that much history are left out.
     """
 
-    def __init__(self, frames, t_in, t_out, lo, hi, periods, start=0, stop=None):
-        super().__init__(frames, t_in, t_out, lo, hi)
+    def __init__(self, frames, t_in, t_out, lo, hi, periods, start=0, stop=None, aux=None):
+        super().__init__(frames, t_in, t_out, lo, hi, aux=aux)
         self.periods = tuple(periods)
         stop = len(frames) if stop is None else stop
         self.first = max(start, max(self.periods) - t_in)   # target frame i + t_in has P frames before it
@@ -50,6 +60,8 @@ class PeriodicFlowWindows(FlowWindows):
         rows = np.concatenate([targets - p for p in self.periods])
         past = np.asarray(self.frames[rows], dtype=np.float32)
         past = torch.from_numpy((past - self.lo) / self.span)
+        if self.aux is not None:
+            past = torch.cat([past, self._aux(rows)], 1)
         return torch.cat([past, x]), y
 
 
