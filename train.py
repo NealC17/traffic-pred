@@ -174,6 +174,8 @@ def run_name(args, splits, loss, loss_options):
         name += "_timetokens"
     if getattr(args, "log_counts", False):
         name += "_logcounts"
+    if splits.split.get("fold_val"):
+        name += "_foldval"
     if splits.split.get("test_days"):
         name += f"_test{splits.split['test_days']:g}d"
     if splits.split.get("periods"):
@@ -200,6 +202,8 @@ def main(argv=None, epoch_callback=None):
 
     splits = splits_from_args(args)
     model_kwargs = configure_model(args.model, args, splits)
+    if splits.split.get("od_slot") and not model_kwargs.get("od_slot_scale"):
+        raise SystemExit("--od-slot only feeds --od-head (distvol / distvolformer / distvolformer_graph)")
     model = build_model(args.model, model_kwargs)
     if args.grad_checkpoint:
         from trafficpred.models.distvolformer import AdaLNBlock

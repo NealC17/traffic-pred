@@ -274,19 +274,22 @@ class DistVolFormer(nn.Module):
                  heads=6, mlp_dim=768, drop=0.1, code_dim=128, dist_residual=False,
                  transport=0, n_periodic=0, sinkformer=0, time_tokens=False,
                  vol_transformer=False, vol_dim=128, vol_depth=3, graph=False, graph_radius=0,
-                 count_scale=0.0, count_offset=0.0, direct=False, aux=0, od_head=None):
+                 count_scale=0.0, count_offset=0.0, direct=False, aux=0, od_head=None, od_slot_scale=0.0):
         """aux: extra input maps per frame after the C flow channels (--od), fed as log-flow maps next to
         the flow's (in every layout: stacked, time tokens, graph, volume transformer); not predicted.
 
         od_head: the --od-head kernel file. End(t+1) = the factorised part + the trips under way at t moved
         by a transport plan (distvol.ODTransportHead); the destination potential is one more output
-        channel of the distribution head, zero at the start.
+        channel of the distribution head, zero at the start. od_slot_scale > 0 (--od-slot): the last
+        extra map is the frame's time-of-day slot (scaled by 1 / od_slot_scale), read only by the od head
+        for its per-slot prior; aux counts the maps the encoders get.
 
         direct: the ablation without the factorisation -- the same inputs and backbone (the volume
         encoder still conditions the distribution transformer), but the head outputs the flow itself
         instead of softmax logits, and there is no total-volume head."""
         super().__init__()
         self.count_scale, self.count_offset = count_scale, count_offset
+        self.od_slot_scale = od_slot_scale
         if direct and (transport or dist_residual):
             raise ValueError("direct has no distribution to transport / add a residual to")
         self.direct = direct
@@ -346,6 +349,10 @@ class DistVolFormer(nn.Module):
     def forward(self, x, return_parts=False):
         B, T, _, H, W = x.shape
         C, A = self.C, self.aux
+        slot = None
+        if self.od_slot_scale:
+            slot = (x[:, -1, -1, 0, 0] * self.od_slot_scale).round().long()
+            x = x[:, :, :-1]
         x, extra_raw = x[:, :, :C], x[:, :, C:]
         p_in, n_in = split_flow(x.clamp_min(0))
         log_n = torch.log(n_in + EPS).reshape(B, T * C)
@@ -393,7 +400,7 @@ class DistVolFormer(nn.Module):
 
         x_hat = p_hat * n_hat[..., None, None]
         if self.od_head is not None:   # End(t+1) = factorised part (above) + arrivals of trips under way
-            arrivals = self.od_head(None, extra_raw[:, -1, 0], g=g)
+            arrivals = self.od_head(None, extra_raw[:, -1, 0], g=g, slot=slot)
             x_hat = torch.stack([x_hat[:, :, 0], x_hat[:, :, 1] + arrivals[:, None]], 2)
             if return_parts:
                 return (x_hat, *split_flow(x_hat))

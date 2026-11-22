@@ -52,7 +52,8 @@ def od_features(spec, volume, flow_train, flow_test):
     kernel /= kernel.sum(2, keepdims=True)
     in_progress = (start - within_by_origin).clip(0)
     arrivals = np.einsum("ti,tij->tj", in_progress.reshape(T, N), kernel[slot]).reshape(T, H, W)
-    return np.stack([in_progress, arrivals], 1).astype(np.float32), all_day.astype(np.float32)
+    return (np.stack([in_progress, arrivals], 1).astype(np.float32), all_day.astype(np.float32),
+            kernel.astype(np.float32))
 
 
 def main():
@@ -67,13 +68,16 @@ def main():
         spec = DATASETS[name]
         volume = np.asarray(files.load(spec.files()[-1]), dtype=np.float64)
         flow_train, flow_test = (np.load(p)["flow"] for p in paths)
-        aux, kernel = od_features(spec, volume, flow_train, flow_test)
+        aux, kernel, slot_kernel = od_features(spec, volume, flow_train, flow_test)
         del flow_train, flow_test
         out = os.path.join(files.ROOT, folder, "od_aux.npy")
-        np.save(out, aux)
+        if not (os.path.exists(out) and np.array_equal(np.load(out), aux)):   # runs may be reading it
+            np.save(out, aux)
+        np.save(os.path.join(files.ROOT, folder, "od_kernel_slot.npy"), slot_kernel)
         np.save(os.path.join(files.ROOT, folder, "od_kernel.npy"), kernel)
         print(f"{name}: {out} {aux.shape} (in-progress trips, expected arrivals at t+1) and od_kernel.npy "
-              f"{kernel.shape} (the all-day destination kernel P(j | i) of the train split, for --od-head)")
+              f"{kernel.shape} (the all-day destination kernel P(j | i) of the train split, for --od-head) and "
+              f"od_kernel_slot.npy {slot_kernel.shape} (per time-of-day slot, for --od-head --od-slot)")
 
 
 if __name__ == "__main__":

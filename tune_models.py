@@ -112,6 +112,9 @@ def parse_args():
     ap.add_argument("--confirm", action="store_true",
                     help="write train_tuned_models_<dataset>_in<T>.sh with every model's best trial and exit")
     ap.add_argument("--wandb-project", default=WANDB_PROJECT)
+    ap.add_argument("--study-suffix", default="",
+                    help="appended to the study / confirm-script names, to tune a variant (e.g. _odhead for "
+                         "-- --od --od-head) apart from the model's main study")
     ap.add_argument("--stale-minutes", type=float, default=30.0)
     ap.add_argument("train_args", nargs="*", help="after --: train.py arguments for every trial "
                                                   "(the data: --dataset, --t-in, --t-out)")
@@ -127,6 +130,7 @@ def parse_args():
     args.dataset, args.t_in = get("--dataset", "taxibj"), get("--t-in", None)
     args.tag = f"{args.dataset}" + (f"_in{args.t_in}" if args.t_in else "")
     args.tag += "" if args.objective == "all" else f"_{args.objective}"
+    args.tag += args.study_suffix
     args.metric = OBJECTIVES[args.objective]
     return args
 

@@ -7,8 +7,8 @@ prediction; --blend scores the average of whole runs (each run's seeds averaged 
 --split val scores the validation period instead, so a blend can be chosen there and only the
 chosen one scored on test (--search-blends K ranks every blend of 2..K runs).
 
-  # STDN (Yao et al. AAAI'19) on NYCTaxi: next step, pick-up / drop-off apart, cells < 10 dropped
-  python tools/eval_published.py checkpoints/workspaces/published_nyctaxi --threshold 10
+  # STDN (Yao et al. AAAI'19) on NYCTaxi: next step, pick-up / drop-off apart, only cells with true > 10
+  python tools/eval_published.py checkpoints/workspaces/published_nyctaxi --threshold 10.5
 
   # DeepSTN+ / ST-ResNet on BikeNYC: next hour, every cell, both channels together
   python tools/eval_published.py checkpoints/workspaces/published_bikenyc
@@ -55,7 +55,8 @@ def predictions(path, device, split="test", batch_size=128):
 
 
 def metrics(pred, true, threshold):
-    keep = (true >= threshold) if threshold > 0 else torch.ones_like(true, dtype=torch.bool)
+    # targets come back from [0, 1] with float error (a true 10 can read 9.99998): never let that decide
+    keep = (true >= threshold - 1e-3) if threshold > 0 else torch.ones_like(true, dtype=torch.bool)
     err = (pred - true) * keep
     ape = (err.abs() / true.clamp_min(1e-6)) * keep
     sums = {}
@@ -76,7 +77,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], epilog=__doc__.split("\n\n", 1)[1],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("paths", nargs="+", help="checkpoints, or workspace directories (every *.pt in them)")
-    ap.add_argument("--threshold", type=float, default=0, help="only cells with true value >= this (STDN: 10)")
+    ap.add_argument("--threshold", type=float, default=0, help="only cells with true value >= this; counts are integers, so 10.5 = STDN's true > 10, 5.5 = ST-SSL's true > 5")
     ap.add_argument("--steps", type=int, default=1, help="forecast steps to show (default 1: t+1)")
     ap.add_argument("--match", help="only runs whose name matches this regex")
     ap.add_argument("--split", choices=("test", "val"), default="test",

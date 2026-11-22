@@ -29,6 +29,8 @@ def _pick(args, name, default):
 
 
 def _aux(splits):   # only stored when on, so older checkpoints' kwargs stay valid
+    if splits.split.get("od_slot"):   # _od_head strips the slot map again for the models that read it
+        return {"aux": splits.aux_in - 1}
     return {"aux": splits.aux_in} if splits.aux_in else {}
 
 
@@ -61,14 +63,15 @@ def _od_head(args, splits):   # only stored when on, so older checkpoints' kwarg
     from trafficpred.data import files
     from trafficpred.data.datasets import DATASETS
     spec = DATASETS[splits.dataset]
-    if not splits.aux_in or getattr(spec, "od_file", None) is None:
+    if not splits.split.get("od") or getattr(spec, "od_file", None) is None:
         raise SystemExit("--od-head needs --od")
     if splits.lo != 0:
         raise SystemExit("--od-head moves scaled counts: it needs data whose minimum is 0")
-    kernel = os.path.join(files.ROOT, os.path.dirname(spec.od_file), "od_kernel.npy")
+    slot = bool(splits.split.get("od_slot"))
+    kernel = os.path.join(files.ROOT, os.path.dirname(spec.od_file), "od_kernel_slot.npy" if slot else "od_kernel.npy")
     if not os.path.exists(kernel):
         raise SystemExit(f"{kernel} missing: rerun tools/import_stdn_od.py")
-    return {"od_head": kernel}
+    return {"od_head": kernel, **({"od_slot_scale": splits.span} if slot else {})}
 
 
 def _configure_distvol(args, splits):

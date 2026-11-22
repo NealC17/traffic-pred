@@ -84,14 +84,16 @@ class ODTransportHead(nn.Module):
     correction (weight decay pulls it back to the prior), g = a destination potential predicted per
     sample from the encoder features: the dual variable of a singly constrained transport / gravity
     model, which lets the plan follow the time of day and conditions. arrivals_j = sum_i plan_ij.
-    D and g start at 0, so the head starts as the historical kernel."""
+    D and g start at 0, so the head starts as the historical kernel. A (S, N, N) kernel is one per
+    time-of-day slot (--od-slot): each sample starts from its own slot's kernel, D stays shared."""
 
     def __init__(self, kernel, width, H, W):
         """width: features to read the potential from with a 1x1 conv (DistVol); None when the caller
         predicts the potential itself and passes it as g (DistVolFormer's distribution head)."""
         super().__init__()
         N = H * W
-        k = torch.as_tensor(kernel, dtype=torch.float32).reshape(N, N)
+        k = torch.as_tensor(kernel, dtype=torch.float32)
+        k = k.reshape(-1, N, N) if k.ndim == 3 else k.reshape(N, N)
         self.register_buffer("log_prior", torch.log(k.clamp_min(1e-8)))
         self.correction = nn.Parameter(torch.zeros(N, N))
         self.potential = None
@@ -101,24 +103,33 @@ class ODTransportHead(nn.Module):
             nn.init.zeros_(self.potential.bias)
         self.H, self.W = H, W
 
-    def forward(self, u, in_progress, g=None):
+    def forward(self, u, in_progress, g=None, slot=None):
         """u: (B, width, >=H, >=W) features (or None with g: (B, H, W) potentials); in_progress:
-        (B, H, W) -> arrivals (B, H, W)."""
+        (B, H, W); slot: (B,) time-of-day slots, with a per-slot kernel -> arrivals (B, H, W)."""
         B = in_progress.shape[0]
         if g is None:
             g = self.potential(u)[:, 0]
         g = g[:, :self.H, :self.W].reshape(B, 1, -1)
-        plan = (self.log_prior + self.correction + g).softmax(-1)              # (B, N, N), rows sum to 1
+        prior = self.log_prior
+        if prior.ndim == 3:
+            if slot is None:
+                raise ValueError("a per-slot kernel needs each sample's slot (--od-slot)")
+            prior = prior[slot]
+        plan = (prior + self.correction + g).softmax(-1)                       # (B, N, N), rows sum to 1
         arrivals = torch.bmm(in_progress.reshape(B, 1, -1).clamp_min(0), plan)  # (B, 1, N)
         return arrivals.reshape(B, self.H, self.W)
 
 
 class DistVolNet(nn.Module):
     def __init__(self, T_in=4, T_out=4, C=2, H=32, W=32, width=64, dist_residual=False,
-                 transport=0, n_periodic=0, count_scale=0.0, count_offset=0.0, aux=0, od_head=None):
+                 transport=0, n_periodic=0, count_scale=0.0, count_offset=0.0, aux=0, od_head=None,
+                 od_slot_scale=0.0):
         """aux: extra input maps per frame after the C flow channels (--od). They go in as log-flow maps
-        next to the flow's, and their log totals next to the flow's totals; they are not predicted."""
+        next to the flow's, and their log totals next to the flow's totals; they are not predicted.
+        od_slot_scale > 0 (--od-slot): the last of them is the frame's time-of-day slot, scaled by
+        1 / od_slot_scale, read only by the od head; aux counts the maps the encoder gets."""
         super().__init__()
+        self.od_slot_scale = od_slot_scale
         self.count_scale, self.count_offset = count_scale, count_offset
         self.T_in, self.T_out, self.C, self.H, self.W = T_in, T_out, C, H, W
         self.aux = aux
@@ -147,6 +158,10 @@ class DistVolNet(nn.Module):
     def forward(self, x, return_parts=False):
         B, T, _, H, W = x.shape
         C = self.C
+        slot = None
+        if self.od_slot_scale:
+            slot = (x[:, -1, -1, 0, 0] * self.od_slot_scale).round().long()
+            x = x[:, :, :-1]
         x, extra = x[:, :, :C], x[:, :, C:]
         p_in, n_in = split_flow(x.clamp_min(0))
         features = [
@@ -176,7 +191,7 @@ class DistVolNet(nn.Module):
 
         x_hat = p_hat * n_hat[..., None, None]
         if self.od_head is not None:   # End(t+1) = within-slot part (above) + arrivals of trips under way
-            arrivals = self.od_head(u, extra[:, -1, 0])
+            arrivals = self.od_head(u, extra[:, -1, 0], slot=slot)
             x_hat = torch.stack([x_hat[:, :, 0], x_hat[:, :, 1] + arrivals[:, None]], 2)
             if return_parts:
                 return (x_hat, *split_flow(x_hat))

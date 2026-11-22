@@ -13,7 +13,7 @@ from trafficpred.data.windows import (FlowWindows, MovingMNISTGenerator, MovingM
                                       PeriodicFlowWindows, base_datasets, limit)
 
 SPLIT_KEYS = ("train_files", "val_files", "test_files", "train_size", "val_size", "test_size", "external",
-              "periods", "period_shift", "test_days", "od")
+              "periods", "period_shift", "test_days", "od", "od_slot", "ha", "fold_val")
 
 
 @dataclass
@@ -59,6 +59,28 @@ class Splits:
     def input_stats(self, samples=2000):
         x = np.stack([self.train[i][0].numpy()[:, :self.shape[0]] for i in self._sample(samples)])
         return float(x.mean()), float(x.std())
+
+
+def usual_pattern(Y, cut, period):
+    """(T, 2 C, H, W) float32: for every frame f, the mean of the train frames (f < cut) at f's slot of the
+    period and at the next slot: [HA(f), HA(f + 1)]. On a train frame its own value is left out of the
+    mean, so a train target never sees itself in its inputs (val / test frames aren't in the means)."""
+    T = len(Y)
+    slot = np.arange(T + 1) % period
+    sums = np.zeros((period,) + Y.shape[1:])
+    np.add.at(sums, slot[:cut], Y[:cut])
+    n = np.bincount(slot[:cut], minlength=period).astype(np.float64)
+    if n.min() < 2:
+        raise ValueError("--ha needs every slot of the week at least twice in the train split")
+    shape = (-1,) + (1,) * (Y.ndim - 1)
+    def ha(frames):   # frames may reach T (the slot after the last frame)
+        own = np.zeros((len(frames),) + Y.shape[1:])
+        inside = frames < cut
+        own[inside] = Y[frames[inside]]
+        k = n[slot[frames]].reshape(shape) - inside.reshape(shape)
+        return (sums[slot[frames]] - own) / k
+    f = np.arange(T)
+    return np.concatenate([ha(f), ha(f + 1)], 1).astype(np.float32)
 
 
 class GridFlowData:
@@ -107,7 +129,7 @@ class GridFlowData:
 
     def splits(self, name, t_in, t_out, train_files=None, val_files=None, test_files=None,
                train_size=None, val_size=None, test_size=None, external=False, periods=None,
-               period_shift=0, test_days=None, od=False):
+               period_shift=0, test_days=None, od=False, od_slot=False, ha=False, fold_val=False):
         names = self.files()
         if not names:
             hint = f"; {self.source}" if self.source else ""
@@ -115,9 +137,11 @@ class GridFlowData:
         if external and not self.has_external:
             raise ValueError(f"{self.title} has no external data (weather / calendar); drop --external")
         if train_files or val_files or test_files:
+            if fold_val:
+                raise ValueError("--fold-val goes with the time split, not a split by file")
             parts = self._by_file(names, train_files, val_files, test_files)
         else:
-            parts = self._by_time(names, test_days)
+            parts = self._by_time(names, test_days, fold_val)
         frames = [[files.load(n)[rows] for n, rows in group] for group in parts]
         lo = min(float(a.min()) for a in frames[0])
         hi = max(float(a.max()) for a in frames[0])
@@ -132,14 +156,30 @@ class GridFlowData:
             mean, std = ext_data.weather_stats([raw[n][rows] for n, rows in parts[0]])
             ext = [[ext_data.features(raw[n], mean, std)[rows] for n, rows in group] for group in parts]
         aux = [[None] * len(group) for group in parts]
+        if od_slot and not od:
+            raise ValueError("--od-slot goes with --od")
+        maps = []   # extra per-frame input maps, in this order: OD (2), usual pattern (2 C), slot (1)
+        od_maps = None
         if od:
             if self.od_file is None:
                 raise ValueError(f"{self.title} has no origin-destination data; drop --od")
             if train_files or val_files or test_files or test_days or len(names) > 1:
                 raise ValueError("--od goes with the default time split only (its kernel is fitted on that train split)")
-            od_maps = files.load(self.od_file)
-            if len(od_maps) != len(files.load(names[-1])):
+            od_arr = files.load(self.od_file)
+            if len(od_arr) != len(files.load(names[-1])):
                 raise ValueError(f"{self.od_file} doesn't match {names[-1]}; rerun tools/import_stdn_od.py")
+            maps.append(np.asarray(od_arr, dtype=np.float32))
+        if ha:
+            if train_files or val_files or test_files or test_days or len(names) > 1:
+                raise ValueError("--ha goes with the default time split only (its means come from that train split)")
+            maps.append(usual_pattern(np.asarray(files.load(names[-1]), dtype=np.float64),
+                                      parts[0][-1][1].stop, 7 * self.steps_per_day))
+        if od_slot:   # the frame's time-of-day slot, for --od-head's per-slot prior (not an encoder input)
+            T = len(maps[0])
+            slot = (np.arange(T) % self.steps_per_day).astype(np.float32)
+            maps.append(np.broadcast_to(slot[:, None, None, None], (T, 1) + maps[0].shape[2:]))
+        if maps:
+            od_maps = np.concatenate(maps, 1)
             aux = [[od_maps[rows] for _, rows in group] for group in parts]
         windows = lambda i: ConcatDataset([FlowWindows(a, t_in, t_out, lo, hi, e, x)
                                            for a, e, x in zip(frames[i], ext[i], aux[i])])
@@ -156,7 +196,7 @@ class GridFlowData:
             def windows(i):   # the whole file, so the periodic frames can reach back past the split
                 return ConcatDataset([PeriodicFlowWindows(files.load(n), t_in, t_out, lo, hi, steps,
                                                           rows.start or 0, rows.stop,
-                                                          files.load(self.od_file) if od else None)
+                                                          od_maps)
                                       for n, rows in parts[i]])
         split = dict(train_files=train_files, val_files=val_files, test_files=test_files,
                      train_size=train_size, val_size=val_size, test_size=test_size)
@@ -170,12 +210,19 @@ class GridFlowData:
             split["test_days"] = test_days
         if od:
             split["od"] = True
+        if od_slot:
+            split["od_slot"] = True
+        if ha:
+            split["ha"] = True
+        if fold_val:
+            split["fold_val"] = True
         return Splits(name, limit(windows(0), train_size, "train"),
                       limit(windows(1), val_size, "val"), limit(windows(2), test_size, "test"),
                       lo, hi, self.channels, t_in, t_out, split, spatial_features=self._spatial(),
                       ext_dim=(len(ext_data.CALENDAR_NAMES) if self.calendar else ext_data.DIM) if external else 0,
                       extra_in=extra_in,
-                      extra_lags=extra_lags, trend_lags=trend_lags, aux_in=2 if od else 0)
+                      extra_lags=extra_lags, trend_lags=trend_lags,
+                      aux_in=0 if od_maps is None else od_maps.shape[1])
 
     def _spatial(self):
         if self.spatial_file is None:
@@ -184,7 +231,9 @@ class GridFlowData:
         f = f.reshape(f.shape[0], -1).T
         return (f - f.mean(0)) / (f.std(0) + 1e-6)
 
-    def _by_time(self, names, test_days=None):
+    def _by_time(self, names, test_days=None, fold_val=False):
+        """fold_val: train on every frame before the test period; val stays the same frames (now seen in
+        training, so only a training curve)."""
         *head, last = names
         test_frames = round(test_days * self.steps_per_day) if test_days else self.test_frames
         cut_test = len(files.load(last)) - test_frames
@@ -192,7 +241,7 @@ class GridFlowData:
         if cut_val <= 0:
             raise ValueError(f"{last} is too short for the val and test periods")
         everything = slice(None)
-        train = [(n, everything) for n in head] + [(last, slice(0, cut_val))]
+        train = [(n, everything) for n in head] + [(last, slice(0, cut_test if fold_val else cut_val))]
         return train, [(last, slice(cut_val, cut_test))], [(last, slice(cut_test, None))]
 
     def _by_file(self, names, train_files, val_files, test_files):
@@ -239,17 +288,21 @@ class MovingMNISTData:
 
 
 class _ArrayWindows(Dataset):
-    """Fixed (x, y) windows, (S, L, C, H, W) raw counts, scaled to 0-1 by lo / hi on access."""
+    """Fixed (x, y) windows, (S, L, C, H, W) raw counts, scaled to 0-1 by lo / hi on access.
+    aux: (S, L, K, H, W) extra input maps per frame (--od), scaled the same way and appended to x."""
 
-    def __init__(self, x, y, lo, hi):
-        self.x, self.y, self.lo, self.span = x, y, lo, max(hi - lo, 1e-8)
+    def __init__(self, x, y, lo, hi, aux=None):
+        self.x, self.y, self.lo, self.span, self.aux = x, y, lo, max(hi - lo, 1e-8), aux
 
     def __len__(self):
         return len(self.x)
 
     def __getitem__(self, i):
         scale = lambda a: torch.from_numpy((np.asarray(a, dtype=np.float32) - self.lo) / self.span)
-        return scale(self.x[i]), scale(self.y[i])
+        x = scale(self.x[i])
+        if self.aux is not None:
+            x = torch.cat([x, scale(self.aux[i])], 1)
+        return x, scale(self.y[i])
 
 
 class StsslData:
@@ -258,8 +311,11 @@ class StsslData:
     ending at 0) plus, as the periodic frames, the target time +-k steps on each of the 3 days before."""
     SOURCE = "download https://github.com/Echo-Ji/ST-SSL_Dataset and run tools/import_stssl.py on it"
 
-    def __init__(self, title, folder, channels=("Inflow", "Outflow")):
+    def __init__(self, title, folder, channels=("Inflow", "Outflow"), od_file=None, steps_per_day=48):
+        """od_file: the same city's per-frame OD maps (tools/import_stdn_od.py) when the release's windows
+        are consecutive frames of that dataset (NYCTaxi / NYCBike2: checked on load); for --od."""
         self.title, self.folder, self.channels = title, folder, channels
+        self.od_file, self.steps_per_day = od_file, steps_per_day
 
     def _path(self, name):
         path = os.path.join(files.ROOT, "STSSL", self.folder, name)
@@ -281,7 +337,9 @@ class StsslData:
 
     def splits(self, name, t_in, t_out, train_files=None, val_files=None, test_files=None,
                train_size=None, val_size=None, test_size=None, external=False, periods=None,
-               period_shift=0, test_days=None):
+               period_shift=0, test_days=None, od=False, od_slot=False, ha=False, fold_val=False):
+        if ha or fold_val:
+            raise ValueError(f"{self.title} is a fixed set of windows: --ha / --fold-val need a grid flow dataset with a time axis")
         if external or periods or period_shift or test_days or train_files or val_files or test_files:
             raise ValueError(f"{self.title} is a fixed set of windows: no --external / --periods / "
                              "--period-shift / --test-days / --*-files")
@@ -292,13 +350,52 @@ class StsslData:
                   for s in ("train", "val", "test") for k in ("x", "y")}
         lo = float(min(arrays["train_x"].min(), arrays["train_y"].min()))
         hi = float(max(arrays["train_x"].max(), arrays["train_y"].max()))
-        part = lambda s: _ArrayWindows(arrays[f"{s}_x"], arrays[f"{s}_y"], lo, hi)
         offs = self.offsets
+        aux = {s: None for s in ("train", "val", "test")}
+        if od_slot and not od:
+            raise ValueError("--od-slot goes with --od")
+        if od:
+            aux = self._od_windows(arrays, offs, od_slot)
+        part = lambda s: _ArrayWindows(arrays[f"{s}_x"], arrays[f"{s}_y"], lo, hi, aux[s])
         extra_lags = tuple(1 - o for o in offs[:len(offs) - t_in])   # steps before the target
         split = dict(train_size=train_size, val_size=val_size, test_size=test_size)
+        if od:
+            split["od"] = True
+        if od_slot:
+            split["od_slot"] = True
         return Splits(name, limit(part("train"), train_size, "train"), limit(part("val"), val_size, "val"),
                       limit(part("test"), test_size, "test"), lo, hi, self.channels, t_in, t_out, split,
-                      extra_in=len(extra_lags), extra_lags=extra_lags)
+                      extra_in=len(extra_lags), extra_lags=extra_lags,
+                      aux_in=(2 + bool(od_slot)) if od else 0)
+
+    def _od_windows(self, arrays, offs, od_slot):
+        """The OD maps of every input frame of every window, (S, L, K, H, W) per split. The release's
+        windows are the frames of the STDN copy in order (target of window k = frame first + k);
+        that is checked on the targets and the inputs before anything is used."""
+        if self.od_file is None:
+            raise ValueError(f"{self.title} has no origin-destination data; drop --od")
+        city = DATASETS[self.folder.lower()]
+        volume = files.load(city.files()[-1])
+        od_maps = np.asarray(files.load(self.od_file), dtype=np.float32)
+        if od_slot:
+            slot = (np.arange(len(od_maps)) % self.steps_per_day).astype(np.float32)
+            od_maps = np.concatenate([od_maps, np.broadcast_to(slot[:, None, None, None],
+                                                               (len(od_maps), 1) + od_maps.shape[2:])], 1)
+        n = [len(arrays[f"{s}_y"]) for s in ("train", "val", "test")]
+        first = len(volume) - sum(n)
+        out, start = {}, first
+        for s, k in zip(("train", "val", "test"), n):
+            t = np.arange(start, start + k)                                  # target frames
+            rows = t[:, None] - 1 + np.asarray(offs)[None, :]                # (S, L) input frames
+            if (rows.min() < 0 or not np.array_equal(arrays[f"{s}_y"][:, 0], volume[t])
+                    or not np.array_equal(arrays[f"{s}_x"][:, -1], volume[t - 1])
+                    or not np.array_equal(arrays[f"{s}_x"][:, 0], volume[rows[:, 0]])):
+                raise ValueError(f"{self.title}'s {s} windows aren't consecutive frames of {self.od_file}'s city")
+            out[s] = od_maps[rows]
+            start += k
+        if len(volume) - city.test_frames - city.val_frames > first + n[0]:   # the kernel's train frames
+            raise ValueError("the OD kernel's train frames reach into this split's val / test windows")
+        return out
 
 
 class SyntheticData:
@@ -368,9 +465,9 @@ DATASETS = {
     # ST-SSL (AAAI'23) windows: the paper's 7:1:2 split, input = recent frames + the target time
     # +-4 steps (+-2 for NYCBike1) on each of the 3 days before. NYCTaxi / NYCBike2 are STDN's data,
     # NYCBike1 / BJTaxi ST-ResNet's. Score as the paper does: MAE / MAPE on cells with true > 5.
-    "stssl_nyctaxi": StsslData("ST-SSL NYCTaxi", "NYCTaxi", ("Start", "End")),
+    "stssl_nyctaxi": StsslData("ST-SSL NYCTaxi", "NYCTaxi", ("Start", "End"), od_file="NYCTaxi/od_aux.npy"),
     "stssl_nycbike1": StsslData("ST-SSL NYCBike1", "NYCBike1"),
-    "stssl_nycbike2": StsslData("ST-SSL NYCBike2", "NYCBike2", ("Start", "End")),
+    "stssl_nycbike2": StsslData("ST-SSL NYCBike2", "NYCBike2", ("Start", "End"), od_file="NYCBike2/od_aux.npy"),
     "stssl_bjtaxi": StsslData("ST-SSL BJTaxi", "BJTaxi"),
     "mmnist": MovingMNISTData(),
     "synthetic": SyntheticData(),
@@ -382,18 +479,14 @@ def get_splits(dataset="taxibj", t_in=None, t_out=None, **split):
     t_in = t_in or spec.horizon[0]
     t_out = t_out or spec.horizon[1]
     split = {k: v for k, v in split.items() if k in SPLIT_KEYS}
-    if not split.get("periods"):
-        split.pop("periods", None)
-    if not split.get("period_shift"):
-        split.pop("period_shift", None)
-    if not split.get("test_days"):
-        split.pop("test_days", None)
-    if not split.get("od"):
-        split.pop("od", None)
-    elif not isinstance(spec, GridFlowData):
-        raise ValueError(f"--test-days needs a grid flow dataset with a time axis, not {dataset}")
-    elif not isinstance(spec, GridFlowData):
-        raise ValueError(f"--periods needs a grid flow dataset with a time axis, not {dataset}")
+    for key in ("periods", "period_shift", "test_days", "od", "od_slot", "ha", "fold_val"):
+        if not split.get(key):
+            split.pop(key, None)
+    for key, flag in (("test_days", "--test-days"), ("periods", "--periods")):
+        if key in split and not isinstance(spec, GridFlowData):
+            raise ValueError(f"{flag} needs a grid flow dataset with a time axis, not {dataset}")
+    if ("od" in split or "od_slot" in split) and getattr(spec, "od_file", None) is None:
+        raise ValueError(f"--od needs origin-destination data (nyctaxi, nycbike2 and their stssl_ windows), not {dataset}")
     return spec.splits(dataset, t_in, t_out, **split)
 
 
@@ -436,6 +529,18 @@ def add_data_args(ap):
                    help="nyctaxi / nycbike2: two more input maps per frame from STDN's origin-destination "
                         "flows (tools/import_stdn_od.py): trips under way by origin, and where they are expected "
                         "to arrive next step. Every model takes them; the targets stay Start / End")
+    g.add_argument("--od-slot", action="store_true",
+                   help="with --od and --od-head: also pass each frame's time-of-day slot, so the transport "
+                        "head starts from that slot's destination kernel instead of the all-day one. Only the "
+                        "head reads it; the encoders see the same inputs as with --od alone")
+    g.add_argument("--ha", action="store_true",
+                   help="grid datasets: 2 C more input maps per frame, the usual value of every channel at that "
+                        "frame's time of week and at the next one (train-period means; on train frames the frame "
+                        "itself is left out). Every model takes them; the targets stay the flow")
+    g.add_argument("--fold-val", action="store_true",
+                   help="time split only: train on every frame before the test period (train + val) and keep "
+                        "the last epoch's model; val is then in-sample and selects nothing. Fix the epochs from "
+                        "a run without it")
     g.add_argument("--external", action="store_true",
                    help="stresnet only: feed TaxiBJ's external data (TaxiBJext: day of week, weekend, "
                         "time of day, temperature, wind, weather type) to its external component")

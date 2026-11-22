@@ -215,7 +215,8 @@ class Trainer:
                                   epoch_time=time.time() - t0, model=self.net, dataset=self.splits.val,
                                   device=self.device, span=self.splits.span, lo=self.splits.lo,
                                   channels=self.splits.channels, last=epoch == s.epochs)
-            improved = m[s.select] < self.best
+            # --fold-val: val is in-sample, so it selects nothing: the last epoch is kept
+            improved = m[s.select] < self.best or bool(self.splits.split.get("fold_val"))
             if improved:
                 self.best, self.bad_epochs = m[s.select], 0
                 self._save_best(epoch, m)
@@ -231,7 +232,7 @@ class Trainer:
                 tqdm.write(f"stopped after epoch {epoch} by the caller (e.g. pruned by the tuner)")
                 self.tracker.finish()
                 return None
-            if s.patience and self.bad_epochs >= s.patience:
+            if s.patience and self.bad_epochs >= s.patience and not self.splits.split.get("fold_val"):
                 tqdm.write(f"early stop: no val improvement for {s.patience} epochs")
                 break
         return self._final()
