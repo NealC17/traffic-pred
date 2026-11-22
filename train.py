@@ -67,7 +67,8 @@ def parse_args(argv=None):
 
     g = ap.add_argument_group(
         "sinkhorn losses",
-        "sinkhorn = 1 L1 + 10 Sinkhorn + 1 volume; sinkhorn_only = Sinkhorn; sinkhorn_vol = 10 Sinkhorn + "
+        "sinkhorn = 1 L1 + 10 Sinkhorn + 1 volume; sinkhorn_unbalanced = the same with unbalanced Sinkhorn "
+        "on the count maps (--reach); sinkhorn_only = Sinkhorn; sinkhorn_vol = 10 Sinkhorn + "
         "1 volume; kl = 1 L1 + 0.1 KL(p || p_hat) + 1 volume; sinkhorn_kl = 1 L1 + 10 Sinkhorn + 1 volume + "
         "0.1 KL; sinkhorn_vol_uw = (Sinkhorn, volume) with learned uncertainty weights; "
         "sinkhorn_vol_mse = 10 Sinkhorn + 500 squared volume error; sinkhorn_vol_mse_uw = (Sinkhorn, squared "
@@ -97,6 +98,9 @@ def parse_args(argv=None):
     g.add_argument("--adapt-every", type=int,
                    help="sinkhorn_adaptive: measure the gradients every N steps (default 10)")
     g.add_argument("--eps", type=float, help="Sinkhorn blur (default 0.01; sinkhorn_change: 0.002)")
+    g.add_argument("--reach", type=float,
+                   help="sinkhorn_unbalanced: transport reach R (rho = R^2), in grid-side units like the blur "
+                        "(default 0.3); farther mismatches are paid as local mass excess / shortfall")
     g.add_argument("--sinkhorn-iters", type=int, help="default 30 (sinkhorn_change: 60)")
     g.add_argument("--sinkhorn-anneal", action=argparse.BooleanOptionalAction, default=None,
                    help="epsilon scaling: lower eps from the grid's largest cost to --eps over the first half of "
@@ -119,7 +123,7 @@ def choose_loss(args, spec):
 
 def choose_loss_options(args, loss):
     options = default_options(loss)
-    given = {k: getattr(args, k) for k in ("l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "huber_delta", "eps", "sinkhorn_iters", "sinkhorn_anneal",
+    given = {k: getattr(args, k) for k in ("l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "huber_delta", "eps", "reach", "sinkhorn_iters", "sinkhorn_anneal",
                                            "adapt_beta", "adapt_every")
              if getattr(args, k) is not None}
     if "sinkhorn_anneal" in given and "eps" in options:   # every Sinkhorn loss takes it; only

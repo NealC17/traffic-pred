@@ -76,7 +76,7 @@ def _differences(mine, theirs):
 
 def make_loaders(splits, settings, device):
     cuda = device.type == "cuda"
-    on_gpu = settings.data_on_gpu == "yes" or (settings.data_on_gpu == "auto" and cuda)
+    on_gpu = settings.data_on_gpu == "yes" or (settings.data_on_gpu == "auto" and device.type in ("cuda", "mps"))
     plan = (("train", splits.train, settings.batch_size, True, splits.train_is_fixed),
             ("val", splits.val, settings.eval_batch_size, False, True),
             ("test", splits.test, settings.eval_batch_size, False, True))
@@ -87,8 +87,13 @@ def make_loaders(splits, settings, device):
                 loaders[name] = DeviceBatches(ds, batch_size, device, shuffle=train, drop_last=train,
                                               workers=settings.workers)
                 continue
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
+            except RuntimeError as e:   # CUDA's OutOfMemoryError, or MPS's "out of memory" RuntimeError
+                if "out of memory" not in str(e).lower():
+                    raise
+                if cuda:
+                    torch.cuda.empty_cache()
+                elif device.type == "mps":
+                    torch.mps.empty_cache()
                 print(f"{name} split doesn't fit on the GPU; using a DataLoader")
         loaders[name] = DataLoader(ds, batch_size, shuffle=train, drop_last=train,
                                    num_workers=settings.workers, pin_memory=cuda,

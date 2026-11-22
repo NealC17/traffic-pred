@@ -24,6 +24,12 @@ Their terms are
 and they differ only in which terms are trained and how the terms are combined:
 
     sinkhorn         1 * reconstruction + 10 * transport + 1 * volume   (fixed weights)
+    sinkhorn_unbalanced  1 * reconstruction + 10 * unbalanced transport + 1 * volume: the same as sinkhorn,
+                     but the transport term is the unbalanced divergence (--reach R, default 0.3 of the
+                     grid side) between the count maps x_hat / n and x / n (n = the true frame total,
+                     so the true map has mass 1 as in `sinkhorn`). Mass may be created or destroyed
+                     locally at a price, so a regional excess farther than ~R is paid where it is,
+                     instead of being transported in from elsewhere as the normalized shapes force
     sinkhorn_only    transport alone
     sinkhorn_vol     10 * transport + 1 * volume
     sinkhorn_vol_mse 10 * transport + 500 * volume_mse   (500 = 1 / (2 * volume error) of tuned DistVol on
@@ -67,6 +73,7 @@ CHANGE_WEIGHT = 0.3
 CHANGE_FLOOR = 1e-2
 WEIGHTED = {  # name -> default weights: l1 reconstruction, l2 transport, l3 volume, l4 kl
     "sinkhorn": dict(l1=1.0, l2=10.0, l3=1.0),
+    "sinkhorn_unbalanced": dict(l1=1.0, l2=10.0, l3=1.0),
     "sinkhorn_only": dict(l1=0.0, l2=10.0, l3=0.0),
     "sinkhorn_vol": dict(l1=0.0, l2=10.0, l3=1.0),
     "kl": dict(l1=1.0, l2=0.0, l3=1.0, l4=0.1),
@@ -79,6 +86,7 @@ KL_FLOOR = 1e-12
 UNCERTAINTY = {"sinkhorn_vol_uw": ("sinkhorn", "volume"), "sinkhorn_vol_mse_uw": ("sinkhorn", "volume_mse")}
 ADAPTIVE = ("sinkhorn_adaptive",)
 SINKHORN_DEFAULTS = dict(eps=0.01, sinkhorn_iters=30)
+UNBALANCED_DEFAULTS = dict(reach=0.3)   # sinkhorn_unbalanced's
 ADAPTIVE_DEFAULTS = dict(l1=1.0, l2=1.0, l3=1.0, adapt_beta=0.95, adapt_every=10)
 
 PARTS_LOSSES = (*WEIGHTED, *UNCERTAINTY, *ADAPTIVE)
@@ -135,9 +143,9 @@ class DistVolTerms(nn.Module):
     anneal = False   # epsilon scaling in the Sinkhorn terms (set by make_loss)
     low_weight, threshold = 1.0, None   # --low-weight on the reconstruction terms (set by make_loss)
 
-    def __init__(self, eps=0.01, iters=30, huber_delta=0.01):
+    def __init__(self, eps=0.01, iters=30, huber_delta=0.01, reach=None):
         super().__init__()
-        self.eps, self.iters, self.huber_delta = eps, iters, huber_delta
+        self.eps, self.iters, self.huber_delta, self.reach = eps, iters, huber_delta, reach
 
     def terms(self, parts, y, transport=True, x=None, change=False):
         x_hat, p_hat, n_hat = (t.float() for t in parts)
@@ -154,7 +162,12 @@ class DistVolTerms(nn.Module):
                "volume": (n_hat - n).abs().mean() / (H * W),
                "volume_mse": ((n_hat - n) / (H * W)).pow(2).mean(),
                "kl": kl_divergence(p, p_hat)}
-        if transport:
+        if transport and self.reach is not None:   # unbalanced, on the counts over the true total
+            scale = n.detach().reshape(-1, 1, 1).clamp_min(1e-6)
+            out["sinkhorn"] = sinkhorn_divergence(x_hat.reshape(-1, H, W) / scale, y.reshape(-1, H, W) / scale,
+                                                  eps=self.eps, iters=self.iters, anneal=self.anneal,
+                                                  reach=self.reach).mean()
+        elif transport:
             out["sinkhorn"] = sinkhorn_divergence(p_hat.reshape(-1, H, W), p.reshape(-1, H, W),
                                                   eps=self.eps, iters=self.iters,
                                                   anneal=self.anneal).mean()
@@ -170,8 +183,8 @@ class DistVolLoss(DistVolTerms):
     + l6 * squared error + l7 * huber."""
 
     def __init__(self, l1=1.0, l2=10.0, l3=1.0, l4=0.0, l5=0.0, l6=0.0, l7=0.0, l8=0.0, huber_delta=0.01,
-                 eps=0.01, iters=30):
-        super().__init__(eps, iters, huber_delta)
+                 eps=0.01, iters=30, reach=None):
+        super().__init__(eps, iters, huber_delta, reach)
         self.weights = {"l1": l1, "sinkhorn": l2, "volume": l3, "kl": l4, "change": l5, "mse": l6,
                         "huber": l7, "volume_mse": l8}
         self.needs_input = l5 > 0
@@ -280,7 +293,8 @@ def default_options(name):
     """The options a loss is built with when nothing is overridden (stored with each run)."""
     if name in WEIGHTED:
         return dict({"l6": 0.0, "l7": 0.0, "l8": 0.0, **WEIGHTED[name]}, huber_delta=0.01,
-                    **(SHARP_SINKHORN if "l5" in WEIGHTED[name] else SINKHORN_DEFAULTS))
+                    **(SHARP_SINKHORN if "l5" in WEIGHTED[name] else SINKHORN_DEFAULTS),
+                    **(UNBALANCED_DEFAULTS if name == "sinkhorn_unbalanced" else {}))
     if name in UNCERTAINTY:
         return dict(SINKHORN_DEFAULTS)
     if name in ADAPTIVE:

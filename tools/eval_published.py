@@ -34,7 +34,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from trafficpred.checkpoints import load_model, splits_for
-from trafficpred.utils import predict
+from trafficpred.utils import pick_device, predict
 
 
 @torch.no_grad()
@@ -92,7 +92,7 @@ def main():
     ap.add_argument("--batch-size", type=int, default=128,
                     help="windows per forward pass (lower it for big models: ST-SSL DistVolFormer needs 16)")
     args = ap.parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = pick_device()
     paths = []
     for p in args.paths:
         paths += sorted(glob.glob(os.path.join(p, "*.pt"))) if os.path.isdir(p) else [p]
