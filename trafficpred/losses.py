@@ -253,7 +253,7 @@ class AdaptiveLoss(DistVolTerms):
         self.alphas = {"l1": l1, "sinkhorn": l2, "volume": l3}
         self.beta, self.every = beta, every
         self.params = []
-        self.register_buffer("sq_norms", torch.zeros(len(self.TERMS), dtype=torch.float64))
+        self.register_buffer("sq_norms", torch.zeros(len(self.TERMS)))   # float32: MPS has no float64
         self.register_buffer("updates", torch.zeros((), dtype=torch.long))
         self.register_buffer("calls", torch.zeros((), dtype=torch.long))
 
@@ -267,8 +267,8 @@ class AdaptiveLoss(DistVolTerms):
                 norms.append(0.0)
                 continue
             grads = torch.autograd.grad(terms[k], self.params, retain_graph=True, allow_unused=True)
-            norms.append(sum(float(g.double().pow(2).sum()) for g in grads if g is not None))
-        new = torch.tensor(norms, dtype=torch.float64, device=self.sq_norms.device)
+            norms.append(sum(float(g.detach().float().pow(2).sum()) for g in grads if g is not None))
+        new = torch.tensor(norms, dtype=self.sq_norms.dtype, device=self.sq_norms.device)
         self.sq_norms.mul_(self.beta).add_((1 - self.beta) * new)
         self.updates += 1
 

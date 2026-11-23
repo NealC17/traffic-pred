@@ -33,7 +33,7 @@ class _Totals:
         self.sums[name] += per_step.to(self.sums[name].dtype)
 
     def numpy(self):
-        return {k: v.double().cpu() for k, v in self.sums.items()}
+        return {k: v.cpu().double() for k, v in self.sums.items()}   # to the CPU first: MPS has no float64
 
 
 @torch.no_grad()
