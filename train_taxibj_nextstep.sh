@@ -18,9 +18,11 @@
 #
 #   ./train_taxibj_nextstep.sh            all runs (rerun to resume)
 #   ./train_taxibj_nextstep.sh --list     the runs; other train_all.sh options work too
+#   ./train_taxibj_nextstep.sh --time     time 1 epoch of each run (nothing saved, no W&B) and estimate the
+#                                         full run; --time distvolformer times only matching runs
 case " $* " in
     *" -h "*|*" --help "*)
-        sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+        sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
         echo; echo "Options (from train_all.sh):"; echo
         bash "$(dirname "${BASH_SOURCE[0]}")/train_all.sh" --help | sed -n '/^  \.\/train_all.sh/,/^$/p'
         exit 0 ;;
@@ -30,6 +32,7 @@ if [ "$(uname -s)" = Darwin ]; then
     export PYTORCH_ENABLE_MPS_FALLBACK="${PYTORCH_ENABLE_MPS_FALLBACK:-1}"
 fi
 
+orig=("$@")
 set -- --dataset taxibj --tin 3 --tout 1 "$@"
 P="--periods day week"
 SCRIPT_NAME=./train_taxibj_nextstep.sh
@@ -47,5 +50,46 @@ RUNS=(
     "distvolformer_sinkhorn distvolformer sinkhorn $P"
     "distvolformer_sinkhorn_unbalanced distvolformer sinkhorn_unbalanced $P"
 )
+
+# --time: one epoch of every run (seed 42), nothing saved, no W&B; prints each run's seconds per epoch and
+# the full run's estimate (EPOCHS x seeds). The workspace is not touched, so the real run starts clean.
+#   ./train_taxibj_nextstep.sh --time              (add a filter, e.g. --time distvolformer)
+case " $* " in
+    *" --time "*)
+        cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
+        filters=()
+        for a in "${orig[@]}"; do case "$a" in --*) ;; *) filters+=("$a") ;; esac; done
+        EPOCHS=50
+        total=0
+        printf "%-36s %10s %12s %14s\n" run "s / epoch" "1 epoch (s)" "full est. (h)"
+        for r in "${RUNS[@]}"; do
+            read -r name model loss extra <<< "$r"
+            if [ ${#filters[@]} -gt 0 ]; then
+                hit=0; for f in "${filters[@]}"; do case "$name" in *"$f"*) hit=1 ;; esac; done
+                [ "$hit" = 1 ] || continue
+            fi
+            t0=$(date +%s)
+            # shellcheck disable=SC2086
+            out=$("${PYTHON:-python}" -u train.py --model "$model" --loss "$loss" $extra \
+                  --dataset taxibj --t-in 3 --t-out 1 --seed 42 --workers 0 --epochs 1 --no-save --no-wandb 2>&1 \
+                  | tr '\r' '\n')
+            wall=$(( $(date +%s) - t0 ))
+            ep=$(printf '%s\n' "$out" | grep -E '^ *ep +1 \|' | tail -1 | sed -E 's/.*\| *([0-9.]+)s.*/\1/')
+            if [ -z "$ep" ]; then
+                if printf '%s\n' "$out" | grep -qiE 'error|traceback'; then
+                    printf "%-36s FAILED:\n" "$name"; printf '%s\n' "$out" | grep -iE 'error' | tail -3
+                    continue
+                fi
+                ep=$wall
+            fi
+            seeds=${#SEEDS[@]}; [ "$model" = copy_last ] && seeds=1
+            est=$(awk -v e="$ep" -v n="$EPOCHS" -v s="$seeds" -v m="$model" \
+                  'BEGIN { if (m == "copy_last") n = 0; printf "%.2f", e * n * s / 3600 }')
+            total=$(awk -v t="$total" -v e="$est" 'BEGIN { printf "%.2f", t + e }')
+            printf "%-36s %10s %12s %14s\n" "$name" "$ep" "$wall" "$est"
+        done
+        echo "total estimate: ${total} h for ${#SEEDS[@]} seeds x $EPOCHS epochs (epoch time only; add ~1 min per run)"
+        exit 0 ;;
+esac
 
 source "$(dirname "${BASH_SOURCE[0]}")/train_all.sh" "$@"
