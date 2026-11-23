@@ -38,6 +38,8 @@ and they differ only in which terms are trained and how the terms are combined:
     sinkhorn_kl      1 * reconstruction + 10 * transport + 1 * volume + 0.1 * kl
     sinkhorn_change  1 * reconstruction + 1 * volume + 0.3 * change, with sharp, converged Sinkhorn
                      (eps 0.002 = blur ~1.4 cells, 60 epsilon-scaled iterations)
+    sinkhorn_change_unbalanced  sinkhorn_change with the change term unbalanced (--reach, default 0.3): the
+                     increase / decrease maps over the true map's mass, not each normalized to sum 1
     sinkhorn_vol_uw  the vector (transport, volume), combined by learned uncertainty weights
                      (Kendall, Gal & Cipolla 2018): sum_i exp(-s_i) * L_i + s_i
     sinkhorn_vol_mse_uw  the vector (transport, volume_mse), the same uncertainty weights
@@ -79,6 +81,7 @@ WEIGHTED = {  # name -> default weights: l1 reconstruction, l2 transport, l3 vol
     "kl": dict(l1=1.0, l2=0.0, l3=1.0, l4=0.1),
     "sinkhorn_kl": dict(l1=1.0, l2=10.0, l3=1.0, l4=0.1),
     "sinkhorn_change": dict(l1=1.0, l2=0.0, l3=1.0, l5=CHANGE_WEIGHT),
+    "sinkhorn_change_unbalanced": dict(l1=1.0, l2=0.0, l3=1.0, l5=CHANGE_WEIGHT),
     "sinkhorn_vol_mse": dict(l1=0.0, l2=10.0, l3=0.0, l8=500.0),
 }
 SHARP_SINKHORN = dict(eps=0.002, sinkhorn_iters=60, sinkhorn_anneal=True)   # sinkhorn_change's
@@ -122,11 +125,13 @@ def kl_divergence(p, p_hat):
     return torch.where(p > 0, p * log_ratio, torch.zeros_like(p)).sum(dim=(-2, -1)).mean()
 
 
-def change_transport(x_hat, y, x_last, eps, iters, anneal):
+def change_transport(x_hat, y, x_last, eps, iters, anneal, reach=None):
     """Sinkhorn between where the flow grows (and shrinks) relative to the last input frame in
     the prediction and in truth, each normalized to a distribution; maps weighted by their true
     change. A floor of CHANGE_FLOOR * the mean true change keeps a map with almost no predicted
-    growth from blowing up the normalization's gradient."""
+    growth from blowing up the normalization's gradient. reach=R: unbalanced (rho = R^2) between
+    the change maps over the true map's mass instead (true map mass 1, predicted map its own mass),
+    so too much or too little predicted change is paid locally rather than normalized away."""
     H, W = y.shape[-2:]
     d_hat = (x_hat - x_last).reshape(-1, H, W)
     d = (y - x_last).reshape(-1, H, W)
@@ -134,7 +139,11 @@ def change_transport(x_hat, y, x_last, eps, iters, anneal):
     b = torch.cat([d.clamp_min(0), (-d).clamp_min(0)])
     mass = b.sum(dim=(-2, -1))
     floor = CHANGE_FLOOR * mass.mean().detach() / (H * W)
-    s = sinkhorn_divergence(a + floor, b + floor, eps=eps, iters=iters, anneal=anneal)
+    if reach is None:
+        s = sinkhorn_divergence(a + floor, b + floor, eps=eps, iters=iters, anneal=anneal)
+    else:
+        scale = mass.detach().clamp_min(floor * H * W)[:, None, None]
+        s = sinkhorn_divergence(a / scale, b / scale, eps=eps, iters=iters, anneal=anneal, reach=reach)
     return (s * mass).sum() / mass.sum().clamp_min(1e-12)
 
 
@@ -174,7 +183,8 @@ class DistVolTerms(nn.Module):
         if change:
             if x is None:
                 raise RuntimeError("the change term needs the input frames: loss(parts, y, x=x)")
-            out["change"] = change_transport(x_hat, y, x[:, -1:, :y.shape[2]].float(), self.eps, self.iters, self.anneal)
+            out["change"] = change_transport(x_hat, y, x[:, -1:, :y.shape[2]].float(), self.eps, self.iters, self.anneal,
+                                              self.reach)
         return out
 
 
@@ -294,7 +304,7 @@ def default_options(name):
     if name in WEIGHTED:
         return dict({"l6": 0.0, "l7": 0.0, "l8": 0.0, **WEIGHTED[name]}, huber_delta=0.01,
                     **(SHARP_SINKHORN if "l5" in WEIGHTED[name] else SINKHORN_DEFAULTS),
-                    **(UNBALANCED_DEFAULTS if name == "sinkhorn_unbalanced" else {}))
+                    **(UNBALANCED_DEFAULTS if name.endswith("_unbalanced") else {}))
     if name in UNCERTAINTY:
         return dict(SINKHORN_DEFAULTS)
     if name in ADAPTIVE:

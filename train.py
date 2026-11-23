@@ -99,7 +99,7 @@ def parse_args(argv=None):
                    help="sinkhorn_adaptive: measure the gradients every N steps (default 10)")
     g.add_argument("--eps", type=float, help="Sinkhorn blur (default 0.01; sinkhorn_change: 0.002)")
     g.add_argument("--reach", type=float,
-                   help="sinkhorn_unbalanced: transport reach R (rho = R^2), in grid-side units like the blur "
+                   help="sinkhorn_unbalanced / sinkhorn_change_unbalanced: transport reach R (rho = R^2), in grid-side units like the blur "
                         "(default 0.3); farther mismatches are paid as local mass excess / shortfall")
     g.add_argument("--sinkhorn-iters", type=int, help="default 30 (sinkhorn_change: 60)")
     g.add_argument("--sinkhorn-anneal", action=argparse.BooleanOptionalAction, default=None,
