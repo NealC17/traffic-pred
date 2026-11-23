@@ -86,7 +86,7 @@ class STResNet(nn.Module):
         if self.ext is not None:
             if ext is None:
                 raise ValueError("STResNet was built with ext_dim > 0; pass ext")
-            out = out + self.ext(ext[:, self.T_in:].reshape(B, -1)).reshape(B, -1, self.H, self.W)
+            out = out + self.ext(ext[:, -self.T_out:].reshape(B, -1)).reshape(B, -1, self.H, self.W)
         x_hat = torch.sigmoid(2 * out).reshape(B, self.T_out, self.C, self.H, self.W)
         if return_parts:
             return (x_hat, *split_flow(x_hat))

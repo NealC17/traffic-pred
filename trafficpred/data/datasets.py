@@ -13,7 +13,7 @@ from trafficpred.data.windows import (FlowWindows, MovingMNISTGenerator, MovingM
                                       PeriodicFlowWindows, base_datasets, limit)
 
 SPLIT_KEYS = ("train_files", "val_files", "test_files", "train_size", "val_size", "test_size", "external",
-              "periods", "period_shift", "test_days", "od", "od_slot", "ha", "fold_val")
+              "periods", "period_shift", "test_days", "od", "od_slot", "ha", "fold_val", "weather")
 
 
 @dataclass
@@ -85,11 +85,12 @@ def usual_pattern(Y, cut, period):
 
 class GridFlowData:
     def __init__(self, title, pattern, channels, steps_per_day, test_days, val_days, horizon=(4, 4),
-                 spatial_file=None, has_external=False, source=None, calendar=None, od_file=None):
+                 spatial_file=None, has_external=False, source=None, calendar=None, od_file=None, weather=None):
         self.title = title
         self.od_file = od_file   # per-frame origin-destination maps (tools/import_stdn_od.py), for --od
         self.source = source   # where to get the files, shown when they are missing
-        self.calendar = calendar   # (start date, holidays): calendar-only external features
+        self.calendar = calendar   # (start date, holidays): calendar external features
+        self.weather = weather     # Open-Meteo hourly file for the calendar datasets (datasets/weather/*.json)
         self.has_external = has_external or calendar is not None
         self.spatial_file = spatial_file
         self.pattern = re.compile(pattern)
@@ -129,11 +130,13 @@ class GridFlowData:
 
     def splits(self, name, t_in, t_out, train_files=None, val_files=None, test_files=None,
                train_size=None, val_size=None, test_size=None, external=False, periods=None,
-               period_shift=0, test_days=None, od=False, od_slot=False, ha=False, fold_val=False):
+               period_shift=0, test_days=None, od=False, od_slot=False, ha=False, fold_val=False, weather=False):
         names = self.files()
         if not names:
             hint = f"; {self.source}" if self.source else ""
             raise FileNotFoundError(f"no {self.title} files under {files.ROOT}{hint}")
+        if weather and not (external and self.calendar and self.weather):
+            raise ValueError("--weather adds NYC weather to the calendar features: give --external too")
         if external and not self.has_external:
             raise ValueError(f"{self.title} has no external data (weather / calendar); drop --external")
         if train_files or val_files or test_files:
@@ -146,15 +149,27 @@ class GridFlowData:
         lo = min(float(a.min()) for a in frames[0])
         hi = max(float(a.max()) for a in frames[0])
         ext = [[None] * len(group) for group in parts]
+        whole_ext = {}   # file -> its whole features (the periodic windows index the whole file)
         if external and self.calendar:
             start, holidays = self.calendar
-            feats = {n: ext_data.calendar(start, len(files.load(n)), self.steps_per_day, holidays)
-                     for group in parts for n, _ in group}
-            ext = [[feats[n][rows] for n, rows in group] for group in parts]
+            for group in parts:
+                for n, _ in group:
+                    if n in whole_ext:
+                        continue
+                    T = len(files.load(n))
+                    feats = ext_data.calendar(start, T, self.steps_per_day, holidays)
+                    if weather:
+                        if len(names) > 1:
+                            raise ValueError("weather is set up for single-file datasets")
+                        raw = ext_data.nyc_weather(self.weather, start, T, self.steps_per_day)
+                        feats = np.concatenate([feats, ext_data.nyc_weather_features(raw, parts[0][-1][1])], 1)
+                    whole_ext[n] = feats
+            ext = [[whole_ext[n][rows] for n, rows in group] for group in parts]
         elif external:
             raw = {n: ext_data.raw_for(n, len(files.load(n))) for group in parts for n, _ in group}
             mean, std = ext_data.weather_stats([raw[n][rows] for n, rows in parts[0]])
-            ext = [[ext_data.features(raw[n], mean, std)[rows] for n, rows in group] for group in parts]
+            whole_ext = {n: ext_data.features(raw[n], mean, std) for n in raw}
+            ext = [[whole_ext[n][rows] for n, rows in group] for group in parts]
         aux = [[None] * len(group) for group in parts]
         if od_slot and not od:
             raise ValueError("--od-slot goes with --od")
@@ -187,8 +202,6 @@ class GridFlowData:
         if period_shift and not periods:
             raise ValueError("--period-shift needs --periods")
         if periods:
-            if external:
-                raise ValueError("--periods together with --external isn't supported")
             steps, trend_lags = self.period_steps(periods, period_shift or 0)
             extra_in = len(steps) * t_out
             extra_lags = tuple(p for p in steps for _ in range(t_out))   # PeriodicFlowWindows' order
@@ -196,12 +209,14 @@ class GridFlowData:
             def windows(i):   # the whole file, so the periodic frames can reach back past the split
                 return ConcatDataset([PeriodicFlowWindows(files.load(n), t_in, t_out, lo, hi, steps,
                                                           rows.start or 0, rows.stop,
-                                                          od_maps)
+                                                          od_maps, whole_ext.get(n))
                                       for n, rows in parts[i]])
         split = dict(train_files=train_files, val_files=val_files, test_files=test_files,
                      train_size=train_size, val_size=val_size, test_size=test_size)
         if external:
             split["external"] = True
+        if weather:
+            split["weather"] = True
         if periods:
             split["periods"] = list(periods)
             if period_shift:
@@ -219,7 +234,8 @@ class GridFlowData:
         return Splits(name, limit(windows(0), train_size, "train"),
                       limit(windows(1), val_size, "val"), limit(windows(2), test_size, "test"),
                       lo, hi, self.channels, t_in, t_out, split, spatial_features=self._spatial(),
-                      ext_dim=(len(ext_data.CALENDAR_NAMES) if self.calendar else ext_data.DIM) if external else 0,
+                      ext_dim=(len(ext_data.CALENDAR_NAMES) + (len(ext_data.NYC_WEATHER_NAMES) if weather else 0)
+                               if self.calendar else ext_data.DIM) if external else 0,
                       extra_in=extra_in,
                       extra_lags=extra_lags, trend_lags=trend_lags,
                       aux_in=0 if od_maps is None else od_maps.shape[1])
@@ -446,10 +462,12 @@ DATASETS = {
     # the last 20 days are test, as in STDN. STDN calls the channels start / end volume.
     "nyctaxi": GridFlowData("NYCTaxi", r"NYCTaxi/volume\.npy", ("Start", "End"),
                             steps_per_day=48, test_days=20, val_days=10, od_file="NYCTaxi/od_aux.npy",
-                            calendar=("2015-01-01", ("2015-01-01", "2015-01-19", "2015-02-16"))),
+                            calendar=("2015-01-01", ("2015-01-01", "2015-01-19", "2015-02-16")),
+                            weather="weather/nyc_2015q1.json"),
     "nycbike2": GridFlowData("NYCBike2", r"NYCBike2/volume\.npy", ("Start", "End"),
                              steps_per_day=48, test_days=20, val_days=10, od_file="NYCBike2/od_aux.npy",
-                             calendar=("2016-07-01", ("2016-07-04",))),
+                             calendar=("2016-07-01", ("2016-07-04",)),
+                             weather="weather/nyc_2016summer.json"),
     # 89 days of Beijing taxi flow; the published file is already scaled to 0-1, so its "raw
     # units" are that scale, not counts.
     "taxibj21": GridFlowData("TaxiBJ21", r"TaxiBJ/TaxiBJ21\.npy", ("Inflow", "Outflow"),
@@ -479,9 +497,11 @@ def get_splits(dataset="taxibj", t_in=None, t_out=None, **split):
     t_in = t_in or spec.horizon[0]
     t_out = t_out or spec.horizon[1]
     split = {k: v for k, v in split.items() if k in SPLIT_KEYS}
-    for key in ("periods", "period_shift", "test_days", "od", "od_slot", "ha", "fold_val"):
+    for key in ("periods", "period_shift", "test_days", "od", "od_slot", "ha", "fold_val", "weather"):
         if not split.get(key):
             split.pop(key, None)
+    if split.get("weather") and not getattr(spec, "weather", None):
+        raise ValueError(f"--weather: no weather file is set up for {dataset}")
     for key, flag in (("test_days", "--test-days"), ("periods", "--periods")):
         if key in split and not isinstance(spec, GridFlowData):
             raise ValueError(f"{flag} needs a grid flow dataset with a time axis, not {dataset}")
@@ -542,8 +562,14 @@ def add_data_args(ap):
                         "the last epoch's model; val is then in-sample and selects nothing. Fix the epochs from "
                         "a run without it")
     g.add_argument("--external", action="store_true",
-                   help="stresnet only: feed TaxiBJ's external data (TaxiBJext: day of week, weekend, "
-                        "time of day, temperature, wind, weather type) to its external component")
+                   help="external features per step for stresnet / cnn / distvol / distvolformer: TaxiBJ's TaxiBJext "
+                        "(day of week, weekend, time of day, temperature, wind, weather type); NYCTaxi / NYCBike2: "
+                        "the calendar (day of week, day off incl. holidays, time of day). Target steps get their own "
+                        "calendar and the last input step's weather")
+    g.add_argument("--weather", action="store_true",
+                   help="with --external on NYCTaxi / NYCBike2: add hourly weather (Open-Meteo ERA5 archive, "
+                        "datasets/weather/): temperature, wind, precipitation, snowfall, snow depth, cloud cover, "
+                        "each frame the last full hour at or before its end (known at forecast time)")
     return g
 
 

@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.utils.checkpoint
 import torch.nn.functional as F
 
-from trafficpred.models.distvol import EPS, ConvBlock, ODTransportHead, log_flow, log_last_distribution
+from trafficpred.models.distvol import EPS, EXT_EMBED, ConvBlock, ODTransportHead, ext_maps, log_flow, log_last_distribution
 from trafficpred.models.transport import TransportHead
 from trafficpred.sinkhorn import split_flow
 
@@ -136,12 +136,15 @@ class SpaceTimeTransformer(nn.Module):
         nn.init.zeros_(self.final_ada.bias)
         self.head = nn.Linear(dim, patch * patch * cout_step)
 
-    def forward(self, x, cond):
-        """x: (B, T_in, cin_frame, H, W) -> (B, T_out * cout_step, H, W), step-major like DistTransformer."""
+    def forward(self, x, cond, target_add=None):
+        """x: (B, T_in, cin_frame, H, W) -> (B, T_out * cout_step, H, W), step-major like DistTransformer.
+        target_add: optional (B, T_out, dim) added to the target tokens (--ext-input: the targets' features)."""
         B, T, Cf, H, W = x.shape
         h, w = H // self.patch, W // self.patch
         tokens = self.embed(x.reshape(B * T, Cf, H, W)).flatten(2).transpose(1, 2).reshape(B, T, h * w, -1)
         target = self.target.expand(B, -1, h * w, -1)
+        if target_add is not None:
+            target = target + target_add[:, :, None]
         z = torch.cat([tokens, target], dim=1) + self.pos + self.frame          # (B, F, N, D)
         F_, N, D = z.shape[1:]
         for i, block in enumerate(self.blocks):
@@ -274,7 +277,8 @@ class DistVolFormer(nn.Module):
                  heads=6, mlp_dim=768, drop=0.1, code_dim=128, dist_residual=False,
                  transport=0, n_periodic=0, sinkformer=0, time_tokens=False,
                  vol_transformer=False, vol_dim=128, vol_depth=3, graph=False, graph_radius=0,
-                 count_scale=0.0, count_offset=0.0, direct=False, aux=0, od_head=None, od_slot_scale=0.0):
+                 count_scale=0.0, count_offset=0.0, direct=False, aux=0, od_head=None, od_slot_scale=0.0,
+                 ext_dim=0, ext_input=False, ext_volume=False):
         """aux: extra input maps per frame after the C flow channels (--od), fed as log-flow maps next to
         the flow's (in every layout: stacked, time tokens, graph, volume transformer); not predicted.
 
@@ -298,6 +302,21 @@ class DistVolFormer(nn.Module):
         if graph and (time_tokens or transport or sinkformer):
             raise ValueError("the graph distribution head doesn't combine with time_tokens / transport / sinkformer")
         self.time_tokens, self.vol_transformer, self.graph = time_tokens, vol_transformer, graph
+        self.ext = None   # --external: the target steps' features, added to the volume code (zero at the start)
+        self.ext_embed = None   # --ext-input: every frame's features as input maps to both encoders instead
+        self.ext_volume = bool(ext_dim and ext_volume)   # --ext-volume: the ext term goes to the volume head only
+        if ext_input and ext_volume:
+            raise ValueError("--ext-input and --ext-volume are alternatives")
+        if ext_dim and ext_input:
+            if vol_transformer:
+                raise ValueError("--ext-input isn't wired into the volume transformer")
+            self.ext_embed = nn.Linear(ext_dim, EXT_EMBED)
+        elif ext_dim:
+            if vol_transformer:
+                raise ValueError("--external isn't wired into the volume transformer's own volume head")
+            self.ext = nn.Sequential(nn.Linear(T_out * ext_dim, 64), nn.GELU(), nn.Linear(64, code_dim))
+            nn.init.zeros_(self.ext[-1].weight)
+            nn.init.zeros_(self.ext[-1].bias)
         if od_head is not None and (aux < 1 or T_out != 1 or C != 2 or direct or transport):
             raise ValueError("od_head needs --od, --t-out 1, the Start / End channels, and no direct / transport")
         g_out = 1 if od_head is not None else 0   # the potential channel, after the logits
@@ -305,6 +324,7 @@ class DistVolFormer(nn.Module):
         self.aux = aux
         k_in, k_out = T_in * C, T_out * C
         a_in = T_in * aux
+        e_in = (T_in + T_out) * EXT_EMBED if self.ext_embed is not None else 0   # stacked layouts
         self.pad_h, self.pad_w = -H % 4, -W % 4
         self.pad_h += -(H + self.pad_h) % patch
         self.pad_w += -(W + self.pad_w) % patch
@@ -313,18 +333,19 @@ class DistVolFormer(nn.Module):
             self.vol_enc = VolumeTransformer(3 * C + aux, C, T_in, T_out, width, vol_dim, vol_depth,
                                              max(1, vol_dim // 32), code_dim, drop)
         else:
-            self.vol_enc = VolumeUNet(3 * k_in + a_in, width, code_dim)
+            self.vol_enc = VolumeUNet(3 * k_in + a_in + e_in, width, code_dim)
         self.transport = TransportHead(T_out, C, transport, n_periodic) if transport else None
         if graph:
-            self.dist_enc = GraphTransformer(2 * k_in + a_in, k_out + g_out, H, W, dim, depth, heads, mlp_dim,
+            self.dist_enc = GraphTransformer(2 * k_in + a_in + e_in, k_out + g_out, H, W, dim, depth, heads, mlp_dim,
                                              code_dim, drop, graph_radius)
         elif time_tokens:
-            self.dist_enc = SpaceTimeTransformer(2 * C + aux, C + g_out, T_in, T_out, grid, patch, dim, depth,
+            self.dist_enc = SpaceTimeTransformer(2 * C + aux + (EXT_EMBED if self.ext_embed is not None else 0), C + g_out, T_in, T_out, grid, patch, dim, depth,
                                                  heads, mlp_dim, code_dim, drop, sinkformer)
         else:
-            self.dist_enc = DistTransformer(2 * k_in + a_in, self.transport.channels if transport else k_out + g_out,
+            self.dist_enc = DistTransformer(2 * k_in + a_in + e_in, self.transport.channels if transport else k_out + g_out,
                                             grid, patch,
                                             dim, depth, heads, mlp_dim, code_dim, drop, sinkformer)
+        self.ext_target = nn.Linear(EXT_EMBED, dim) if (self.ext_embed is not None and time_tokens) else None
         self.dist_residual = dist_residual
         if transport:
             p2 = patch * patch   # head outputs (patch*patch*cout) are pixel-shuffled: channel-major
@@ -346,7 +367,7 @@ class DistVolFormer(nn.Module):
             nn.init.zeros_(self.vol_head[-1].weight)
             nn.init.zeros_(self.vol_head[-1].bias)
 
-    def forward(self, x, return_parts=False):
+    def forward(self, x, return_parts=False, ext=None):
         B, T, _, H, W = x.shape
         C, A = self.C, self.aux
         slot = None
@@ -365,6 +386,9 @@ class DistVolFormer(nn.Module):
         extra = F.pad(log_flow(extra_raw, self.count_scale, self.count_offset).reshape(B, T * A, H, W),
                       (0, self.pad_w, 0, self.pad_h)) if A else None
         volume_maps = log_n[..., None, None].expand(-1, -1, Hp, Wp)
+        e_maps = e_frames = None
+        if self.ext_embed is not None:   # (B, (T + T_out) * E, Hp, Wp), (B, T + T_out, E)
+            e_maps, e_frames = ext_maps(self.ext_embed, ext, T, self.T_out, Hp, Wp)
         if self.vol_transformer:   # per frame: distribution, log flow, log totals (, extra) as (3C + A, H, W)
             frames = torch.cat([features, volume_maps], 1).reshape(B, 3, T, C, Hp, Wp).transpose(1, 2)
             frames = frames.reshape(B, T, 3 * C, Hp, Wp)
@@ -372,21 +396,35 @@ class DistVolFormer(nn.Module):
                 frames = torch.cat([frames, extra.reshape(B, T, A, Hp, Wp)], 2)
             delta, code = self.vol_enc(frames, log_n.reshape(B, T, C))
         else:
-            code = self.vol_enc(torch.cat([features, volume_maps] + ([extra] if A else []), dim=1))
+            code = self.vol_enc(torch.cat([features, volume_maps] + ([extra] if A else [])
+                                          + ([e_maps] if e_maps is not None else []), dim=1))
+        vol_code = code
+        if self.ext is not None:
+            if ext is None:
+                raise ValueError("DistVolFormer was built with ext_dim > 0; pass ext")
+            vol_code = code + self.ext(ext[:, -self.T_out:].reshape(B, -1))
+            if not self.ext_volume:   # conditioning: every AdaLN block sees it too
+                code = vol_code
         if self.time_tokens:   # the same features, one (2C + A, H, W) stack per frame
             features = features.reshape(B, 2, T, C, Hp, Wp).transpose(1, 2).reshape(B, T, 2 * C, Hp, Wp)
             if A:
                 features = torch.cat([features, extra.reshape(B, T, A, Hp, Wp)], 2)
-        elif A:
-            features = torch.cat([features, extra], 1)
+            if e_frames is not None:   # each input frame its own features; the targets' go to the target tokens
+                features = torch.cat([features, e_frames[:, :T, :, None, None].expand(-1, -1, -1, Hp, Wp)], 2)
+        else:
+            if A:
+                features = torch.cat([features, extra], 1)
+            if e_maps is not None:
+                features = torch.cat([features, e_maps], 1)
+        dist_kw = {"target_add": self.ext_target(e_frames[:, T:])} if self.ext_target is not None else {}
 
         if self.direct:
-            x_hat = self.dist_enc(features, code)[..., :H, :W].reshape(B, self.T_out, C, H, W)
+            x_hat = self.dist_enc(features, code, **dist_kw)[..., :H, :W].reshape(B, self.T_out, C, H, W)
             return (x_hat, *split_flow(x_hat)) if return_parts else x_hat
         if self.transport is not None:
-            p_hat = self.transport(self.dist_enc(features, code)[..., :H, :W], p_in, H, W)
+            p_hat = self.transport(self.dist_enc(features, code, **dist_kw)[..., :H, :W], p_in, H, W)
         else:
-            out = self.dist_enc(features, code)[..., :H, :W]
+            out = self.dist_enc(features, code, **dist_kw)[..., :H, :W]
             if self.od_head is not None:
                 out, g = out[:, :self.T_out * C], out[:, self.T_out * C]
             logits = out.reshape(B, self.T_out, C, H * W)
@@ -395,7 +433,7 @@ class DistVolFormer(nn.Module):
             p_hat = logits.softmax(dim=-1).reshape(B, self.T_out, C, H, W)
 
         if not self.vol_transformer:
-            delta = self.vol_head(torch.cat([code, log_n], dim=-1)).reshape(B, self.T_out, C)
+            delta = self.vol_head(torch.cat([vol_code, log_n], dim=-1)).reshape(B, self.T_out, C)
         n_hat = n_in[:, -1:, :] * torch.exp(delta.clamp(-5, 5))
 
         x_hat = p_hat * n_hat[..., None, None]

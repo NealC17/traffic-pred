@@ -219,6 +219,21 @@ Each target step gets 29 features:
 The features go through FC(10) -> ReLU -> FC(C*H*W) -> ReLU and are added to the fused branches
 before the output sigmoid, as in the paper.
 
+On `nyctaxi` / `nycbike2`, `--external` gives `cnn`, `distvol` and `distvolformer` the same 10 calendar
+features (the day-off flag also covers public holidays), and `--weather` adds 6 NYC weather features
+from Open-Meteo (`datasets/weather/*.json`: temperature, wind, log precipitation, log snowfall, log
+snow depth, cloud cover). Each frame gets the hourly record at or before its end, and the targets
+get the last input frame's weather. There are three ways in for DistVol / DistVolFormer:
+
+- default (conditioning): the target steps' features go through a zero-initialised MLP that is
+  added to the volume code, so they reach the FiLM / AdaLN of the map branch and the volume head
+  (run names `_ext` / `_extw`)
+- `--ext-input`: every frame's features (input frames, day / week-back frames and targets) go
+  through a shared 8-dim embedding and into the encoders as constant input maps; with
+  `--time-tokens` they go per frame, and onto the target tokens (`_extin` / `_extwin`)
+- `--ext-volume`: like the default, but the MLP's output reaches the volume head only, so the map
+  branch never sees it (`_extvol` / `_extwvol`)
+
 ### DistVolFormer
 
 `distvolformer` keeps DistVolNet's split into a spatial distribution and a total volume per
@@ -335,6 +350,168 @@ W&B (project `traffic-pred`, override with `WANDB_PROJECT`) gets live progress, 
 epoch, prediction heatmaps, the final test metrics and their ratio to copy-last
 (`vs_copy_last/*`, below 1 = better). Offline: `WANDB_MODE=offline`, then
 `wandb sync wandb/offline-run-*`. Off: `--no-wandb`.
+
+## Experiments and results
+
+Every experiment run so far, roughly in order. Unless noted:
+
+- **Protocol:** STDN's, i.e. next step, RMSE on cells whose true count is above 10
+  (`--threshold 10.5`), per channel Start / End.
+- **Seeds and settings:** mean of 3 seeds (42, 7, 123), untuned defaults.
+- **Scoring:** `tools/compare_published.py` (says BETTER when the seed mean + 2 standard errors is
+  below the target) and `tools/eval_published.py`.
+- **Old threshold:** runs before 2026-11-21 kept cells equal to 10 (≥ 10). That makes their NYCTaxi
+  numbers about 0.3 too good; NYCBike2 is unaffected. Those numbers are marked (≥10).
+
+Published targets (RMSE Start / End):
+
+| | STDN (AAAI'19) | Wang et al. 2020, no outside data | Wang et al. 2020, with weather / holidays |
+|---|---|---|---|
+| NYCTaxi | 24.10 / 19.05 | 23.69 / 18.78 | 22.37 / 17.78 |
+| NYCBike2 | 8.85 / 8.15 | – | 8.32 / 7.66 |
+
+Wang et al. is arXiv 2005.05128, an unnamed extension of STDN.
+
+### Headline
+
+| Dataset / protocol | Our best fair result | Published | Verdict |
+|---|---|---|---|
+| NYCTaxi, STDN | DistVolFormer, fold-val (#25): **22.35 / 18.01** | Wang + weather 22.37 / 17.78 | Beats STDN and Wang without outside data; ties Wang with weather on Start, behind on End, using no outside data |
+| NYCTaxi, STDN (no fold-val) | DistVolFormer, tuned (#15): 23.24 / 18.59 | STDN 24.10 / 19.05 | Beats STDN and Wang without outside data |
+| NYCBike2, STDN | DistVolFormer, fold-val (#25): **8.34 / 7.66** | Wang + weather 8.32 / 7.66 | Beats STDN; ties Wang with weather, using no outside data |
+| NYCTaxi, ST-SSL (MAE, true > 5) | DistVolFormer (#20): **11.84 / 9.49** | ST-SSL 11.99 / 9.78 | Beats |
+| NYCBike2, ST-SSL | DistVolFormer (#20): 5.08 / 4.82 | ST-SSL 5.04 / 4.71 | Not beaten |
+| BikeNYC, DeepSTN+ (all cells) | DistVolFormer (#10): RMSE 5.93, MAE 2.14 | DeepSTN+ 5.955 / 2.285 | RMSE ties, MAE beats; ST-ResNet's 6.475 beaten easily |
+| TaxiBJ, next step | DistVolFormer 4 → 4 scored at t+1, 1 seed (#1): **16.34** | ST-ResNet 16.69, ACFM 15.40 | Beats ST-ResNet, not ACFM |
+
+What held up:
+- the DistVol shape × total factorization;
+- L1 + volume instead of MSE;
+- day / week-back frames;
+- tuning;
+- training on the most recent data (fold-val).
+
+Every OT term, attention variant, head and learned cost, the frame encoder, and calendar and
+weather in every form gave no RMSE gain or hurt. OT only helps the spatial (GeOT) error.
+
+### TaxiBJ
+
+1. **Baseline, 4 → 4.** Train 2013, val 2014, test 2015–16; RMSE over all frames.
+   - DistVolFormer + Sinkhorn is best at 18.85. Then DistVolFormer MSE 19.23, DistVol 19.25, CNN
+     19.61, ST-ResNet 19.77, MLP 20.67, copy-last 38.4.
+   - Sinkhorn without a count-space loss breaks (44–65).
+   - Scored at t+1: 16.34 vs ST-ResNet's published 16.69 (1 seed, no outside data).
+2. **Optuna on DistVolFormer's loss weights.** It drives the Sinkhorn weight to about 0. The best
+   is L1 + volume, 17.21 vs 17.40 for the default (short runs, 1 seed).
+3. **Official PredFormer, OpenSTL protocol.** Frame MSE 0.42 vs the paper's 0.277–0.284. Not
+   reproduced, and the gap is unexplained.
+4. **Next-step TaxiBJ** (`train_taxibj_nextstep.sh`, Slurm). Runs on a separate machine; no results
+   here yet.
+
+### NYCTaxi / BikeNYC, early 4 → 4 (all-cell MSE; not comparable to papers)
+
+5. **Inputs.**
+   - A residual-over-the-last-frame output hurts (about +5 MSE).
+   - Day / week-back frames help a lot on BikeNYC (DistVolFormer 48 → 39) and are neutral on
+     NYCTaxi.
+   - Sinkhorn with `--l2 0` is best, and that is L1 + volume with no transport term.
+6. **Transport head.** No gain (196–208 vs 197).
+7. **Sinkformer attention.** No gain.
+8. **MSE vs Sinkhorn, 4 seeds.** DistVolFormer: MSE 201, Sinkhorn 204.7, L1 + volume 197.2. The OT
+   term adds nothing.
+9. **Longer horizons (8 and 12 steps).** OT hurts NYCTaxi more as the horizon grows (+0.4 at t+1 →
+   +1.0 at t+8). Neutral on bikes.
+
+### NYCTaxi / NYCBike2, STDN protocol
+
+10. **Published sweep, 4 frames in.** Both of these beat STDN:
+    - NYCTaxi (≥10): ST-ResNet + day / week-back 23.05 / 18.12, DistVolFormer 23.45 / 18.88.
+    - NYCBike2: ST-ResNet + day / week-back 8.69 / 7.90.
+    - BikeNYC is in the headline.
+11. **4, 8 or 12 input frames.** 8 is best for taxi, 4 for bikes.
+    - ST-ResNet + day / week-back: taxi 22.89 / 18.11 (≥10), bike 8.69 / 7.91.
+    - DistVolFormer: taxi 23.15 / 18.64 (≥10), bike 8.94 / 8.18.
+12. **Day / week-back variants and blends.**
+    - A shifted day / week-back window helps ST-ResNet: taxi 22.67 / 17.92 (≥10).
+    - A 9-model blend gets taxi 21.63 / 17.14 (≥10) and bike 8.34 / 7.63. That is an ensemble, so
+      not a fair comparison.
+13. **Time tokens.** A small gain: taxi 23.04 / 18.38 (≥10), bike 8.73 / 8.17 (patch 1).
+14. **Loss ablation** (MSE, L1, Huber, L1 + volume, Sinkhorn, with and without the level term).
+    - The L1 family is slightly better than MSE: taxi DistVol L1 + volume 23.06 / 18.49 (≥10).
+    - Sinkhorn is DistVolFormer's worst loss.
+15. **Optuna model tuning.**
+    - The first pass made ST-ResNet the taxi leader.
+    - The second pass, tuned for the ≥ 10 cells: DistVolFormer 22.90 / 18.28 (≥10), which is
+      23.24 / 18.59 under > 10. Bike 8.66 / 8.13.
+    - The graph variant gets bike 8.60 / 8.01.
+    - The official PredFormer, our PredFormer and the MLP are far behind.
+16. **Loss focus.**
+    - No extra weight on low-count cells is a small gain: DistVolFormer taxi 22.82 / 18.25 (≥10),
+      bike 8.57 / 8.09.
+    - Training on log counts is worse.
+17. **Calendar features, ST-ResNet.** No gain (taxi 23.85 → 23.95).
+18. **Direct output, without the shape × total factorization.** Much worse: taxi 24.94 / 19.39 vs
+    22.90 / 18.28. The factorization is a real win.
+19. **Split loss** (OT on the map, separate volume loss). Far worse: taxi 29–33, bike 11–13.
+20. **ST-SSL protocol** (MAE, true > 5). See the headline. On bikes we beat AGCRN and STGCN.
+21. **OD trip flows as extra input** (outside data, so not comparable to the papers).
+    - Taxi: helps DistVol (21.06 → 20.58 all-cell) and the CNN, but the best is still DistVolFormer
+      without OD.
+    - Bike, with the OD head: DistVolFormer 8.30, the graph variant 8.24 (End 7.77).
+22. **OD per time-of-day kernel, and retuning with OD.** Neither helps; the retunes are worse.
+23. **Usual-pattern (weekly average) input.**
+    - No gain for DistVolFormer.
+    - A big gain for the CNN (bike 8.62 → 8.38).
+    - Hurts ST-ResNet.
+24. **Diagnostics.**
+    - Error split: giving the model the true total barely moves RMSE (about 20.8 → 19.2), while
+      the true map drops it to about 8. The error is in the map, not the total.
+    - A ratio-to-usual feature could remove 4–7% of MSE after the fact, but didn't carry over into
+      training.
+    - Correcting the level with recent data helps every model. That points to drift, which led to
+      #25.
+25. **Fold-val** (train on train + val, keep the last epoch). **Our best result.**
+    - DistVolFormer: taxi 22.35 / 18.01, bike 8.34 / 7.66.
+    - CNN: bike 8.53 / 7.57.
+    - ST-ResNet diverges without a validation set to pick its epoch.
+    - Caveat: the configs were tuned on the validation set before it was folded in.
+26. **Unbalanced OT and the change (ΔX±) term, 4 seeds.**
+    - Unbalanced OT is worse everywhere.
+    - The change term ties L1 + volume and gives the CNN about 2%.
+    - GeOT spatial error (`tools/geot_eval.py`): L1 cuts it 20–28% vs MSE, and OT terms add another
+      1–7% at a small RMSE cost. Bike: DistVolFormer unbalanced 112 vs 116 for L1 + volume.
+27. **OT diagnostics.**
+    - At small blur the OT plan is close to the identity (87% of mass stays put).
+    - A cost learned from OD flows is no better than grid distance.
+    - Neighbouring cells err in the same direction, so the error is level, not displaced mass.
+    - Timing shifts explain nothing.
+28. **Frame encoder** (`--frame-encoder`). Worse than stacking frames (taxi 25.01 / 19.59 vs
+    23.97 / 18.91) and worse than STDN.
+29. **Calendar and weather as conditioning** (`--external [--weather]`, see "External data").
+    - Weather hurts every taxi model: DistVol 23.38 → 24.51, CNN 25.28 → 29.53.
+    - Bikes and calendar are neutral.
+    - The best fair taxi result here is DistVol with no outside data, 23.38 / 18.77. It beats STDN
+      and Wang without outside data on Start.
+30. **Log counts as input.** Taxi worse by 0.15–0.3; bike neutral.
+31. **Calendar and weather as encoder input** (`--ext-input`). No gain, and weather is worse than
+    as conditioning:
+
+    | | none | calendar, conditioning | calendar, input | weather, conditioning | weather, input |
+    |---|---|---|---|---|---|
+    | NYCTaxi DistVol | 23.38 / 18.77 | 23.42 / 18.87 | 23.47 / 18.85 | 24.51 / 19.77 | 25.77 / 20.84 |
+    | NYCTaxi DistVolFormer | 23.47 / 18.99 | 23.44 / 19.07 | 23.39 / 18.92 | 23.82 / 19.45 | 24.95 / 20.67 |
+    | NYCBike2 DistVol | 9.05 / 8.60 | 9.02 / 8.45 | 9.01 / 8.39 | 8.92 / 8.34 | 9.13 / 8.53 |
+    | NYCBike2 DistVolFormer | 8.93 / 8.18 | 8.93 / 8.30 | 8.87 / 8.24 | 9.07 / 8.33 | 8.90 / 8.22 |
+
+    The NYCTaxi test period has different weather from training:
+    - mean temperature −8.7 °C vs −3.7 °C, with a low below anything seen in training;
+    - no hours of heavy precipitation vs 24;
+    - snow on the ground the whole time.
+
+    NYCBike2's test weather looks like its training weather. So weather inputs fit a few events in
+    training that don't recur at test time. Month or week number wouldn't help either: the 60-day
+    datasets never show the test period's values in training.
+32. **Weather on the volume head only** (`--ext-volume`): running.
 
 ## Look at predictions
 

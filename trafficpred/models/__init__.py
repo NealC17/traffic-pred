@@ -39,8 +39,20 @@ def _grid(splits):
     return dict(T_in=splits.in_frames, T_out=splits.t_out, C=C, H=H, W=W, **_aux(splits))
 
 
+def _ext(splits, args=None):   # only stored when on, so older checkpoints' kwargs stay valid
+    if getattr(args, "ext_input", False):
+        if not splits.ext_dim:
+            raise SystemExit("--ext-input needs --external (and optionally --weather)")
+        return {"ext_dim": splits.ext_dim, "ext_input": True}
+    if getattr(args, "ext_volume", False):
+        if not splits.ext_dim:
+            raise SystemExit("--ext-volume needs --external (and optionally --weather)")
+        return {"ext_dim": splits.ext_dim, "ext_volume": True}
+    return {"ext_dim": splits.ext_dim} if splits.ext_dim else {}
+
+
 def _configure_cnn(args, splits):
-    return dict(_grid(splits), width=_pick(args, "width", 64), blocks=_pick(args, "blocks", 6))
+    return dict(_grid(splits), width=_pick(args, "width", 64), blocks=_pick(args, "blocks", 6), **_ext(splits))
 
 
 def _residual(args, splits):   # only stored when on, so older checkpoints' kwargs stay valid
@@ -76,7 +88,8 @@ def _od_head(args, splits):   # only stored when on, so older checkpoints' kwarg
 
 def _configure_distvol(args, splits):
     return dict(_grid(splits), width=_pick(args, "width", 64), **_residual(args, splits), **_log_counts(args, splits),
-                **_od_head(args, splits))
+                **_od_head(args, splits), **({"frame_encoder": True} if getattr(args, "frame_encoder", False) else {}),
+                **_ext(splits, args))
 
 
 def _configure_distvolformer(args, splits):
@@ -87,7 +100,7 @@ def _configure_distvolformer(args, splits):
                 mlp_dim=_pick(args, "mlp_dim", 4 * dim), drop=_pick(args, "drop", 0.1), **_residual(args, splits),
                 **({"sinkformer": args.sinkformer} if getattr(args, "sinkformer", None) else {}),
                 **({"time_tokens": True} if getattr(args, "time_tokens", False) else {}),
-                **_log_counts(args, splits), **_od_head(args, splits))
+                **_log_counts(args, splits), **_od_head(args, splits), **_ext(splits, args))
 
 
 def _configure_distvolformer_graph(args, splits):
@@ -251,6 +264,19 @@ def add_model_args(ap):
                    help="distvol / distvolformer / distvolformer_graph with --od: End(t+1) = the network's within-slot part + the trips under way at t "
                         "moved to their destinations by a transport plan (historical kernel, a learned correction "
                         "and a per-sample destination potential; every origin's known trips are conserved)")
+    g.add_argument("--frame-encoder", action="store_true",
+                   help="distvol: encode every input frame on its own (shared convs + a lag embedding), combine "
+                        "them with attention across frames at each cell, then the U-Net and both heads "
+                        "(default: all frames stacked as channels into the U-Net)")
+    g.add_argument("--ext-input", action="store_true",
+                   help="distvol / distvolformer with --external: every frame's external features (each input "
+                        "frame's own calendar / weather and the target steps' calendar + last known weather) go "
+                        "through a shared embedding into the encoders as constant input maps (with --time-tokens: "
+                        "per frame, and the targets' onto the target tokens), instead of only conditioning the "
+                        "blocks and the volume head")
+    g.add_argument("--ext-volume", action="store_true",
+                   help="distvol / distvolformer with --external: the target steps' external features (as in the "
+                        "default conditioning) go to the volume head only, not the FiLM / AdaLN of the map branch")
     g.add_argument("--log-counts", action="store_true",
                    help="distvol / distvolformer: the log-flow input is log1p of the raw counts (default: "
                         "log1p of the 0-1 scaled data, which is nearly linear)")

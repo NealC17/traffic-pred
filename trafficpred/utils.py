@@ -73,6 +73,6 @@ def to_device(batch, device):
 
 
 def predict(model, x, ext=None, **kwargs):
-    if ext is not None and getattr(model, "ext", None) is not None:
+    if ext is not None and (getattr(model, "ext", None) is not None or getattr(model, "ext_embed", None) is not None):
         return model(x, ext=ext, **kwargs)
     return model(x, **kwargs)

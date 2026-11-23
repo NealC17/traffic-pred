@@ -42,8 +42,8 @@ class PeriodicFlowWindows(FlowWindows):
     the most recent frame stays last. Windows without that much history are left out.
     """
 
-    def __init__(self, frames, t_in, t_out, lo, hi, periods, start=0, stop=None, aux=None):
-        super().__init__(frames, t_in, t_out, lo, hi, aux=aux)
+    def __init__(self, frames, t_in, t_out, lo, hi, periods, start=0, stop=None, aux=None, ext=None):
+        super().__init__(frames, t_in, t_out, lo, hi, ext=ext, aux=aux)
         self.periods = tuple(periods)
         stop = len(frames) if stop is None else stop
         self.first = max(start, max(self.periods) - t_in)   # target frame i + t_in has P frames before it
@@ -55,14 +55,16 @@ class PeriodicFlowWindows(FlowWindows):
 
     def __getitem__(self, j):
         i = self.first + j
-        x, y = super().__getitem__(i)
+        x, y, *ext = super().__getitem__(i)
         targets = np.arange(i + self.t_in, i + self.t_in + self.t_out)
         rows = np.concatenate([targets - p for p in self.periods])
         past = np.asarray(self.frames[rows], dtype=np.float32)
         past = torch.from_numpy((past - self.lo) / self.span)
         if self.aux is not None:
             past = torch.cat([past, self._aux(rows)], 1)
-        return torch.cat([past, x]), y
+        if ext:   # the period-back frames' own features first, so ext rows line up with x's frames + targets
+            ext = [torch.cat([torch.from_numpy(np.asarray(self.ext[rows], dtype=np.float32)), ext[0]])]
+        return (torch.cat([past, x]), y, *ext)
 
 
 class MovingMNISTSequences(Dataset):

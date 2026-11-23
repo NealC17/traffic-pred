@@ -167,7 +167,11 @@ def run_name(args, splits, loss, loss_options):
     if (splits.t_in, splits.t_out) != DATASETS[args.dataset].horizon:
         name += f"_in{splits.t_in}_out{splits.t_out}"
     if splits.ext_dim:
-        name += "_ext"
+        name += "_extw" if splits.split.get("weather") else "_ext"
+        if getattr(args, "ext_input", False):
+            name += "in"
+        if getattr(args, "ext_volume", False):
+            name += "vol"
     if getattr(args, "dist_residual", False):
         name += "_res"
     if getattr(args, "transport", None):
@@ -176,6 +180,8 @@ def run_name(args, splits, loss, loss_options):
         name += f"_sinkformer{args.sinkformer}"
     if getattr(args, "time_tokens", False):
         name += "_timetokens"
+    if getattr(args, "frame_encoder", False):
+        name += "_frameenc"
     if getattr(args, "log_counts", False):
         name += "_logcounts"
     if splits.split.get("fold_val"):
@@ -195,8 +201,8 @@ def main(argv=None, epoch_callback=None):
     """Run train.py with these arguments (default: the command line). Returns the val-selected
     checkpoint's scores by split, or None if epoch_callback stopped the run (see Trainer.fit)."""
     args = parse_args(argv)
-    if args.external and args.model != "stresnet":
-        raise SystemExit("--external only works with --model stresnet")
+    if args.external and args.model not in ("stresnet", "cnn", "distvol", "distvolformer"):
+        raise SystemExit("--external works with --model stresnet / cnn / distvol / distvolformer")
     if args.st_branches and args.model != "stresnet":
         raise SystemExit("--st-branches only works with --model stresnet")
     spec = MODELS[args.model]
