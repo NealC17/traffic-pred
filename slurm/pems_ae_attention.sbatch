@@ -11,7 +11,7 @@
 # The job resubmits itself 15 min before its time limit (--signal) and the continuation resumes the
 # interrupted run from its .last.pt; finished runs have a .done marker and are skipped.
 #
-# Needs on the cluster: the current (uncommitted) code and datasets/PEMS/PEMS08/flow.npy (+ hops.npy).
+# Needs on the cluster: the current (uncommitted) code. The PEMS08 data is downloaded on the first job if missing.
 # Submit from the repo root:
 #   sbatch --chdir="$PWD" slurm/pems_ae_attention.sbatch
 #   sbatch --chdir="$PWD" --export=ALL,SEEDS="42 7 123" slurm/pems_ae_attention.sbatch
@@ -46,8 +46,8 @@ COMMON=(--dataset pems08 --t-in 12 --t-out 12 --loss sinkhorn --l2 0 --time-toke
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
-if [ ! -f train.py ] || [ ! -f datasets/PEMS/PEMS08/flow.npy ]; then
-    log "run this from the traffic_pred repo root, with datasets/PEMS/PEMS08/flow.npy present; now in $PWD"
+if [ ! -f train.py ] || [ ! -f tools/download_pems.py ]; then
+    log "run this from the traffic_pred repo root (with tools/download_pems.py); now in $PWD"
     exit 1
 fi
 mkdir -p logs "$W/logs"
@@ -57,6 +57,17 @@ grep -q -- "--time-transport" train.py trafficpred/models/__init__.py 2>/dev/nul
     log "!!! this checkout has no --adaptive-embed / --time-transport code; copy the current code over"
 # shellcheck disable=SC1091
 source setup.sh || { log "source setup.sh failed"; exit 1; }
+
+# The data, once: only the first job of a chain downloads (when flow.npy / hops.npy are missing); every later
+# job and every training run just reads the local .npy files (the dataloader never downloads anything).
+if [ -f datasets/PEMS/PEMS08/flow.npy ] && [ -f datasets/PEMS/PEMS08/hops.npy ]; then
+    log "data: datasets/PEMS/PEMS08 present, not downloading"
+else
+    log "data: datasets/PEMS/PEMS08 missing, downloading it once"
+    python tools/download_pems.py PEMS08 || {
+        log "!!! download failed (no internet on this compute node?): run  python tools/download_pems.py PEMS08"
+        log "    on the login node, then sbatch this script again"; exit 1; }
+fi
 command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | sed 's/^/    GPU: /'
 
 resubmit() {

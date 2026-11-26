@@ -3,6 +3,7 @@ torch
 torchvision
 matplotlib
 pandas
+pyarrow
 tqdm
 wandb
 optuna
