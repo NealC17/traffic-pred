@@ -13,7 +13,7 @@ from trafficpred.data.windows import (FlowWindows, MovingMNISTGenerator, MovingM
                                       PeriodicFlowWindows, base_datasets, limit)
 
 SPLIT_KEYS = ("train_files", "val_files", "test_files", "train_size", "val_size", "test_size", "external",
-              "periods", "period_shift", "test_days", "od", "od_slot", "ha", "fold_val", "weather")
+              "periods", "period_shift", "test_days", "od", "od_slot", "ha", "fold_val", "weather", "od_kernel")
 
 
 @dataclass
@@ -35,6 +35,8 @@ class Splits:
     extra_lags: tuple = ()   # how far back each of those extra frames is, in input order
     trend_lags: frozenset = frozenset()   # the lags that belong to a weekly period (ST-ResNet's trend)
     aux_in: int = 0   # extra input channels per frame after the flow ones (--od: 2), not predicted
+    train_mean: float = None   # raw-unit mean / std of the train frames (--zscore); None where not computed
+    train_std: float = None
 
     @property
     def in_frames(self):
@@ -96,8 +98,8 @@ class GridFlowData:
         self.pattern = re.compile(pattern)
         self.channels = channels
         self.steps_per_day = steps_per_day
-        self.test_frames = test_days * steps_per_day
-        self.val_frames = val_days * steps_per_day
+        self.test_frames = round(test_days * steps_per_day)   # fractional days allowed (PEMS: 20% of the frames)
+        self.val_frames = round(val_days * steps_per_day)
         self.horizon = horizon
 
     def files(self):
@@ -130,7 +132,8 @@ class GridFlowData:
 
     def splits(self, name, t_in, t_out, train_files=None, val_files=None, test_files=None,
                train_size=None, val_size=None, test_size=None, external=False, periods=None,
-               period_shift=0, test_days=None, od=False, od_slot=False, ha=False, fold_val=False, weather=False):
+               period_shift=0, test_days=None, od=False, od_slot=False, ha=False, fold_val=False, weather=False,
+               od_kernel=None):
         names = self.files()
         if not names:
             hint = f"; {self.source}" if self.source else ""
@@ -148,6 +151,9 @@ class GridFlowData:
         frames = [[files.load(n)[rows] for n, rows in group] for group in parts]
         lo = min(float(a.min()) for a in frames[0])
         hi = max(float(a.max()) for a in frames[0])
+        train_flat = np.concatenate([np.asarray(a, np.float64).ravel() for a in frames[0]])
+        train_mean, train_std = float(train_flat.mean()), float(train_flat.std())
+        del train_flat
         ext = [[None] * len(group) for group in parts]
         whole_ext = {}   # file -> its whole features (the periodic windows index the whole file)
         if external and self.calendar:
@@ -183,7 +189,15 @@ class GridFlowData:
             od_arr = files.load(self.od_file)
             if len(od_arr) != len(files.load(names[-1])):
                 raise ValueError(f"{self.od_file} doesn't match {names[-1]}; rerun tools/import_stdn_od.py")
-            maps.append(np.asarray(od_arr, dtype=np.float32))
+            od_arr = np.array(od_arr, dtype=np.float32)
+            if od_kernel:   # expected arrivals from another destination kernel (tools/ot_od_kernel.py)
+                if not od_slot:
+                    raise ValueError("--od-kernel replaces the per-slot kernel: add --od-slot")
+                k = files.load(os.path.join(os.path.dirname(self.od_file), f"od_kernel_slot_{od_kernel}.npy"))
+                T_, _, H_, W_ = od_arr.shape
+                s = np.arange(T_) % self.steps_per_day
+                od_arr[:, 1] = np.einsum("ti,tij->tj", od_arr[:, 0].reshape(T_, -1), np.asarray(k)[s]).reshape(T_, H_, W_)
+            maps.append(od_arr)
         if ha:
             if train_files or val_files or test_files or test_days or len(names) > 1:
                 raise ValueError("--ha goes with the default time split only (its means come from that train split)")
@@ -227,6 +241,8 @@ class GridFlowData:
             split["od"] = True
         if od_slot:
             split["od_slot"] = True
+        if od_kernel:
+            split["od_kernel"] = od_kernel
         if ha:
             split["ha"] = True
         if fold_val:
@@ -238,7 +254,8 @@ class GridFlowData:
                                if self.calendar else ext_data.DIM) if external else 0,
                       extra_in=extra_in,
                       extra_lags=extra_lags, trend_lags=trend_lags,
-                      aux_in=0 if od_maps is None else od_maps.shape[1])
+                      aux_in=0 if od_maps is None else od_maps.shape[1],
+                      train_mean=train_mean, train_std=train_std)
 
     def _spatial(self):
         if self.spatial_file is None:
@@ -452,6 +469,9 @@ class SyntheticData:
 BOUSAI_SOURCE = ("apply for Yahoo! Bousai Crowd Data at https://randd.yahoo.co.jp/en/softwaredata, then "
                  "convert flowio_*.npy with tools/import_grid.py (see its --help)")
 
+PEMS_SOURCE = ("download <DS>_series.parquet and <DS>_edges.parquet from huggingface.co/datasets/Davidham3/"
+               "pems-stsgcn into datasets/PEMS/<DS>/, then run python -I tools/import_pems.py <DS>")
+
 DATASETS = {
     "taxibj": GridFlowData("TaxiBJ", r"TaxiBJ/TaxiBJ20\d\d(_\d+)?\.npy", ("Inflow", "Outflow"),
                            steps_per_day=48, test_days=28, val_days=28, has_external=True),
@@ -487,6 +507,15 @@ DATASETS = {
     "stssl_nycbike1": StsslData("ST-SSL NYCBike1", "NYCBike1"),
     "stssl_nycbike2": StsslData("ST-SSL NYCBike2", "NYCBike2", ("Start", "End"), od_file="NYCBike2/od_aux.npy"),
     "stssl_bjtaxi": StsslData("ST-SSL BJTaxi", "BJTaxi"),
+    # PeMS highway sensors (STSGCN's release; tools/import_pems.py): 5-min flow, 12 -> 12, the usual
+    # chronological 6:2:2 split of the frames (test / val = the last 20% / the 20% before). Sensors lie along
+    # the width (H = 1); --external gives the calendar (STAEformer / STID's time-of-day and day-of-week).
+    "pems04": GridFlowData("PEMS04", r"PEMS/PEMS04/flow\.npy", ("Flow",), steps_per_day=288,
+                           test_days=0.2 * 16992 / 288, val_days=0.2 * 16992 / 288, horizon=(12, 12),
+                           source=PEMS_SOURCE, calendar=("2018-01-01", ("2018-01-01", "2018-01-15", "2018-02-19"))),
+    "pems08": GridFlowData("PEMS08", r"PEMS/PEMS08/flow\.npy", ("Flow",), steps_per_day=288,
+                           test_days=0.2 * 17856 / 288, val_days=0.2 * 17856 / 288, horizon=(12, 12),
+                           source=PEMS_SOURCE, calendar=("2016-07-01", ("2016-07-04",))),
     "mmnist": MovingMNISTData(),
     "synthetic": SyntheticData(),
 }
@@ -497,7 +526,7 @@ def get_splits(dataset="taxibj", t_in=None, t_out=None, **split):
     t_in = t_in or spec.horizon[0]
     t_out = t_out or spec.horizon[1]
     split = {k: v for k, v in split.items() if k in SPLIT_KEYS}
-    for key in ("periods", "period_shift", "test_days", "od", "od_slot", "ha", "fold_val", "weather"):
+    for key in ("periods", "period_shift", "test_days", "od", "od_slot", "ha", "fold_val", "weather", "od_kernel"):
         if not split.get(key):
             split.pop(key, None)
     if split.get("weather") and not getattr(spec, "weather", None):
@@ -553,6 +582,11 @@ def add_data_args(ap):
                    help="with --od and --od-head: also pass each frame's time-of-day slot, so the transport "
                         "head starts from that slot's destination kernel instead of the all-day one. Only the "
                         "head reads it; the encoders see the same inputs as with --od alone")
+    g.add_argument("--od-kernel", choices=("ot", "dest"),
+                   help="with --od --od-slot: replace the real per-slot destination kernel (from STDN's trips) by "
+                        "one from the counts alone (tools/ot_od_kernel.py): ot = entropic OT from the Start to the "
+                        "next End map, dest = the next End share for every origin. Both the expected-arrivals "
+                        "input map and --od-head's prior use it"),
     g.add_argument("--ha", action="store_true",
                    help="grid datasets: 2 C more input maps per frame, the usual value of every channel at that "
                         "frame's time of week and at the next one (train-period means; on train frames the frame "

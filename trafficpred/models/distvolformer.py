@@ -51,14 +51,98 @@ def sinkhorn_attention(attn, x, iters):
     return attn.out_proj(out)
 
 
+class ModeMixer(nn.Module):
+    """Low-rank spatial mixing in place of self-attention (--spatial-modes r): the N tokens are read into r
+    learned spatial modes, Z = V^T h (r x dim), and written back, U (Z W) (N x dim), so every token reaches
+    every other one through r shared global patterns instead of an N x N attention matrix. The modes are
+    fixed after training (experiment A of the mode study).
+
+    gate (--mode-gate, experiment B): each mode's contents are scaled by g = 1 + tanh(G(Z)) before they are
+    written back, G = a linear map within each mode (across features) + one across modes (r x r), so the
+    input turns modes up or down and modes act on each other. G starts at zero: B starts as A."""
+
+    def __init__(self, tokens, dim, rank, drop, gate=False):
+        super().__init__()
+        self.V = nn.Parameter(torch.randn(tokens, rank) / tokens ** 0.5)
+        self.U = nn.Parameter(torch.randn(tokens, rank) / rank ** 0.5)
+        self.mix = nn.Linear(dim, dim)
+        self.drop = nn.Dropout(drop)
+        self.gate_feat = self.gate_mode = None
+        if gate:
+            self.gate_norm = nn.LayerNorm(dim, elementwise_affine=False)
+            self.gate_feat = nn.Linear(dim, dim)
+            self.gate_mode = nn.Linear(rank, rank, bias=False)
+            for p in (self.gate_feat.weight, self.gate_feat.bias, self.gate_mode.weight):
+                nn.init.zeros_(p)
+
+    def forward(self, h):                       # (B, N, dim)
+        z = torch.einsum("nr,bnd->brd", self.V, h)
+        if self.gate_feat is not None:
+            zn = self.gate_norm(z)
+            g = 1 + torch.tanh(self.gate_feat(zn) + self.gate_mode(zn.transpose(1, 2)).transpose(1, 2))
+            z = g * z
+        return self.drop(torch.einsum("nr,brd->bnd", self.U, self.mix(z)))
+
+
+class LatentTransport(nn.Module):
+    """Spatial mixing by entropic optimal transport with a learned cost (--latent-transport K), in place of
+    self-attention. Every token i is a unit of mass at phi(z_i) in a learned "now" space; every token j asks
+    for one unit at psi(z_j) in a learned "next" space. The cost of moving i to j has two learned parts, and
+    no hand-made ground cost:
+      - state: ||phi(z_i) - psi(z_j)||, the unsquared distance. (A squared distance would reduce to the dot
+        product under Sinkhorn's row / column scalings, i.e. Sinkformer attention; this one doesn't.)
+      - topology: softplus(w) ||e_i - e_j||, e_i a learned position of token i (a sensor or cell) in a
+        latent space, so the model finds how far apart the sensors are for moving mass between them.
+    The plan is K log-domain Sinkhorn steps on -cost / eps (eps learned per head, balanced uniform marginals),
+    ending on the destinations, and token j receives the barycentric transport of the values: sum_i P_ij v_i.
+
+    n_src (--time-transport, the temporal blocks): only the first n_src tokens send mass (the input frames),
+    every token receives it (input and future frames), so the future tokens are made of transported input
+    tokens; the topology is then over the lags / target steps. Each destination gets 1 unit, so each source
+    sends M / n_src: every input frame must be shipped somewhere, which attention needn't do."""
+
+    def __init__(self, tokens, dim, heads, drop, iters, topo_dim=16, n_src=None):
+        super().__init__()
+        self.heads, self.iters, self.drop, self.n_src = heads, iters, drop, n_src
+        self.src, self.dst, self.val, self.out = (nn.Linear(dim, dim) for _ in range(4))
+        self.topo = nn.Parameter(0.1 * torch.randn(heads, tokens, topo_dim))
+        self.topo_w = nn.Parameter(torch.zeros(heads))
+        self.log_eps = nn.Parameter(torch.zeros(heads))
+
+    @staticmethod
+    def _dist(a, b):   # (..., N, d), (..., M, d) -> (..., M, N) Euclidean distances, safe gradient at 0
+        sq = b.pow(2).sum(-1, keepdim=True) + a.pow(2).sum(-1)[..., None, :] - 2 * b @ a.transpose(-2, -1)
+        return (sq.clamp_min(0) + 1e-4).sqrt()
+
+    def forward(self, x):
+        B, N, D = x.shape
+        S = self.n_src or N
+        split = lambda t: t.reshape(B, t.shape[1], self.heads, -1).transpose(1, 2)   # (B, h, tokens, d)
+        a, b, v = split(self.src(x[:, :S])), split(self.dst(x)), split(self.val(x[:, :S]))
+        cost = self._dist(a, b) + F.softplus(self.topo_w)[:, None, None] * self._dist(self.topo[:, :S], self.topo)
+        logits = -cost / self.log_eps.exp()[:, None, None]                     # (B, h, N dest, S sources)
+        col = float(np.log(N / S))   # each source sends N / S units (0 when every token is a source)
+        for i in range(self.iters):   # odd count ends on the rows: each destination's weights sum to 1
+            logits = (logits - logits.logsumexp(dim=-1, keepdim=True)) if i % 2 == 0 else \
+                     (logits - logits.logsumexp(dim=-2, keepdim=True) + col)
+        plan = F.dropout(logits.exp(), self.drop, self.training)
+        return self.out((plan @ v).transpose(1, 2).reshape(B, N, D))
+
+
 class AdaLNBlock(nn.Module):
     grad_checkpoint = False   # train.py --grad-checkpoint: recompute the block in the backward pass
 
-    def __init__(self, dim, heads, mlp_dim, cond_dim, drop, sinkformer=0):
+    def __init__(self, dim, heads, mlp_dim, cond_dim, drop, sinkformer=0, modes=None, transport=None):
+        """modes: (tokens, rank) to mix tokens with a ModeMixer instead of self-attention.
+        transport: (tokens, Sinkhorn steps[, sources]) to mix them with a LatentTransport instead."""
         super().__init__()
         self.sinkformer = sinkformer
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
-        self.attn = nn.MultiheadAttention(dim, heads, dropout=drop, batch_first=True)
+        self.modes = ModeMixer(modes[0], dim, modes[1], drop, *modes[2:]) if modes else None
+        if transport:
+            self.modes = LatentTransport(transport[0], dim, heads, drop, transport[1],
+                                         n_src=transport[2] if len(transport) > 2 else None)
+        self.attn = None if self.modes is not None else nn.MultiheadAttention(dim, heads, dropout=drop, batch_first=True)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
         self.mlp = nn.Sequential(nn.Linear(dim, mlp_dim), nn.GELU(), nn.Dropout(drop),
                                  nn.Linear(mlp_dim, dim), nn.Dropout(drop))
@@ -74,7 +158,9 @@ class AdaLNBlock(nn.Module):
     def _forward(self, x, cond):
         shift1, scale1, gate1, shift2, scale2, gate2 = self.ada(cond)[:, None].chunk(6, dim=-1)
         h = self.norm1(x) * (1 + scale1) + shift1
-        if self.sinkformer:
+        if self.modes is not None:
+            a = self.modes(h)
+        elif self.sinkformer:
             a = sinkhorn_attention(self.attn, h, self.sinkformer)
         else:
             a = self.attn(h, h, h, need_weights=False)[0]
@@ -119,17 +205,30 @@ class SpaceTimeTransformer(nn.Module):
     across patches within each frame (spatial). The head reads the target tokens only."""
 
     def __init__(self, cin_frame, cout_step, T_in, T_out, grid, patch, dim, depth, heads, mlp_dim,
-                 cond_dim, drop, sinkformer=0):
+                 cond_dim, drop, sinkformer=0, spatial_modes=0, mode_gate=False, latent_transport=0,
+                 time_transport=0, adaptive_embed=False):
         super().__init__()
         self.patch, self.T_in, self.T_out, self.cout_step = patch, T_in, T_out, cout_step
         self.embed = nn.Conv2d(cin_frame, dim, patch, stride=patch)
         tokens = (grid[0] // patch) * (grid[1] // patch)
-        self.pos = nn.Parameter(torch.zeros(1, 1, tokens, dim))
-        self.frame = nn.Parameter(torch.zeros(1, T_in + T_out, 1, dim))   # lag / target-step embedding
         self.target = nn.Parameter(torch.zeros(1, T_out, 1, dim))
-        for p in (self.pos, self.frame, self.target):
+        if adaptive_embed:   # STAEformer's spatio-temporal adaptive embedding: one free vector per (frame, patch)
+            self.adaptive = nn.Parameter(torch.zeros(1, T_in + T_out, tokens, dim))
+            params = (self.adaptive, self.target)
+        else:                # separable: a position per patch + an embedding per frame (lag / target step)
+            self.adaptive = None
+            self.pos = nn.Parameter(torch.zeros(1, 1, tokens, dim))
+            self.frame = nn.Parameter(torch.zeros(1, T_in + T_out, 1, dim))
+            params = (self.pos, self.frame, self.target)
+        for p in params:
             nn.init.trunc_normal_(p, std=0.02)
-        self.blocks = nn.ModuleList(AdaLNBlock(dim, heads, mlp_dim, cond_dim, drop, sinkformer) for _ in range(depth))
+        modes = (tokens, spatial_modes, mode_gate) if spatial_modes else None   # spatial blocks only; temporal keep attention
+        transport = (tokens, latent_transport) if latent_transport else None   # spatial blocks
+        # temporal blocks: the T_in input frames send, all T_in + T_out frames receive
+        t_transport = (T_in + T_out, time_transport, T_in) if time_transport else None
+        self.blocks = nn.ModuleList(AdaLNBlock(dim, heads, mlp_dim, cond_dim, drop, sinkformer,
+                                               modes if i % 2 == 1 else None,
+                                               transport if i % 2 == 1 else t_transport) for i in range(depth))
         self.norm = nn.LayerNorm(dim, elementwise_affine=False)
         self.final_ada = nn.Linear(cond_dim, 2 * dim)
         nn.init.zeros_(self.final_ada.weight)
@@ -145,7 +244,8 @@ class SpaceTimeTransformer(nn.Module):
         target = self.target.expand(B, -1, h * w, -1)
         if target_add is not None:
             target = target + target_add[:, :, None]
-        z = torch.cat([tokens, target], dim=1) + self.pos + self.frame          # (B, F, N, D)
+        z = torch.cat([tokens, target], dim=1)                                    # (B, F, N, D)
+        z = z + (self.adaptive if self.adaptive is not None else self.pos + self.frame)
         F_, N, D = z.shape[1:]
         for i, block in enumerate(self.blocks):
             if i % 2 == 0:   # temporal: each patch's sequence of frames
@@ -278,7 +378,8 @@ class DistVolFormer(nn.Module):
                  transport=0, n_periodic=0, sinkformer=0, time_tokens=False,
                  vol_transformer=False, vol_dim=128, vol_depth=3, graph=False, graph_radius=0,
                  count_scale=0.0, count_offset=0.0, direct=False, aux=0, od_head=None, od_slot_scale=0.0,
-                 ext_dim=0, ext_input=False, ext_volume=False):
+                 ext_dim=0, ext_input=False, ext_volume=False, spatial_modes=0, mode_head=0, mode_init="random", mode_gate=False,
+                 crop_pad=False, latent_transport=0, time_transport=0, adaptive_embed=False, zscore=None):
         """aux: extra input maps per frame after the C flow channels (--od), fed as log-flow maps next to
         the flow's (in every layout: stacked, time tokens, graph, volume transformer); not predicted.
 
@@ -290,7 +391,16 @@ class DistVolFormer(nn.Module):
 
         direct: the ablation without the factorisation -- the same inputs and backbone (the volume
         encoder still conditions the distribution transformer), but the head outputs the flow itself
-        instead of softmax logits, and there is no total-volume head."""
+        instead of softmax logits, and there is no total-volume head.
+
+        spatial_modes r (--spatial-modes, with time_tokens): the spatial blocks mix tokens through r learned
+        modes (ModeMixer) instead of self-attention; mode_gate (--mode-gate) gates the modes from the input. mode_head r (--mode-head): the logits get a low-rank
+        term Phi a, Phi (C, H*W, r) learned spatial modes, a = a linear map of the volume code (zero at the
+        start); mode_init "pca" starts Phi from the train split's change modes (init_modes).
+
+        crop_pad (time_tokens, patch 1; set for sensor data, H = 1): the grid is padded to a multiple of 4 for
+        the volume U-Net only; the transformer gets the H x W cells themselves (padding H = 1 to 4 would
+        quadruple the tokens with empty rows)."""
         super().__init__()
         self.count_scale, self.count_offset = count_scale, count_offset
         self.od_slot_scale = od_slot_scale
@@ -323,12 +433,38 @@ class DistVolFormer(nn.Module):
         self.T_in, self.T_out, self.C, self.H, self.W = T_in, T_out, C, H, W
         self.aux = aux
         k_in, k_out = T_in * C, T_out * C
+        if mode_gate and not spatial_modes:
+            raise ValueError("--mode-gate gates the --spatial-modes mixer: give --spatial-modes")
+        if spatial_modes and not time_tokens:
+            raise ValueError("--spatial-modes replaces the time-token transformer's spatial attention: add --time-tokens")
+        if latent_transport and (not time_tokens or spatial_modes or sinkformer):
+            raise ValueError("--latent-transport replaces the time-token transformer's spatial attention: add "
+                             "--time-tokens, and no --spatial-modes / --sinkformer")
+        if adaptive_embed and not time_tokens:
+            raise ValueError("--adaptive-embed is a per-(frame, patch) embedding of the time-token transformer: add --time-tokens")
+        # --zscore: (mean, std) of the train flow in the 0-1 data scale; the direct head predicts
+        # (x - mean) / std, the papers' z-scored target, and is mapped back here (the loss is scaled in train.py)
+        self.zscore = tuple(zscore) if zscore else None
+        if time_transport and (not time_tokens or sinkformer):
+            raise ValueError("--time-transport replaces the time-token transformer's temporal attention: add "
+                             "--time-tokens, and no --sinkformer")
+        if mode_head and (direct or transport):
+            raise ValueError("--mode-head adds to softmax logits: no --direct / --transport")
+        self.mode_init = mode_init
+        self.phi = nn.Parameter(torch.randn(C, H * W, mode_head) / (H * W) ** 0.5) if mode_head else None
+        if mode_head:
+            self.mode_coef = nn.Linear(code_dim, T_out * C * mode_head)
+            nn.init.zeros_(self.mode_coef.weight)
+            nn.init.zeros_(self.mode_coef.bias)
         a_in = T_in * aux
         e_in = (T_in + T_out) * EXT_EMBED if self.ext_embed is not None else 0   # stacked layouts
         self.pad_h, self.pad_w = -H % 4, -W % 4
         self.pad_h += -(H + self.pad_h) % patch
         self.pad_w += -(W + self.pad_w) % patch
         grid = (H + self.pad_h, W + self.pad_w)
+        if crop_pad and not (time_tokens and patch == 1):
+            raise ValueError("crop_pad goes with time_tokens and patch 1")
+        self.crop_pad = crop_pad
         if vol_transformer:
             self.vol_enc = VolumeTransformer(3 * C + aux, C, T_in, T_out, width, vol_dim, vol_depth,
                                              max(1, vol_dim // 32), code_dim, drop)
@@ -339,8 +475,10 @@ class DistVolFormer(nn.Module):
             self.dist_enc = GraphTransformer(2 * k_in + a_in + e_in, k_out + g_out, H, W, dim, depth, heads, mlp_dim,
                                              code_dim, drop, graph_radius)
         elif time_tokens:
-            self.dist_enc = SpaceTimeTransformer(2 * C + aux + (EXT_EMBED if self.ext_embed is not None else 0), C + g_out, T_in, T_out, grid, patch, dim, depth,
-                                                 heads, mlp_dim, code_dim, drop, sinkformer)
+            self.dist_enc = SpaceTimeTransformer(2 * C + aux + (EXT_EMBED if self.ext_embed is not None else 0), C + g_out, T_in, T_out,
+                                                 (H, W) if crop_pad else grid, patch, dim, depth,
+                                                 heads, mlp_dim, code_dim, drop, sinkformer, spatial_modes, mode_gate,
+                                                 latent_transport, time_transport, adaptive_embed)
         else:
             self.dist_enc = DistTransformer(2 * k_in + a_in + e_in, self.transport.channels if transport else k_out + g_out,
                                             grid, patch,
@@ -411,6 +549,8 @@ class DistVolFormer(nn.Module):
                 features = torch.cat([features, extra.reshape(B, T, A, Hp, Wp)], 2)
             if e_frames is not None:   # each input frame its own features; the targets' go to the target tokens
                 features = torch.cat([features, e_frames[:, :T, :, None, None].expand(-1, -1, -1, Hp, Wp)], 2)
+            if self.crop_pad:
+                features = features[..., :H, :W]
         else:
             if A:
                 features = torch.cat([features, extra], 1)
@@ -420,6 +560,8 @@ class DistVolFormer(nn.Module):
 
         if self.direct:
             x_hat = self.dist_enc(features, code, **dist_kw)[..., :H, :W].reshape(B, self.T_out, C, H, W)
+            if self.zscore:
+                x_hat = self.zscore[0] + self.zscore[1] * x_hat
             return (x_hat, *split_flow(x_hat)) if return_parts else x_hat
         if self.transport is not None:
             p_hat = self.transport(self.dist_enc(features, code, **dist_kw)[..., :H, :W], p_in, H, W)
@@ -430,6 +572,9 @@ class DistVolFormer(nn.Module):
             logits = out.reshape(B, self.T_out, C, H * W)
             if self.dist_residual:
                 logits = logits + log_last_distribution(p_in)
+            if self.phi is not None:   # + Phi a: r global modes per channel, activations from the volume code
+                a = self.mode_coef(code).reshape(B, self.T_out, C, -1)
+                logits = logits + torch.einsum("cnr,btcr->btcn", self.phi, a)
             p_hat = logits.softmax(dim=-1).reshape(B, self.T_out, C, H, W)
 
         if not self.vol_transformer:
@@ -445,3 +590,28 @@ class DistVolFormer(nn.Module):
         if return_parts:
             return x_hat, p_hat, n_hat
         return x_hat
+
+    @torch.no_grad()
+    def init_modes(self, basis):
+        """Phi from (C, H*W, r) modes, e.g. tools / train.py's pca of the train split's change maps."""
+        self.phi.copy_(torch.as_tensor(basis, dtype=self.phi.dtype))
+
+
+def change_modes(train, C, rank, samples=4000):
+    """(C, H*W, rank) top principal directions of the train windows' change in log distribution, log p(target)
+    - log p(last input frame), per channel: the data's own modes of how the map moves one step."""
+    from trafficpred.models.distvol import RESIDUAL_FLOOR
+    idx = np.linspace(0, len(train) - 1, min(len(train), samples)).astype(int)
+    d = []
+    for i in idx:
+        item = train[i]
+        x, y = item[0][-1, :C].double().clamp_min(0), item[1][0, :C].double().clamp_min(0)
+        lp = lambda m: torch.log(m.flatten(1) / (m.flatten(1).sum(-1, keepdim=True) + 1e-9) + RESIDUAL_FLOOR)
+        d.append((lp(y) - lp(x)).numpy())
+    d = np.stack(d)                                     # (S, C, N)
+    out = []
+    for c in range(C):
+        A = d[:, c] - d[:, c].mean(0)
+        out.append(np.linalg.svd(A, full_matrices=False)[2][:rank].T)
+    return np.stack(out).astype(np.float32)
+

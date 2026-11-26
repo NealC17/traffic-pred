@@ -346,6 +346,13 @@ Predictions are clamped to `[0, 1]` and scored by `trafficpred/metrics.py`:
 - **how much** (each map summed): `volume_err` (relative), `volume_mae_flow`
 - every metric per prediction step: `mse_t1`, `sinkhorn_t1`, ...
 
+For the STDN-protocol runs, `tools/compare_published.py` scores runs against the papers' numbers.
+`tools/risk_eval.py` gives an empirical risk analysis:
+- the train / val / test RMSE and the generalisation gap;
+- tail risk (per-window percentiles and CVaR95);
+- RMSE by demand quartile;
+- a day-level block bootstrap of each run's difference from a `--baseline` run.
+
 W&B (project `traffic-pred`, override with `WANDB_PROJECT`) gets live progress, val metrics every
 epoch, prediction heatmaps, the final test metrics and their ratio to copy-last
 (`vs_copy_last/*`, below 1 = better). Offline: `WANDB_MODE=offline`, then
@@ -511,7 +518,110 @@ weather in every form gave no RMSE gain or hurt. OT only helps the spatial (GeOT
     NYCBike2's test weather looks like its training weather. So weather inputs fit a few events in
     training that don't recur at test time. Month or week number wouldn't help either: the 60-day
     datasets never show the test period's values in training.
-32. **Weather on the volume head only** (`--ext-volume`): running.
+32. **Weather on the volume head only** (`--ext-volume`). This is the least harmful way in for
+    weather, but it is still no gain on NYCTaxi. On NYCBike2 the small edge for DistVolFormer is
+    within seed noise:
+
+    | | none | weather, conditioning | weather, input | weather, volume head only |
+    |---|---|---|---|---|
+    | NYCTaxi DistVol | 23.38 / 18.77 | 24.51 / 19.77 | 25.77 / 20.84 | 24.13 / 19.23 |
+    | NYCTaxi DistVolFormer | 23.47 / 18.99 | 23.82 / 19.45 | 24.95 / 20.67 | 23.65 / 19.03 |
+    | NYCBike2 DistVol | 9.05 / 8.60 | 8.92 / 8.34 | 9.13 / 8.53 | 9.00 / 8.39 |
+    | NYCBike2 DistVolFormer | 8.93 / 8.18 | 9.07 / 8.33 | 8.90 / 8.22 | 8.79 / 8.16 |
+
+    Keeping weather out of the map branch removes most of the taxi damage, so most of that damage
+    came from the map branch. The total forecast doesn't use weather well either: it is still
+    slightly worse than no weather.
+33. **Spatial modes, experiments A0 and A** (`train_modes.sh`; baseline DistVolFormer with time
+    tokens, 23.47 / 18.99 and 8.93 / 8.18). The motivating checks, on train data:
+    - The maps are low-rank: 16 modes explain 93% of NYCTaxi's maps.
+    - The step-to-step changes are much less so: 32 modes capture 93% on NYCTaxi and only 53% on
+      TaxiBJ.
+    - Modes fit on the training period capture about 10 points less of the test period's changes
+      at r = 8–16. The modes drift.
+
+    Variants:
+    - A0, `--mode-head R`: the logits get + Φa, with Φ starting from the train split's change modes
+      (PCA) or at random.
+    - A, `--spatial-modes R`: the spatial blocks mix tokens through R fixed learned modes,
+      U(VᵀH)W, instead of attention. 7.18M parameters vs 7.51M.
+
+    | | NYCTaxi | NYCBike2 |
+    |---|---|---|
+    | attention (baseline) | 23.47 / 18.99 | 8.93 / 8.18 |
+    | A, modes r = 8 | 23.44 / 18.90 | 8.97 / 8.37 |
+    | A, modes r = 16 | 23.44 / 18.80 | 9.08 / 8.41 |
+    | A, modes r = 32 | 23.56 / 18.90 | 9.08 / 8.34 |
+    | A0, head, random, r = 32 | 23.59 / 18.94 | 9.34 / 8.64 |
+    | A0, head, PCA, r = 16 | 23.74 / 19.09 | 9.15 / 8.56 |
+    | A0, head, PCA, r = 32 | 23.75 / 19.03 | 9.27 / 8.76 |
+
+    - A0 is worse everywhere, and the PCA start is worse than the random one on NYCTaxi. A low-rank
+      term on top of a full-rank output adds nothing, and the train-period modes drift.
+    - A is mixed. On NYCTaxi, fixed modes tie attention on Start and are slightly better on End (r =
+      16: 18.80 ± 0.03 vs 18.99 ± 0.11, about 3 standard errors). On NYCBike2 they are worse on End
+      by about 0.2 (Start is within noise).
+    - So fixed, input-independent spatial mixing is about as good as attention on taxi but not on
+      bikes. Input-dependent gating (experiment B) is the next test.
+    - Risk analysis on NYCTaxi (`tools/risk_eval.py`, both channels together):
+      - Every variant has the same generalisation gap, train 17.0–17.3 → test 21.0–21.1 (about +3.9).
+        The mixer fits the training period slightly better without overfitting more.
+      - The worst 5% of windows (CVaR95 about 35.6–36.0) are hit about equally.
+      - The mixer's edge is mostly in the quietest quartile of windows (13.45 vs 13.70).
+      - Against attention, r = 16 is −0.11 RMSE, with a 95% interval of [−0.29, +0.05] from a
+        bootstrap over the 20 test days, and better in 91% of resamples. Not established. The
+        test-day uncertainty (about ±0.17) is larger than the seed spread that `compare_published`'s
+        verdicts use.
+34. **Gated spatial modes, experiment B** (`train_modes_gated.sh`, `--spatial-modes R --mode-gate`).
+    Each mode is scaled by 1 + tanh(G(Z)), with G linear within and across modes and zero at the
+    start. Worse than fixed modes on both datasets:
+
+    | | NYCTaxi | NYCBike2 | NYCBike2 vs attention, both channels [95% day-bootstrap] |
+    |---|---|---|---|
+    | attention | 23.47 / 18.99 | 8.93 / 8.18 | – |
+    | A, fixed, r = 8 | 23.44 / 18.90 | 8.97 / 8.37 | +0.12 [+0.04, +0.20] |
+    | A, fixed, r = 16 | 23.44 / 18.80 | 9.08 / 8.41 | +0.19 [+0.13, +0.26] |
+    | B, gated, r = 8 | 23.57 / 18.95 | 9.15 / 8.55 | +0.29 [+0.22, +0.37] |
+    | B, gated, r = 16 | 23.51 / 18.97 | 9.19 / 8.48 | +0.28 [+0.19, +0.39] |
+
+    - On NYCTaxi, gating loses A's small edge and lands on attention (+0.01 and +0.03 against it).
+    - On NYCBike2 every mode variant is worse than attention, with day-bootstrap intervals that
+      exclude zero, and gating makes it worse still.
+    - The gated r = 16 model has a higher bike train error (7.52 vs 6.79 for attention), so it is
+      harder to train rather than overfitting.
+    - Conclusion: making the modes depend on the input doesn't recover what attention does on
+      bikes. This doesn't support the dynamic-modes direction (experiment C).
+35. **OT destination kernel from counts alone** (NYCBike2, `tools/ot_od_kernel.py`, `--od-kernel`).
+    Entropic OT between the mean Start map at slot s and the mean End map at s+1 is the doubly
+    constrained gravity model. Its plan estimates where trips go, with no OD data. Measured against
+    the real per-slot kernel from STDN's trips, using training days only:
+
+    | kernel | TV to real | mean trip (cells) | arrivals error |
+    |---|---|---|---|
+    | real all-day kernel (OD data) | 0.224 | 2.43 | 27.5% |
+    | Sinkhorn OT, ε = 2 | 0.270 | 2.22 | 11.6% |
+    | gravity without OT balancing, ε = 2 | 0.284 | 2.18 | 27.7% |
+    | destination share only | 0.358 | 3.47 | 16.0% |
+    | identity | 0.939 | 0 | 53.2% |
+
+    - The OT kernel's expected arrivals are closer to the real slot kernel's than the real all-day
+      kernel's are, and the OT balancing step halves the error. The real per-slot kernel's mean trip
+      is 2.45 cells.
+    - Training check (`train_od_kernel.sh`): the tuned DistVolFormer with `--od --od-slot --od-head`,
+      with the real kernel swapped for the OT one or the destination-share one (both the head's prior
+      and the arrivals input). The in-progress input map is still from the OD data. STDN metric
+      (test RMSE, cells with true > 10), mean ± sd over seeds 42 / 7 / 123:
+
+      | kernel | Start | End | seed ensemble S / E |
+      |---|---|---|---|
+      | real per-slot kernel | 8.62 ± 0.06 | 7.96 ± 0.06 | 8.48 / 7.87 |
+      | Sinkhorn OT, ε = 2 | 8.63 ± 0.08 | 7.98 ± 0.06 | 8.49 / 7.90 |
+      | destination share only | 8.64 ± 0.04 | 8.09 ± 0.12 | 8.49 / 7.99 |
+      | no OD (tuned DistVolFormer) | 8.66 ± 0.02 | 8.13 ± 0.04 | 8.52 / 8.01 |
+
+    - The OT kernel recovers almost all of the real kernel's gain (End 7.98 vs 7.96), and the
+      destination-share kernel only part of it. All three beat STDN (8.85 / 8.15) and trail Wang et
+      al. with weather (8.32 / 7.66). OT is closed after this.
 
 ## Look at predictions
 

@@ -1,0 +1,94 @@
+"""Score PEMS04 / PEMS08 checkpoints the way the PeMS papers do (STSGCN, STID, STAEformer, STD-MAE): MAE,
+RMSE and MAPE of the flow over all 12 forecast steps together, and at steps 3 / 6 / 12 (15 / 30 / 60 min).
+The masked numbers leave out readings whose true value is 0 (the BasicTS / STAEformer masked metrics with
+null value 0); the "all" MAE / RMSE keep them. Seeds of a run are averaged (mean and sample sd).
+
+  python tools/eval_pems.py checkpoints/workspaces/pems_pems08 [--match REGEX]
+"""
+import argparse
+import collections
+import glob
+import os
+import re
+import statistics as st
+import sys
+
+import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from eval_published import predictions                       # noqa: E402
+from trafficpred.utils import pick_device                     # noqa: E402
+
+# averaged over the 12 steps, masked: (MAE, RMSE, MAPE %), from the papers' own tables
+PUBLISHED = {
+    "pems04": [("STID (CIKM'22), in STAEformer's table", (18.38, 29.95, 12.04)),
+               ("STAEformer (CIKM'23)", (18.22, 30.18, 11.98)),
+               ("STD-MAE (IJCAI'24, long-history pre-training)", (17.80, 29.25, 11.97))],
+    "pems08": [("STID (CIKM'22), in STAEformer's table", (14.21, 23.28, 9.27)),
+               ("STAEformer (CIKM'23)", (13.46, 23.25, 8.88)),
+               ("STD-MAE (IJCAI'24, long-history pre-training)", (13.44, 22.47, 8.76))],
+}
+
+
+def scores(pred, true):
+    pred, true = pred.flatten(2), true.flatten(2)                    # (N, T, sensors)
+    out = {}
+    for name, steps in (("avg", slice(None)), ("h3", slice(2, 3)), ("h6", slice(5, 6)), ("h12", slice(11, 12))):
+        p, t = pred[:, steps], true[:, steps]
+        keep = t > 0.5                                               # true 0 (counts); float error stays away
+        e = (p - t)[keep]
+        out[name] = (e.abs().mean().item(), e.pow(2).mean().sqrt().item(), (e.abs() / t[keep]).mean().item() * 100)
+        if name == "avg":
+            out["all"] = ((p - t).abs().mean().item(), (p - t).pow(2).mean().sqrt().item())
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("paths", nargs="+")
+    ap.add_argument("--match")
+    ap.add_argument("--split", default="test", choices=("val", "test"))
+    ap.add_argument("--batch-size", type=int, default=64)
+    args = ap.parse_args()
+    device = pick_device()
+    paths = []
+    for p in args.paths:
+        paths += sorted(glob.glob(os.path.join(p, "*.pt"))) if os.path.isdir(p) else [p]
+    paths = [p for p in paths if not p.endswith(".last.pt")]
+    paths = [p for p in paths if os.path.exists(p[:-3] + ".done") or not glob.glob(os.path.join(os.path.dirname(p), "*.done"))]
+    if args.match:
+        paths = [p for p in paths if re.search(args.match, os.path.basename(p))]
+    runs, dataset = collections.defaultdict(list), None
+    for path in paths:
+        ck, pred, true = predictions(path, device, args.split, args.batch_size)
+        if dataset and ck["dataset"] != dataset:
+            raise SystemExit("give runs of one dataset at a time")
+        dataset = ck["dataset"]
+        runs[re.sub(r"_seed\d+$", "", os.path.basename(path)[:-3])].append(scores(pred, true))
+        print(f"scored {os.path.basename(path)}", file=sys.stderr, flush=True)
+    if not runs:
+        raise SystemExit("no finished runs matched")
+
+    def ms(vals):
+        return f"{st.mean(vals):6.2f}" + (f" ±{st.stdev(vals):4.2f}" if len(vals) > 1 else "      ")
+
+    print(f"{dataset} {args.split}: flow, 12 steps, masked (true > 0) unless 'all'; mean ± sd over seeds")
+    print(f"  {'run':52}{'n':>2}  {'MAE':>12}{'RMSE':>12}{'MAPE %':>12}   {'all MAE':>8}{'all RMSE':>9}   "
+          f"{'MAE@3':>8}{'MAE@6':>8}{'MAE@12':>8}")
+    order = sorted(runs, key=lambda r: st.mean(s["avg"][0] for s in runs[r]))
+    for r in order:
+        s = runs[r]
+        cols = [ms([x["avg"][k] for x in s]) for k in range(3)]
+        print(f"  {r[:52]:52}{len(s):2d}  " + "".join(f"{c:>12}" for c in cols)
+              + f"   {st.mean(x['all'][0] for x in s):8.2f}{st.mean(x['all'][1] for x in s):9.2f}   "
+              + "".join(f"{st.mean(x[h][0] for x in s):{w}.2f}" for h, w in (("h3", 8), ("h6", 8), ("h12", 8))))
+    if args.split == "test" and dataset in PUBLISHED:
+        print("\npublished (12-step average, masked): MAE / RMSE / MAPE")
+        for name, (mae, rmse, mape) in PUBLISHED[dataset]:
+            print(f"  {name:52}{mae:8.2f}{rmse:8.2f}{mape:8.2f}")
+
+
+if __name__ == "__main__":
+    main()

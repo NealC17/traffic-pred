@@ -7,6 +7,7 @@ from trafficpred.models.distvol import DistVolNet
 from trafficpred.models.distvolformer import DistVolFormer
 from trafficpred.models.mlp import MLP
 from trafficpred.models.predformer import VARIANTS, PredFormer, with_horizon
+from trafficpred.models.stid import STID
 from trafficpred.models.stresnet import STResNet
 
 
@@ -80,7 +81,8 @@ def _od_head(args, splits):   # only stored when on, so older checkpoints' kwarg
     if splits.lo != 0:
         raise SystemExit("--od-head moves scaled counts: it needs data whose minimum is 0")
     slot = bool(splits.split.get("od_slot"))
-    kernel = os.path.join(files.ROOT, os.path.dirname(spec.od_file), "od_kernel_slot.npy" if slot else "od_kernel.npy")
+    suffix = f"_{splits.split['od_kernel']}" if splits.split.get("od_kernel") else ""
+    kernel = os.path.join(files.ROOT, os.path.dirname(spec.od_file), f"od_kernel_slot{suffix}.npy" if slot else "od_kernel.npy")
     if not os.path.exists(kernel):
         raise SystemExit(f"{kernel} missing: rerun tools/import_stdn_od.py")
     return {"od_head": kernel, **({"od_slot_scale": splits.span} if slot else {})}
@@ -100,7 +102,38 @@ def _configure_distvolformer(args, splits):
                 mlp_dim=_pick(args, "mlp_dim", 4 * dim), drop=_pick(args, "drop", 0.1), **_residual(args, splits),
                 **({"sinkformer": args.sinkformer} if getattr(args, "sinkformer", None) else {}),
                 **({"time_tokens": True} if getattr(args, "time_tokens", False) else {}),
-                **_log_counts(args, splits), **_od_head(args, splits), **_ext(splits, args))
+                **_log_counts(args, splits), **_od_head(args, splits), **_ext(splits, args), **_modes(args),
+                **_zscore(args, splits),
+                **({"crop_pad": True} if splits.shape[1] == 1 and getattr(args, "time_tokens", False)
+                   and _pick(args, "patch_size", 2) == 1 else {}))   # sensor data (PEMS): no empty token rows
+
+
+def zscore_of(splits):
+    """The train flow's (mean, std) in the 0-1 data scale, for --zscore."""
+    if splits.train_mean is None:
+        raise SystemExit("--zscore needs the train mean / std, which this dataset's split doesn't compute")
+    return (splits.train_mean - splits.lo) / splits.span, splits.train_std / splits.span
+
+
+def _zscore(args, splits):   # only stored when on, so older checkpoints' kwargs stay valid
+    return {"zscore": zscore_of(splits)} if getattr(args, "zscore", False) else {}
+
+
+def _modes(args):   # only stored when on, so older checkpoints' kwargs stay valid
+    out = {}
+    if getattr(args, "spatial_modes", None):
+        out["spatial_modes"] = args.spatial_modes
+        if getattr(args, "mode_gate", False):
+            out["mode_gate"] = True
+    if getattr(args, "mode_head", None):
+        out.update(mode_head=args.mode_head, mode_init=args.mode_init)
+    if getattr(args, "latent_transport", None):
+        out["latent_transport"] = args.latent_transport
+    if getattr(args, "time_transport", None):
+        out["time_transport"] = args.time_transport
+    if getattr(args, "adaptive_embed", False):
+        out["adaptive_embed"] = True
+    return out
 
 
 def _configure_distvolformer_graph(args, splits):
@@ -135,6 +168,15 @@ def _configure_stresnet(args, splits):
         branches = {k: v for k, v in branches.items() if v}
     return dict(_grid(splits), filters=_pick(args, "width", 64), units=_pick(args, "st_units", 12),
                 bn=bool(args.st_bn), init_mean=init_mean, **external, **branches)
+
+
+def _configure_stid(args, splits):
+    from trafficpred.data.datasets import DATASETS
+    if splits.aux_in:
+        raise SystemExit("stid doesn't take --od")
+    return dict(_grid(splits), **({"ext_dim": splits.ext_dim} if splits.ext_dim else {}),
+                steps_per_day=getattr(DATASETS[splits.dataset], "steps_per_day", 288),
+                drop=_pick(args, "dropout", 0.15))
 
 
 def _configure_mlp(args, splits):
@@ -228,6 +270,14 @@ MODELS = {
     "stresnet": ModelSpec(STResNet, _configure_stresnet, "mse", CONV_TRAIN,
                           parts=True),
     "mlp": ModelSpec(MLP, _configure_mlp, "mse", MLP_TRAIN),
+    # BasicTS's PEMS04 / 08 STID config: Adam lr 0.002, weight decay 1e-4, batch 32, masked MAE. Adam's
+    # (coupled) weight decay acts against the loss gradient, which here is on the 0-1 scale (/ span), not
+    # BasicTS's z-scores (/ std): 1e-4 * std / span of the train flow keeps it equally strong. With 1e-4
+    # as is, STID underfits (PEMS08 MAE 15.40 vs published 14.21); matched it gives 14.34.
+    "stid": ModelSpec(STID, _configure_stid, "mae",
+                      dict(CONV_TRAIN, epochs=100, batch_size=32, lr=2e-3, weight_decay=1e-4, clip=0.0,
+                           optimizer="adam"),
+                      {"pems08": dict(weight_decay=1e-4 * 145.6 / 1077), "pems04": dict(weight_decay=1e-4 * 156.5 / 919)}),
     "predformer": ModelSpec(_build_predformer, _configure_predformer, "mse",
                             PREDFORMER_TRAIN, {"mmnist": dict(epochs=2000)}),
     "predformer_official": ModelSpec(_build_official, _configure_official, "mse",
@@ -274,6 +324,32 @@ def add_model_args(ap):
                         "through a shared embedding into the encoders as constant input maps (with --time-tokens: "
                         "per frame, and the targets' onto the target tokens), instead of only conditioning the "
                         "blocks and the volume head")
+    g.add_argument("--spatial-modes", type=int, metavar="R",
+                   help="distvolformer --time-tokens: the spatial blocks mix the patch tokens through R learned "
+                        "spatial modes (U (V^T h) W) instead of self-attention; the temporal blocks keep attention")
+    g.add_argument("--latent-transport", type=int, metavar="K",
+                   help="distvolformer --time-tokens: the spatial blocks move each token by entropic OT (K Sinkhorn "
+                        "steps, odd) with a learned cost, the distance from a learned 'now' to a learned 'next' "
+                        "embedding plus a learned sensor topology, instead of self-attention")
+    g.add_argument("--adaptive-embed", action="store_true",
+                   help="distvolformer --time-tokens: one learned vector per (frame, patch) in place of a patch "
+                        "position + a frame embedding (STAEformer's spatio-temporal adaptive embedding)")
+    g.add_argument("--zscore", action="store_true",
+                   help="distvolformer: train in the papers' z-scored units: the loss is divided by the train "
+                        "flow's std (in the 0-1 data scale), and the direct head predicts (x - mean) / std")
+    g.add_argument("--time-transport", type=int, metavar="K",
+                   help="distvolformer --time-tokens: the temporal blocks move the input frames' tokens into all "
+                        "frames' (input and future) by entropic OT (K Sinkhorn steps, odd) with a learned cost "
+                        "and a learned topology over the lags, instead of temporal self-attention")
+    g.add_argument("--mode-gate", action="store_true",
+                   help="--spatial-modes: scale each mode by g = 1 + tanh(G(Z)), G a linear map within each mode "
+                        "and one across modes, from the input (zero at the start, so it starts as fixed modes)")
+    g.add_argument("--mode-head", type=int, metavar="R",
+                   help="distvolformer: add a low-rank term Phi a to the distribution logits, Phi R learned spatial "
+                        "modes per channel, a from the volume code (zero at the start)")
+    g.add_argument("--mode-init", choices=("random", "pca"), default="random",
+                   help="--mode-head: start Phi at random or at the train split's top change modes (PCA of "
+                        "log p(target) - log p(last frame))")
     g.add_argument("--ext-volume", action="store_true",
                    help="distvol / distvolformer with --external: the target steps' external features (as in the "
                         "default conditioning) go to the volume head only, not the FiLM / AdaLN of the map branch")

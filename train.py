@@ -24,6 +24,24 @@ EXAMPLES = """examples:
 """
 
 
+class ScaledLoss(torch.nn.Module):
+    """A training loss times a constant (--zscore: the loss in z units); the logged parts stay unscaled."""
+
+    def __init__(self, inner, factor):
+        super().__init__()
+        self.inner, self.factor = inner, factor
+        self.needs_parts = getattr(inner, "needs_parts", False)
+        self.needs_input = getattr(inner, "needs_input", False)
+
+    def bind(self, params):
+        if hasattr(self.inner, "bind"):
+            self.inner.bind(params)
+
+    def forward(self, *args, **kwargs):
+        loss, parts = self.inner(*args, **kwargs)
+        return loss * self.factor, parts
+
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description="Train any model on any dataset, pick the checkpoint "
                                              "on val, score it once on test.",
@@ -201,8 +219,8 @@ def main(argv=None, epoch_callback=None):
     """Run train.py with these arguments (default: the command line). Returns the val-selected
     checkpoint's scores by split, or None if epoch_callback stopped the run (see Trainer.fit)."""
     args = parse_args(argv)
-    if args.external and args.model not in ("stresnet", "cnn", "distvol", "distvolformer"):
-        raise SystemExit("--external works with --model stresnet / cnn / distvol / distvolformer")
+    if args.external and args.model not in ("stresnet", "cnn", "distvol", "distvolformer", "distvolformer_direct", "stid"):
+        raise SystemExit("--external works with --model stresnet / cnn / distvol / distvolformer / stid")
     if args.st_branches and args.model != "stresnet":
         raise SystemExit("--st-branches only works with --model stresnet")
     spec = MODELS[args.model]
@@ -215,6 +233,9 @@ def main(argv=None, epoch_callback=None):
     if splits.split.get("od_slot") and not model_kwargs.get("od_slot_scale"):
         raise SystemExit("--od-slot only feeds --od-head (distvol / distvolformer / distvolformer_graph)")
     model = build_model(args.model, model_kwargs)
+    if model_kwargs.get("mode_init") == "pca":
+        from trafficpred.models.distvolformer import change_modes
+        model.init_modes(change_modes(splits.train, splits.shape[0], model_kwargs["mode_head"]))
     if args.grad_checkpoint:
         from trafficpred.models.distvolformer import AdaLNBlock
         blocks = [m for m in model.modules() if isinstance(m, AdaLNBlock)]
@@ -241,6 +262,9 @@ def main(argv=None, epoch_callback=None):
                loss_options=loss_options, seed=args.seed)
     threshold = (THRESHOLD - splits.lo) / splits.span   # the scored cut in scaled units (--low-weight)
     loss = None if loss_name == "none" else make_loss(loss_name, threshold=threshold, **loss_options)
+    if getattr(args, "zscore", False) and loss is not None:   # the loss in z units: / the train std (0-1 scale)
+        from trafficpred.models import zscore_of
+        loss = ScaledLoss(loss, 1.0 / zscore_of(splits)[1])
 
     torch.backends.cudnn.benchmark = device.type == "cuda"
     trainer = Trainer(model, run, splits, loss, settings, save, device)

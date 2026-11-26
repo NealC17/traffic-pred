@@ -1,0 +1,87 @@
+{
+  "built_by": "scripts/build_hf_dataset.py",
+  "datasets": {
+    "PEMS03": {
+      "N": 358,
+      "T": 26208,
+      "channels": [
+        "flow"
+      ],
+      "edges": 547,
+      "files": {
+        "PEMS03_edges.parquet": {
+          "bytes": 6962,
+          "sha256": "d4c49a7bf9d893756212d302cd9f485ede12fe39d8c416cd587fe85c0d24354d"
+        },
+        "PEMS03_sensors.parquet": {
+          "bytes": 4489,
+          "sha256": "03d12f7aef16ea75f9838d666c9e0e754b0b40da623d92ecc6795c68d7969810"
+        },
+        "PEMS03_series.parquet": {
+          "bytes": 11622229,
+          "sha256": "66ccabdb64f09deac6ef58e5bed116349a6cef8a79be6d19a527adcec7768525"
+        }
+      },
+      "sensors": 358
+    },
+    "PEMS04": {
+      "N": 307,
+      "T": 16992,
+      "channels": [
+        "flow",
+        "occupancy",
+        "speed"
+      ],
+      "edges": 340,
+      "files": {
+        "PEMS04_edges.parquet": {
+          "bytes": 5877,
+          "sha256": "6f5dff5f034b9f3c18fecfa4f0f28eef88209d9d861ffc06c01aa960095a1449"
+        },
+        "PEMS04_series.parquet": {
+          "bytes": 20354128,
+          "sha256": "39de0b3d83ece4543c9bd500e692dbe983cce5e6c1648dd7895b27222de2413d"
+        }
+      }
+    },
+    "PEMS07": {
+      "N": 883,
+      "T": 28224,
+      "channels": [
+        "flow"
+      ],
+      "edges": 866,
+      "files": {
+        "PEMS07_edges.parquet": {
+          "bytes": 14551,
+          "sha256": "a1086aa1e413155a8650c15850746246adf20ea2201a86d4009ef868cf841330"
+        },
+        "PEMS07_series.parquet": {
+          "bytes": 33728294,
+          "sha256": "c67f33013c22360db2bebe4f6f344cefceb6effb08994cbfd6d773dd168f8ff5"
+        }
+      }
+    },
+    "PEMS08": {
+      "N": 170,
+      "T": 17856,
+      "channels": [
+        "flow",
+        "occupancy",
+        "speed"
+      ],
+      "edges": 295,
+      "files": {
+        "PEMS08_edges.parquet": {
+          "bytes": 4459,
+          "sha256": "942d54fad5c7c0a577b8ec28f804fcb3bc9dfae3b7d57bffacb493b3befbfd99"
+        },
+        "PEMS08_series.parquet": {
+          "bytes": 11956120,
+          "sha256": "7d9143f9271f1819217de56940959e8b14a23c23824dc6cb7cc4ef641976b1b8"
+        }
+      }
+    }
+  },
+  "source": "https://github.com/Davidham3/STSGCN (commit 3f825f6)"
+}
