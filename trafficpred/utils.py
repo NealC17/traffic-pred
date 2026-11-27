@@ -44,15 +44,22 @@ def seed_everything(seed):
     torch.manual_seed(seed)
 
 
+def _mps():
+    return getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
+
+
 def rng_state():
     return {"cpu": torch.get_rng_state(),
-            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "mps": torch.mps.get_rng_state() if _mps() else None}   # Apple GPUs: dropout draws from this one
 
 
 def set_rng_state(state):
     torch.set_rng_state(state["cpu"].cpu())
     if state.get("cuda") is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
+    if state.get("mps") is not None and _mps():
+        torch.mps.set_rng_state(state["mps"].cpu())
 
 
 def save_atomic(obj, path):

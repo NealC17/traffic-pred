@@ -133,6 +133,21 @@ def _modes(args):   # only stored when on, so older checkpoints' kwargs stay val
         out["time_transport"] = args.time_transport
     if getattr(args, "adaptive_embed", False):
         out["adaptive_embed"] = True
+    if getattr(args, "no_vol_encoder", False):
+        out["no_vol_encoder"] = True
+    tt = {}   # --tt-*: variants of the temporal latent transport
+    if getattr(args, "tt_no_topology", False):
+        tt["topology"] = False
+    if getattr(args, "tt_unbalanced", None):
+        tt["unbalanced"] = args.tt_unbalanced
+    if getattr(args, "tt_learned_mass", False):
+        tt["learned_mass"] = True
+    if getattr(args, "tt_sensor_topology", False):
+        tt["sensor_topology"] = True
+    if getattr(args, "tt_hybrid", False):
+        tt["hybrid"] = True
+    if tt:
+        out["tt_opts"] = tt
     return out
 
 
@@ -334,6 +349,9 @@ def add_model_args(ap):
     g.add_argument("--adaptive-embed", action="store_true",
                    help="distvolformer --time-tokens: one learned vector per (frame, patch) in place of a patch "
                         "position + a frame embedding (STAEformer's spatio-temporal adaptive embedding)")
+    g.add_argument("--no-vol-encoder", action="store_true",
+                   help="distvolformer_direct: no volume U-Net; the blocks' AdaLN gets a zero code, so it is plain "
+                        "LayerNorm with learned shift / scale / gate (STAEformer-like: the transformer alone)")
     g.add_argument("--zscore", action="store_true",
                    help="distvolformer: train in the papers' z-scored units: the loss is divided by the train "
                         "flow's std (in the 0-1 data scale), and the direct head predicts (x - mean) / std")
@@ -341,6 +359,18 @@ def add_model_args(ap):
                    help="distvolformer --time-tokens: the temporal blocks move the input frames' tokens into all "
                         "frames' (input and future) by entropic OT (K Sinkhorn steps, odd) with a learned cost "
                         "and a learned topology over the lags, instead of temporal self-attention")
+    g.add_argument("--tt-no-topology", action="store_true",
+                   help="--time-transport: no learned lag topology; the cost is the state distance alone")
+    g.add_argument("--tt-unbalanced", type=float, metavar="RHO",
+                   help="--time-transport: unbalanced OT, the input frames' marginal a KL penalty of strength RHO "
+                        "(learned per head, starting here) instead of a hard 'send N / S each'")
+    g.add_argument("--tt-learned-mass", action="store_true",
+                   help="--time-transport: each input frame's mass comes from its token (softmax over the frames) "
+                        "instead of N / S each")
+    g.add_argument("--tt-sensor-topology", action="store_true",
+                   help="--time-transport: one learned lag topology per sensor instead of one shared")
+    g.add_argument("--tt-hybrid", action="store_true",
+                   help="--time-transport: keep the temporal self-attention as well and add the two outputs")
     g.add_argument("--mode-gate", action="store_true",
                    help="--spatial-modes: scale each mode by g = 1 + tanh(G(Z)), G a linear map within each mode "
                         "and one across modes, from the input (zero at the start, so it starts as fixed modes)")

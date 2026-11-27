@@ -11,8 +11,10 @@ Skips files that are already present with the right hash. Needs pyarrow (pip ins
 import argparse
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from functools import partial
 
@@ -47,9 +49,15 @@ def fetch(url, path, want):
     print(f"  downloading {url}")
     part = path + ".part"
     req = urllib.request.Request(url, headers={"User-Agent": "traffic-pred-downloader"})
-    with urllib.request.urlopen(req, timeout=120) as r, open(part, "wb") as f:
-        while block := r.read(1 << 20):
-            f.write(block)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r, open(part, "wb") as f:
+            while block := r.read(1 << 20):
+                f.write(block)
+    except urllib.error.URLError as e:   # e.g. macOS python.org builds without CA certificates installed
+        if not shutil.which("curl"):
+            raise
+        print(f"  urllib failed ({e.reason}); retrying with curl")
+        subprocess.run(["curl", "-fL", "--retry", "3", "-A", "traffic-pred-downloader", "-o", part, url], check=True)
     got = sha256(part)
     if got != want:
         os.remove(part)

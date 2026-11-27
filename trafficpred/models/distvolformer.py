@@ -101,31 +101,75 @@ class LatentTransport(nn.Module):
     tokens; the topology is then over the lags / target steps. Each destination gets 1 unit, so each source
     sends M / n_src: every input frame must be shipped somewhere, which attention needn't do."""
 
-    def __init__(self, tokens, dim, heads, drop, iters, topo_dim=16, n_src=None):
+    def __init__(self, tokens, dim, heads, drop, iters, topo_dim=16, n_src=None, topology=True, unbalanced=0.0,
+                 learned_mass=False, groups=1):
+        """Variants (the temporal --tt-* flags; the defaults are the original layer):
+          topology=False (--tt-no-topology): the cost is the state distance alone.
+          unbalanced rho > 0 (--tt-unbalanced): the source marginal is a KL penalty of strength rho (learned per
+            head, from this start) instead of a hard constraint; each column step moves only a fraction
+            rho / (rho + eps) of the way, so a source may send more or less than its share. Rows stay exact.
+          learned_mass (--tt-learned-mass): each source's mass comes from its own token (a softmax over the
+            sources, per head) instead of being equal; the total is still N.
+          groups G > 1 (--tt-sensor-topology): G topologies, token sequence b uses topology b % G (the temporal
+            blocks see the sensors as B * N sequences, sensor-minor: one lag geometry per sensor)."""
         super().__init__()
         self.heads, self.iters, self.drop, self.n_src = heads, iters, drop, n_src
+        self.groups = groups
         self.src, self.dst, self.val, self.out = (nn.Linear(dim, dim) for _ in range(4))
-        self.topo = nn.Parameter(0.1 * torch.randn(heads, tokens, topo_dim))
-        self.topo_w = nn.Parameter(torch.zeros(heads))
+        if topology:
+            shape = (heads, tokens, topo_dim) if groups == 1 else (groups, heads, tokens, topo_dim)
+            self.topo = nn.Parameter(0.1 * torch.randn(shape))
+            self.topo_w = nn.Parameter(torch.zeros(heads))
+        else:
+            self.topo = self.topo_w = None
         self.log_eps = nn.Parameter(torch.zeros(heads))
+        self.log_rho = nn.Parameter(torch.full((heads,), float(np.log(unbalanced)))) if unbalanced > 0 else None
+        self.mass = nn.Linear(dim, heads) if learned_mass else None
+        if self.mass is not None:   # equal masses at the start
+            nn.init.zeros_(self.mass.weight)
+            nn.init.zeros_(self.mass.bias)
 
     @staticmethod
     def _dist(a, b):   # (..., N, d), (..., M, d) -> (..., M, N) Euclidean distances, safe gradient at 0
         sq = b.pow(2).sum(-1, keepdim=True) + a.pow(2).sum(-1)[..., None, :] - 2 * b @ a.transpose(-2, -1)
         return (sq.clamp_min(0) + 1e-4).sqrt()
 
+    def _topology_cost(self, S, B):
+        w = F.softplus(self.topo_w)[:, None, None]
+        if self.groups == 1:
+            return w * self._dist(self.topo[:, :S], self.topo)                    # (h, N, S)
+        if B % self.groups:
+            raise ValueError(f"{B} sequences aren't a multiple of the {self.groups} topology groups")
+        cost = w * self._dist(self.topo[:, :, :S], self.topo)                      # (G, h, N, S)
+        return cost.repeat(B // self.groups, 1, 1, 1)                              # sequence b -> group b % G
+
     def forward(self, x):
         B, N, D = x.shape
         S = self.n_src or N
         split = lambda t: t.reshape(B, t.shape[1], self.heads, -1).transpose(1, 2)   # (B, h, tokens, d)
         a, b, v = split(self.src(x[:, :S])), split(self.dst(x)), split(self.val(x[:, :S]))
-        cost = self._dist(a, b) + F.softplus(self.topo_w)[:, None, None] * self._dist(self.topo[:, :S], self.topo)
-        logits = -cost / self.log_eps.exp()[:, None, None]                     # (B, h, N dest, S sources)
-        col = float(np.log(N / S))   # each source sends N / S units (0 when every token is a source)
+        cost = self._dist(a, b)                                                    # (B, h, N dest, S sources)
+        if self.topo is not None:
+            cost = cost + self._topology_cost(S, B)
+        eps = self.log_eps.exp()[:, None, None]
+        logits = -cost / eps
+        # log of what each source sends: N / S each (0 when every token is a source), or learned shares of N
+        if self.mass is not None:
+            col = float(np.log(N)) + self.mass(x[:, :S]).transpose(1, 2).log_softmax(-1)[:, :, None, :]
+        else:
+            col = float(np.log(N / S))
+        frac = None
+        if self.log_rho is not None:   # unbalanced: a damped column step
+            rho = self.log_rho.exp()[:, None, None]
+            frac = rho / (rho + eps)
         for i in range(self.iters):   # odd count ends on the rows: each destination's weights sum to 1
-            logits = (logits - logits.logsumexp(dim=-1, keepdim=True)) if i % 2 == 0 else \
-                     (logits - logits.logsumexp(dim=-2, keepdim=True) + col)
+            if i % 2 == 0:
+                logits = logits - logits.logsumexp(dim=-1, keepdim=True)
+            else:
+                step = col - logits.logsumexp(dim=-2, keepdim=True)
+                logits = logits + (step if frac is None else frac * step)
         plan = F.dropout(logits.exp(), self.drop, self.training)
+        self.last_plan = plan.detach() if getattr(self, "keep_plan", False) else None   # tools/plot_tt.py
         return self.out((plan @ v).transpose(1, 2).reshape(B, N, D))
 
 
@@ -134,15 +178,22 @@ class AdaLNBlock(nn.Module):
 
     def __init__(self, dim, heads, mlp_dim, cond_dim, drop, sinkformer=0, modes=None, transport=None):
         """modes: (tokens, rank) to mix tokens with a ModeMixer instead of self-attention.
-        transport: (tokens, Sinkhorn steps[, sources]) to mix them with a LatentTransport instead."""
+        transport: (tokens, Sinkhorn steps[, sources[, options]]) to mix them with a LatentTransport instead;
+        options are LatentTransport's keyword arguments, plus hybrid=True (--tt-hybrid): keep the self-attention
+        too and add the two (a = attention(h) + transport(h))."""
         super().__init__()
         self.sinkformer = sinkformer
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
         self.modes = ModeMixer(modes[0], dim, modes[1], drop, *modes[2:]) if modes else None
+        hybrid = False
         if transport:
+            opts = dict(transport[3]) if len(transport) > 3 else {}
+            hybrid = opts.pop("hybrid", False)
             self.modes = LatentTransport(transport[0], dim, heads, drop, transport[1],
-                                         n_src=transport[2] if len(transport) > 2 else None)
-        self.attn = None if self.modes is not None else nn.MultiheadAttention(dim, heads, dropout=drop, batch_first=True)
+                                         n_src=transport[2] if len(transport) > 2 else None, **opts)
+        self.hybrid = hybrid
+        self.attn = None if (self.modes is not None and not hybrid) else \
+            nn.MultiheadAttention(dim, heads, dropout=drop, batch_first=True)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
         self.mlp = nn.Sequential(nn.Linear(dim, mlp_dim), nn.GELU(), nn.Dropout(drop),
                                  nn.Linear(mlp_dim, dim), nn.Dropout(drop))
@@ -158,7 +209,9 @@ class AdaLNBlock(nn.Module):
     def _forward(self, x, cond):
         shift1, scale1, gate1, shift2, scale2, gate2 = self.ada(cond)[:, None].chunk(6, dim=-1)
         h = self.norm1(x) * (1 + scale1) + shift1
-        if self.modes is not None:
+        if self.hybrid:
+            a = self.modes(h) + self.attn(h, h, h, need_weights=False)[0]
+        elif self.modes is not None:
             a = self.modes(h)
         elif self.sinkformer:
             a = sinkhorn_attention(self.attn, h, self.sinkformer)
@@ -206,7 +259,7 @@ class SpaceTimeTransformer(nn.Module):
 
     def __init__(self, cin_frame, cout_step, T_in, T_out, grid, patch, dim, depth, heads, mlp_dim,
                  cond_dim, drop, sinkformer=0, spatial_modes=0, mode_gate=False, latent_transport=0,
-                 time_transport=0, adaptive_embed=False):
+                 time_transport=0, adaptive_embed=False, tt_opts=None):
         super().__init__()
         self.patch, self.T_in, self.T_out, self.cout_step = patch, T_in, T_out, cout_step
         self.embed = nn.Conv2d(cin_frame, dim, patch, stride=patch)
@@ -225,7 +278,10 @@ class SpaceTimeTransformer(nn.Module):
         modes = (tokens, spatial_modes, mode_gate) if spatial_modes else None   # spatial blocks only; temporal keep attention
         transport = (tokens, latent_transport) if latent_transport else None   # spatial blocks
         # temporal blocks: the T_in input frames send, all T_in + T_out frames receive
-        t_transport = (T_in + T_out, time_transport, T_in) if time_transport else None
+        tt_opts = dict(tt_opts or {})
+        if tt_opts.pop("sensor_topology", False):   # one lag topology per patch (sensor)
+            tt_opts["groups"] = tokens
+        t_transport = (T_in + T_out, time_transport, T_in, tt_opts) if time_transport else None
         self.blocks = nn.ModuleList(AdaLNBlock(dim, heads, mlp_dim, cond_dim, drop, sinkformer,
                                                modes if i % 2 == 1 else None,
                                                transport if i % 2 == 1 else t_transport) for i in range(depth))
@@ -379,7 +435,8 @@ class DistVolFormer(nn.Module):
                  vol_transformer=False, vol_dim=128, vol_depth=3, graph=False, graph_radius=0,
                  count_scale=0.0, count_offset=0.0, direct=False, aux=0, od_head=None, od_slot_scale=0.0,
                  ext_dim=0, ext_input=False, ext_volume=False, spatial_modes=0, mode_head=0, mode_init="random", mode_gate=False,
-                 crop_pad=False, latent_transport=0, time_transport=0, adaptive_embed=False, zscore=None):
+                 crop_pad=False, latent_transport=0, time_transport=0, adaptive_embed=False, zscore=None,
+                 no_vol_encoder=False, tt_opts=None):
         """aux: extra input maps per frame after the C flow channels (--od), fed as log-flow maps next to
         the flow's (in every layout: stacked, time tokens, graph, volume transformer); not predicted.
 
@@ -448,6 +505,8 @@ class DistVolFormer(nn.Module):
         if time_transport and (not time_tokens or sinkformer):
             raise ValueError("--time-transport replaces the time-token transformer's temporal attention: add "
                              "--time-tokens, and no --sinkformer")
+        if tt_opts and not time_transport:
+            raise ValueError("the --tt-* options change --time-transport: give --time-transport K")
         if mode_head and (direct or transport):
             raise ValueError("--mode-head adds to softmax logits: no --direct / --transport")
         self.mode_init = mode_init
@@ -465,7 +524,13 @@ class DistVolFormer(nn.Module):
         if crop_pad and not (time_tokens and patch == 1):
             raise ValueError("crop_pad goes with time_tokens and patch 1")
         self.crop_pad = crop_pad
-        if vol_transformer:
+        if no_vol_encoder and (not direct or vol_transformer or mode_head or ext_volume):
+            raise ValueError("--no-vol-encoder: only with distvolformer_direct (no volume head to feed), "
+                             "no --vol-transformer / --mode-head / --ext-volume")
+        self.code_dim = code_dim
+        if no_vol_encoder:   # the blocks are conditioned on a zero code (+ the --external term, if any)
+            self.vol_enc = None
+        elif vol_transformer:
             self.vol_enc = VolumeTransformer(3 * C + aux, C, T_in, T_out, width, vol_dim, vol_depth,
                                              max(1, vol_dim // 32), code_dim, drop)
         else:
@@ -478,7 +543,7 @@ class DistVolFormer(nn.Module):
             self.dist_enc = SpaceTimeTransformer(2 * C + aux + (EXT_EMBED if self.ext_embed is not None else 0), C + g_out, T_in, T_out,
                                                  (H, W) if crop_pad else grid, patch, dim, depth,
                                                  heads, mlp_dim, code_dim, drop, sinkformer, spatial_modes, mode_gate,
-                                                 latent_transport, time_transport, adaptive_embed)
+                                                 latent_transport, time_transport, adaptive_embed, tt_opts)
         else:
             self.dist_enc = DistTransformer(2 * k_in + a_in + e_in, self.transport.channels if transport else k_out + g_out,
                                             grid, patch,
@@ -533,6 +598,8 @@ class DistVolFormer(nn.Module):
             if A:
                 frames = torch.cat([frames, extra.reshape(B, T, A, Hp, Wp)], 2)
             delta, code = self.vol_enc(frames, log_n.reshape(B, T, C))
+        elif self.vol_enc is None:
+            code = features.new_zeros(B, self.code_dim)
         else:
             code = self.vol_enc(torch.cat([features, volume_maps] + ([extra] if A else [])
                                           + ([e_maps] if e_maps is not None else []), dim=1))

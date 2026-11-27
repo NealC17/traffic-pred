@@ -5,10 +5,11 @@ null value 0); the "all" MAE / RMSE keep them. Seeds of a run are averaged (mean
 
   python tools/eval_pems.py checkpoints/workspaces/pems_pems08 [--match REGEX]
 """
+import os
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")   # Apple GPUs: run any op MPS lacks on the CPU
 import argparse
 import collections
 import glob
-import os
 import re
 import statistics as st
 import sys

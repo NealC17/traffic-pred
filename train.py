@@ -1,5 +1,6 @@
-import argparse
 import os
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")   # Apple GPUs: run any op MPS lacks on the CPU
+import argparse
 from dataclasses import asdict
 
 import torch
