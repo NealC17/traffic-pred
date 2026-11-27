@@ -1,0 +1,22 @@
+[2026-11-26 18:32:32] job 2471642 (chain job 2 of at most 20) on sg028 in /home/nchand39/traffic-pred
+[2026-11-26 18:32:32] code: df12ed5 (uncommitted changes)
+[setup] packages up to date
+[setup] activated: Python 3.12.15 at /home/nchand39/traffic-pred/.env
+[setup] torch 2.15.0+cu132, device: CUDA (NVIDIA A100-SXM4-80GB)
+[2026-11-26 18:32:45] data: datasets/PEMS/PEMS08 present, not downloading
+    GPU: NVIDIA A100-SXM4-80GB, 81920 MiB
+[2026-11-26 18:32:45] train distvolformer_direct_small_extin_ae_z_pems08_in12_out12
+[2026-11-26 19:29:59] done distvolformer_direct_small_extin_ae_z_pems08_in12_out12
+[2026-11-26 19:29:59] train distvolformer_small_extin_ae_z_pems08_in12_out12
+[2026-11-26 21:04:24] done distvolformer_small_extin_ae_z_pems08_in12_out12
+[2026-11-26 21:04:24] every run is finished; scoring into logs/pems_pems08_attn_eval.out
+pems08 test: flow, 12 steps, masked (true > 0) unless 'all'; mean ± sd over seeds
+  run                                                  n           MAE        RMSE      MAPE %    all MAE all RMSE      MAE@3   MAE@6  MAE@12
+  distvolformer_direct_small_extin_ae_z_pems08_in12_ou 1   15.36       24.21       11.42            15.35    24.29      14.75   15.39   16.30
+  distvolformer_small_extin_ae_z_pems08_in12_out12     1   15.42       24.22        9.75            15.39    24.31      14.86   15.46   16.32
+
+published (12-step average, masked): MAE / RMSE / MAPE
+  STID (CIKM'22), in STAEformer's table                  14.21   23.28    9.27
+  STAEformer (CIKM'23)                                   13.46   23.25    8.88
+  STD-MAE (IJCAI'24, long-history pre-training)          13.44   22.47    8.76
+[2026-11-26 21:04:43] all done

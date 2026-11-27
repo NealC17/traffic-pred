@@ -1,0 +1,9 @@
+pems08 test: flow, 12 steps, masked (true > 0) unless 'all'; mean ± sd over seeds
+  run                                                  n           MAE        RMSE      MAPE %    all MAE all RMSE      MAE@3   MAE@6  MAE@12
+  distvolformer_direct_small_extin_ae_z_pems08_in12_ou 1   15.36       24.21       11.42            15.35    24.29      14.75   15.39   16.30
+  distvolformer_small_extin_ae_z_pems08_in12_out12     1   15.42       24.22        9.75            15.39    24.31      14.86   15.46   16.32
+
+published (12-step average, masked): MAE / RMSE / MAPE
+  STID (CIKM'22), in STAEformer's table                  14.21   23.28    9.27
+  STAEformer (CIKM'23)                                   13.46   23.25    8.88
+  STD-MAE (IJCAI'24, long-history pre-training)          13.44   22.47    8.76
