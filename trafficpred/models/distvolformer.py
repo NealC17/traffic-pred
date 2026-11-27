@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -102,7 +104,7 @@ class LatentTransport(nn.Module):
     sends M / n_src: every input frame must be shipped somewhere, which attention needn't do."""
 
     def __init__(self, tokens, dim, heads, drop, iters, topo_dim=16, n_src=None, topology=True, unbalanced=0.0,
-                 learned_mass=False, groups=1):
+                 learned_mass=False, groups=1, cond_dim=0, causal=0):
         """Variants (the temporal --tt-* flags; the defaults are the original layer):
           topology=False (--tt-no-topology): the cost is the state distance alone.
           unbalanced rho > 0 (--tt-unbalanced): the source marginal is a KL penalty of strength rho (learned per
@@ -111,7 +113,14 @@ class LatentTransport(nn.Module):
           learned_mass (--tt-learned-mass): each source's mass comes from its own token (a softmax over the
             sources, per head) instead of being equal; the total is still N.
           groups G > 1 (--tt-sensor-topology): G topologies, token sequence b uses topology b % G (the temporal
-            blocks see the sensors as B * N sequences, sensor-minor: one lag geometry per sensor)."""
+            blocks see the sensors as B * N sequences, sensor-minor: one lag geometry per sensor).
+          cond_dim > 0 (--tt-cond-cost): a third cost term from the block's conditioning code (the target
+            window's calendar, and the volume code): a linear map to a (heads, tokens, sources) cost added to
+            the other two, zero at the start, so the lag map may change with the time of day / day of week.
+          causal T_in > 0 (--tt-chain, the later temporal blocks): every frame is a source, but frame f may
+            draw only on the input frames and on frames before it (t+2 on the inputs and t+1, ...), so long
+            horizons are built step by step from the shorter ones; the columns are unbalanced (rho, default 1:
+            the last frames feed few or none)."""
         super().__init__()
         self.heads, self.iters, self.drop, self.n_src = heads, iters, drop, n_src
         self.groups = groups
@@ -128,6 +137,16 @@ class LatentTransport(nn.Module):
         if self.mass is not None:   # equal masses at the start
             nn.init.zeros_(self.mass.weight)
             nn.init.zeros_(self.mass.bias)
+        S = n_src or tokens
+        if causal:   # (tokens, S) allowed: an input frame, or an earlier frame
+            dst, src = torch.arange(tokens)[:, None], torch.arange(S)[None]
+            self.register_buffer("allowed", (src < causal) | (src < dst), persistent=False)
+        else:
+            self.allowed = None
+        self.cond_cost = nn.Linear(cond_dim, heads * tokens * (n_src or tokens)) if cond_dim else None
+        if self.cond_cost is not None:   # the original cost at the start
+            nn.init.zeros_(self.cond_cost.weight)
+            nn.init.zeros_(self.cond_cost.bias)
 
     @staticmethod
     def _dist(a, b):   # (..., N, d), (..., M, d) -> (..., M, N) Euclidean distances, safe gradient at 0
@@ -143,7 +162,7 @@ class LatentTransport(nn.Module):
         cost = w * self._dist(self.topo[:, :, :S], self.topo)                      # (G, h, N, S)
         return cost.repeat(B // self.groups, 1, 1, 1)                              # sequence b -> group b % G
 
-    def forward(self, x):
+    def forward(self, x, cond=None):
         B, N, D = x.shape
         S = self.n_src or N
         split = lambda t: t.reshape(B, t.shape[1], self.heads, -1).transpose(1, 2)   # (B, h, tokens, d)
@@ -151,8 +170,14 @@ class LatentTransport(nn.Module):
         cost = self._dist(a, b)                                                    # (B, h, N dest, S sources)
         if self.topo is not None:
             cost = cost + self._topology_cost(S, B)
+        if self.cond_cost is not None:
+            if cond is None:
+                raise ValueError("LatentTransport was built with cond_dim > 0; pass cond")
+            cost = cost + self.cond_cost(cond).reshape(B, self.heads, N, S)
         eps = self.log_eps.exp()[:, None, None]
         logits = -cost / eps
+        if self.allowed is not None:
+            logits = logits.masked_fill(~self.allowed, -1e4)
         # log of what each source sends: N / S each (0 when every token is a source), or learned shares of N
         if self.mass is not None:
             col = float(np.log(N)) + self.mass(x[:, :S]).transpose(1, 2).log_softmax(-1)[:, :, None, :]
@@ -168,9 +193,113 @@ class LatentTransport(nn.Module):
             else:
                 step = col - logits.logsumexp(dim=-2, keepdim=True)
                 logits = logits + (step if frac is None else frac * step)
-        plan = F.dropout(logits.exp(), self.drop, self.training)
+        plan = logits.exp()
+        # --tt-flow-head reads the last temporal block's plan (with gradients, before dropout: rows sum to 1)
+        self.flow_plan = plan if getattr(self, "keep_flow_plan", False) else None
+        plan = F.dropout(plan, self.drop, self.training)
         self.last_plan = plan.detach() if getattr(self, "keep_plan", False) else None   # tools/plot_tt.py
         return self.out((plan @ v).transpose(1, 2).reshape(B, N, D))
+
+
+def neighbour_table(hops, radius):
+    """(N, N) hop counts (-1: unreachable) -> the nodes within `radius` hops of each node, itself first:
+    (N, K) indices (padded with the node itself), (N, K) hop counts and (N, K) valid; K the largest count."""
+    h = torch.as_tensor(np.asarray(hops)).long()
+    N = h.shape[0]
+    near = ((h >= 0) & (h <= radius)) | torch.eye(N, dtype=torch.bool)
+    K = int(near.sum(1).max())
+    key = torch.where(near, h.clamp_min(0), radius + 1)                  # nearest first, the rest after
+    idx = torch.sort(key, dim=1, stable=True).indices[:, :K]
+    valid = near.gather(1, idx)
+    hop = h.gather(1, idx).clamp(0, radius)
+    idx = torch.where(valid, idx, torch.arange(N)[:, None])
+    return idx, torch.where(valid, hop, 0), valid
+
+
+HOP_COST = 2.0
+
+
+class SpaceTimeTransport(nn.Module):
+    """Latent transport over space and time at once (--st-transport R): every (input frame, sensor) token
+    is a source, every (frame, sensor) token (input and future frames) a destination, and mass may move from
+    sensor m at input frame i to sensor n at frame f when m is within R hops of n on the road graph (the
+    PEMS sensor graph, or the 8-neighbour grid of patches). So a forecast is made of the observed traffic
+    upstream and downstream, a lag earlier: the factorised layers only move it along one sensor's timeline
+    (temporal TT) or within one frame (spatial attention). The cost of i, m -> f, n is
+      ||phi(z_im) - psi(z_fn)||               the state distance (unsquared, as in LatentTransport)
+      + softplus(w) ||e_i - e_f||             a learned lag topology over the frames
+      + c[hops(m, n)]                         a learned cost per hop distance (per head; HOP_COST per hop at
+                                              the start, so it starts close to the temporal TT)
+    and the plan is K log-domain Sinkhorn steps on -cost / eps, ending on the destinations (each receives
+    1). The sources' marginal (F / S each) is unbalanced by default (rho, learned per head): sensors carry very
+    different volumes, and ramps add and remove cars, so a hard 'every source ships the same' would fight the
+    data. Sparse: each destination sees only K_R neighbours x S frames (PEMS08, R = 2: at most 28 x 12)."""
+
+    def __init__(self, frames, n_src, dim, heads, drop, iters, hops, radius, topo_dim=16, unbalanced=1.0):
+        super().__init__()
+        self.frames, self.n_src, self.heads, self.drop, self.iters = frames, n_src, heads, drop, iters
+        nbr, hop, valid = neighbour_table(hops, radius)
+        self.register_buffer("nbr", nbr, persistent=False)
+        self.register_buffer("hop", hop, persistent=False)
+        self.register_buffer("valid", valid, persistent=False)
+        self.src, self.dst, self.val, self.out = (nn.Linear(dim, dim) for _ in range(4))
+        self.topo = nn.Parameter(0.1 * torch.randn(heads, frames, topo_dim))
+        self.topo_w = nn.Parameter(torch.zeros(heads))
+        # starts at HOP_COST per hop: mass stays mostly at the sensor itself (its neighbours carry other volumes)
+        self.hop_cost = nn.Parameter(HOP_COST * torch.arange(radius + 1.0).repeat(heads, 1))
+        self.log_eps = nn.Parameter(torch.zeros(heads))
+        self.log_rho = nn.Parameter(torch.full((heads,), float(np.log(unbalanced)))) if unbalanced > 0 else None
+
+    def _col_lse(self, logits, idx):
+        """(B, h, F, N, S, K) -> (B, h, S, N): log of the mass each source (frame s, sensor m) sends, summed over
+        every destination frame and every sensor n that has m among its neighbours."""
+        B, h, _, N, S, K = logits.shape
+        flat = logits.logsumexp(2).permute(0, 1, 3, 2, 4).reshape(B, h, S, N * K)
+        ix = idx.expand(B, h, S, -1)
+        top = flat.new_full((B, h, S, N + 1), -1e4).scatter_reduce(-1, ix, flat.detach(), "amax")
+        tot = flat.new_zeros((B, h, S, N + 1)).scatter_add(-1, ix, (flat - top.gather(-1, ix)).exp())
+        return (top + tot.clamp_min(1e-30).log())[..., :N]
+
+    def forward(self, x):   # x (B, F * N, D), frame-major
+        B, L, D = x.shape
+        F_, S, h = self.frames, self.n_src, self.heads
+        N, K = self.nbr.shape
+        z = x.reshape(B, F_, N, D)
+        split = lambda t: t.reshape(B, t.shape[1], N, h, -1).permute(0, 3, 1, 2, 4)   # (B, h, frames, N, d)
+        a, b, v = split(self.src(z[:, :S])), split(self.dst(z)), split(self.val(z[:, :S]))
+        nbr = self.nbr
+        dots = torch.stack([torch.einsum("bhfnd,bhsnd->bhfns", b, a[:, :, :, nbr[:, k]]) for k in range(K)], -1)
+        a2 = a.pow(2).sum(-1)[:, :, :, nbr].permute(0, 1, 3, 2, 4)[:, :, None]   # (B, h, 1, N, S, K)
+        b2 = b.pow(2).sum(-1)[..., None, None]                                    # (B, h, F, N, 1, 1)
+        cost = (b2 + a2 - 2 * dots).clamp_min(0).add(1e-4).sqrt()                 # (B, h, F, N, S, K)
+        lag = F.softplus(self.topo_w)[:, None, None] * LatentTransport._dist(self.topo[:, :S], self.topo)  # (h, F, S)
+        cost = cost + lag[None, :, :, None, :, None] + self.hop_cost[:, self.hop][None, :, None, :, None, :]
+        eps = self.log_eps.exp()[None, :, None, None, None, None]
+        logits = (-cost / eps).masked_fill(~self.valid[:, None, :], -1e4)
+        idx = torch.where(self.valid, nbr, N).reshape(-1)                         # padding -> a dummy source
+        col = float(np.log(F_ / S))
+        frac = None
+        if self.log_rho is not None:
+            rho = self.log_rho.exp()[None, :, None, None]
+            frac = rho / (rho + self.log_eps.exp()[None, :, None, None])
+        for i in range(self.iters):   # odd count ends on the rows: each destination's weights sum to 1
+            if i % 2 == 0:
+                logits = logits - logits.flatten(-2).logsumexp(-1)[..., None, None]
+            else:
+                step = col - self._col_lse(logits, idx)                            # (B, h, S, N)
+                step = step if frac is None else frac * step
+                logits = logits + step[:, :, :, nbr].permute(0, 1, 3, 2, 4)[:, :, None]
+        plan = logits.exp()
+        self.flow_plan = plan if getattr(self, "keep_flow_plan", False) else None
+        plan = F.dropout(plan, self.drop, self.training)
+        self.last_plan = plan.detach() if getattr(self, "keep_plan", False) else None
+        out = sum(torch.einsum("bhfns,bhsnd->bhfnd", plan[..., k], v[:, :, :, nbr[:, k]]) for k in range(K))
+        return self.out(out.permute(0, 2, 3, 1, 4).reshape(B, L, D))
+
+    def move(self, plan, src):
+        """plan (B, h', F', N, S, K) mixed over heads, src (B, S, N, c): the flow at the destinations,
+        sum over s, k of plan[.., f, n, s, k] src[s, nbr[n, k]] -> (B, F', N, c)."""
+        return torch.einsum("bfnsk,bsnkc->bfnc", plan, src[:, :, self.nbr])
 
 
 class AdaLNBlock(nn.Module):
@@ -189,6 +318,8 @@ class AdaLNBlock(nn.Module):
         if transport:
             opts = dict(transport[3]) if len(transport) > 3 else {}
             hybrid = opts.pop("hybrid", False)
+            if opts.pop("cond_cost", False):
+                opts["cond_dim"] = cond_dim
             self.modes = LatentTransport(transport[0], dim, heads, drop, transport[1],
                                          n_src=transport[2] if len(transport) > 2 else None, **opts)
         self.hybrid = hybrid
@@ -209,10 +340,11 @@ class AdaLNBlock(nn.Module):
     def _forward(self, x, cond):
         shift1, scale1, gate1, shift2, scale2, gate2 = self.ada(cond)[:, None].chunk(6, dim=-1)
         h = self.norm1(x) * (1 + scale1) + shift1
+        kw = {"cond": cond} if getattr(self.modes, "cond_cost", None) is not None else {}
         if self.hybrid:
-            a = self.modes(h) + self.attn(h, h, h, need_weights=False)[0]
+            a = self.modes(h, **kw) + self.attn(h, h, h, need_weights=False)[0]
         elif self.modes is not None:
-            a = self.modes(h)
+            a = self.modes(h, **kw)
         elif self.sinkformer:
             a = sinkhorn_attention(self.attn, h, self.sinkformer)
         else:
@@ -259,9 +391,12 @@ class SpaceTimeTransformer(nn.Module):
 
     def __init__(self, cin_frame, cout_step, T_in, T_out, grid, patch, dim, depth, heads, mlp_dim,
                  cond_dim, drop, sinkformer=0, spatial_modes=0, mode_gate=False, latent_transport=0,
-                 time_transport=0, adaptive_embed=False, tt_opts=None):
+                 time_transport=0, adaptive_embed=False, tt_opts=None, mixed_head=False):
+        """mixed_head (--mixed-head): STAEformer's output layer instead of target tokens: no target frames;
+        each patch's T_in final input-frame tokens, flattened, map to its T_out steps by one linear layer."""
         super().__init__()
         self.patch, self.T_in, self.T_out, self.cout_step = patch, T_in, T_out, cout_step
+        self.mixed_head = mixed_head
         self.embed = nn.Conv2d(cin_frame, dim, patch, stride=patch)
         tokens = (grid[0] // patch) * (grid[1] // patch)
         self.target = nn.Parameter(torch.zeros(1, T_out, 1, dim))
@@ -281,39 +416,120 @@ class SpaceTimeTransformer(nn.Module):
         tt_opts = dict(tt_opts or {})
         if tt_opts.pop("sensor_topology", False):   # one lag topology per patch (sensor)
             tt_opts["groups"] = tokens
-        t_transport = (T_in + T_out, time_transport, T_in, tt_opts) if time_transport else None
-        self.blocks = nn.ModuleList(AdaLNBlock(dim, heads, mlp_dim, cond_dim, drop, sinkformer,
-                                               modes if i % 2 == 1 else None,
-                                               transport if i % 2 == 1 else t_transport) for i in range(depth))
+        # --tt-flow-head: the forecast includes the observed past flow moved by the last temporal block's plan
+        self.flow_head = bool(tt_opts.pop("flow_head", False))
+        if self.flow_head and not time_transport:
+            raise ValueError("--tt-flow-head reads the temporal transport plan: give --time-transport K")
+        # --st-transport R: the temporal blocks (all blocks with --st-only) are a SpaceTimeTransport instead
+        st_radius, st_only = tt_opts.pop("space_time", 0), tt_opts.pop("st_only", False)
+        st_hops = tt_opts.pop("graph", None)
+        chain = tt_opts.pop("chain", False)
+        if mixed_head and (st_radius or chain or self.flow_head):
+            raise ValueError("--mixed-head has no target frames: no --st-transport / --tt-chain / --tt-flow-head")
+        if chain and (not time_transport or self.flow_head):
+            raise ValueError("--tt-chain changes --time-transport's later blocks: give --time-transport K, "
+                             "no --tt-flow-head")
+        if st_radius:
+            if set(tt_opts) - {"unbalanced"}:
+                raise ValueError(f"--st-transport doesn't take {sorted(set(tt_opts) - {'unbalanced'})}")
+            if st_hops is None:   # a grid: the 8-neighbour graph of the patches
+                st_hops = grid_hops(grid[0] // patch, grid[1] // patch)
+            elif isinstance(st_hops, str):
+                from trafficpred.data.files import ROOT
+                st_hops = np.load(os.path.join(ROOT, st_hops))
+            if len(st_hops) != tokens:
+                raise ValueError(f"--st-transport: a {len(st_hops)}-node graph for {tokens} tokens (use --patch-size 1)")
+        elif st_only:
+            raise ValueError("--st-only needs --st-transport R")
+        F_all = T_in if mixed_head else T_in + T_out
+        t_transport = (F_all, time_transport, T_in, tt_opts) if time_transport else None
+        # --tt-chain: the temporal blocks after the first take every earlier frame as a source too
+        c_transport = (F_all, time_transport, F_all,
+                       dict(tt_opts, causal=T_in, unbalanced=tt_opts.get("unbalanced", 1.0))) if chain else None
+        first_t = True
+        self.kinds = ["st" if st_radius and (st_only or i % 2 == 0) else ("t" if i % 2 == 0 else "s")
+                      for i in range(depth)]
+        blocks = []
+        for kind in self.kinds:
+            if kind == "st":
+                blk = AdaLNBlock(dim, heads, mlp_dim, cond_dim, drop)
+                blk.attn = None
+                blk.modes = SpaceTimeTransport(T_in + T_out, T_in, dim, heads, drop, time_transport, st_hops,
+                                               st_radius, unbalanced=tt_opts.get("unbalanced", 1.0))
+            else:
+                tt = t_transport
+                if kind == "t":
+                    tt = t_transport if (first_t or not chain) else c_transport
+                    first_t = False
+                blk = AdaLNBlock(dim, heads, mlp_dim, cond_dim, drop, sinkformer, modes if kind == "s" else None,
+                                 transport if kind == "s" else tt)
+            blocks.append(blk)
+        self.blocks = nn.ModuleList(blocks)
         self.norm = nn.LayerNorm(dim, elementwise_affine=False)
         self.final_ada = nn.Linear(cond_dim, 2 * dim)
         nn.init.zeros_(self.final_ada.weight)
         nn.init.zeros_(self.final_ada.bias)
-        self.head = nn.Linear(dim, patch * patch * cout_step)
+        self.head = nn.Linear(T_in * dim if mixed_head else dim, (T_out if mixed_head else 1) * patch * patch * cout_step)
+        if self.flow_head:
+            last = max(i for i, kind in enumerate(self.kinds) if kind in ("t", "st"))
+            self.blocks[last].modes.keep_flow_plan = True
+            self.flow_mix = nn.Parameter(torch.zeros(heads))   # softmax weights over the plan's heads
+            nn.init.zeros_(self.head.weight)   # start as the transported flow alone; learn the correction
+            nn.init.zeros_(self.head.bias)
 
-    def forward(self, x, cond, target_add=None):
+    def forward(self, x, cond, target_add=None, flow_src=None):
         """x: (B, T_in, cin_frame, H, W) -> (B, T_out * cout_step, H, W), step-major like DistTransformer.
-        target_add: optional (B, T_out, dim) added to the target tokens (--ext-input: the targets' features)."""
+        target_add: optional (B, T_out, dim) added to the target tokens (--ext-input: the targets' features).
+        flow_src (--tt-flow-head): the observed flow (B, T_in, cout_step, H, W); then returns (head output,
+        transported flow), both (B, T_out * cout_step, H, W): the target frames' rows of the last temporal
+        plan (a head mixture; each row sums to 1) applied to the input frames' flow, patch by patch."""
         B, T, Cf, H, W = x.shape
         h, w = H // self.patch, W // self.patch
         tokens = self.embed(x.reshape(B * T, Cf, H, W)).flatten(2).transpose(1, 2).reshape(B, T, h * w, -1)
-        target = self.target.expand(B, -1, h * w, -1)
-        if target_add is not None:
-            target = target + target_add[:, :, None]
-        z = torch.cat([tokens, target], dim=1)                                    # (B, F, N, D)
-        z = z + (self.adaptive if self.adaptive is not None else self.pos + self.frame)
+        if self.mixed_head:   # input frames only
+            z = tokens + (self.adaptive[:, :T] if self.adaptive is not None else self.pos + self.frame[:, :T])
+        else:
+            target = self.target.expand(B, -1, h * w, -1)
+            if target_add is not None:
+                target = target + target_add[:, :, None]
+            z = torch.cat([tokens, target], dim=1)                                # (B, F, N, D)
+            z = z + (self.adaptive if self.adaptive is not None else self.pos + self.frame)
         F_, N, D = z.shape[1:]
-        for i, block in enumerate(self.blocks):
-            if i % 2 == 0:   # temporal: each patch's sequence of frames
+        for kind, block in zip(self.kinds, self.blocks):
+            if kind == "st":   # space-time: all the frames' patches at once
+                z = block(z.reshape(B, F_ * N, D), cond).reshape(B, F_, N, D)
+            elif kind == "t":   # temporal: each patch's sequence of frames
                 seq = z.transpose(1, 2).reshape(B * N, F_, D)
                 z = block(seq, cond.repeat_interleave(N, dim=0)).reshape(B, N, F_, D).transpose(1, 2)
             else:            # spatial: each frame's patches
                 z = block(z.reshape(B * F_, N, D), cond.repeat_interleave(F_, dim=0)).reshape(B, F_, N, D)
-        out = z[:, T:]                                                           # target frames
         shift, scale = self.final_ada(cond)[:, None, None].chunk(2, dim=-1)
-        out = self.head(self.norm(out) * (1 + scale) + shift)                    # (B, T_out, N, p*p*c)
-        out = out.transpose(2, 3).reshape(B * self.T_out, -1, h, w)
-        return F.pixel_shuffle(out, self.patch).reshape(B, self.T_out * self.cout_step, H, W)
+        if self.mixed_head:   # (B, T_in, N, D) -> each patch's frames flattened -> (B, T_out, N, p*p*c)
+            out = (self.norm(z) * (1 + scale) + shift).transpose(1, 2).reshape(B, N, T * D)
+            out = self.head(out).reshape(B, N, self.T_out, -1).transpose(1, 2)
+        else:
+            out = z[:, T:]                                                       # target frames
+            out = self.head(self.norm(out) * (1 + scale) + shift)                # (B, T_out, N, p*p*c)
+        to_maps = lambda t: F.pixel_shuffle(t.transpose(2, 3).reshape(B * self.T_out, -1, h, w), self.patch) \
+            .reshape(B, self.T_out * self.cout_step, H, W)
+        if not self.flow_head:
+            return to_maps(out)
+        if flow_src is None:
+            raise ValueError("built with --tt-flow-head: pass flow_src")
+        last = max(i for i, kind in enumerate(self.kinds) if kind in ("t", "st"))
+        lt = self.blocks[last].modes
+        mix = self.flow_mix.softmax(0)
+        src = F.pixel_unshuffle(flow_src.reshape(B * T, self.cout_step, H, W), self.patch)   # (B T, c p p, h, w)
+        src = src.flatten(2).transpose(1, 2).reshape(B, T, N, -1)                          # (B, T_in, N, c p p)
+        if self.kinds[last] == "st":   # (B, heads, F, N, T_in, K): the target frames, mixed over the heads
+            plan = torch.einsum("bhfnsk,h->bfnsk", lt.flow_plan[:, :, T:], mix)
+            moved = lt.move(plan, src)                                                # (B, T_out, N, c p p)
+        else:
+            plan = lt.flow_plan[:, :, T:]                                             # (B N, heads, T_out, T_in)
+            plan = (plan * mix[None, :, None, None]).sum(1)                           # (B N, T_out, T_in)
+            src = src.transpose(1, 2).reshape(B * N, T, -1)
+            moved = (plan @ src).reshape(B, N, self.T_out, -1).transpose(1, 2)        # (B, T_out, N, c p p)
+        return to_maps(out), to_maps(moved)
 
 
 class VolumeTransformer(nn.Module):
@@ -436,7 +652,7 @@ class DistVolFormer(nn.Module):
                  count_scale=0.0, count_offset=0.0, direct=False, aux=0, od_head=None, od_slot_scale=0.0,
                  ext_dim=0, ext_input=False, ext_volume=False, spatial_modes=0, mode_head=0, mode_init="random", mode_gate=False,
                  crop_pad=False, latent_transport=0, time_transport=0, adaptive_embed=False, zscore=None,
-                 no_vol_encoder=False, tt_opts=None):
+                 no_vol_encoder=False, tt_opts=None, mixed_head=False):
         """aux: extra input maps per frame after the C flow channels (--od), fed as log-flow maps next to
         the flow's (in every layout: stacked, time tokens, graph, volume transformer); not predicted.
 
@@ -505,6 +721,10 @@ class DistVolFormer(nn.Module):
         if time_transport and (not time_tokens or sinkformer):
             raise ValueError("--time-transport replaces the time-token transformer's temporal attention: add "
                              "--time-tokens, and no --sinkformer")
+        if tt_opts and tt_opts.get("flow_head") and not (direct and time_tokens):
+            raise ValueError("--tt-flow-head: only with distvolformer_direct --time-tokens")
+        if mixed_head and not (direct and time_tokens):
+            raise ValueError("--mixed-head: only with distvolformer_direct --time-tokens")
         if tt_opts and not time_transport:
             raise ValueError("the --tt-* options change --time-transport: give --time-transport K")
         if mode_head and (direct or transport):
@@ -543,7 +763,8 @@ class DistVolFormer(nn.Module):
             self.dist_enc = SpaceTimeTransformer(2 * C + aux + (EXT_EMBED if self.ext_embed is not None else 0), C + g_out, T_in, T_out,
                                                  (H, W) if crop_pad else grid, patch, dim, depth,
                                                  heads, mlp_dim, code_dim, drop, sinkformer, spatial_modes, mode_gate,
-                                                 latent_transport, time_transport, adaptive_embed, tt_opts)
+                                                 latent_transport, time_transport, adaptive_embed, tt_opts,
+                                                 mixed_head)
         else:
             self.dist_enc = DistTransformer(2 * k_in + a_in + e_in, self.transport.channels if transport else k_out + g_out,
                                             grid, patch,
@@ -626,6 +847,13 @@ class DistVolFormer(nn.Module):
         dist_kw = {"target_add": self.ext_target(e_frames[:, T:])} if self.ext_target is not None else {}
 
         if self.direct:
+            if getattr(self.dist_enc, "flow_head", False):   # x_hat = transported past flow + a correction
+                src = x if self.crop_pad else F.pad(x, (0, self.pad_w, 0, self.pad_h))
+                out, moved = self.dist_enc(features, code, flow_src=src, **dist_kw)
+                out = out[..., :H, :W].reshape(B, self.T_out, C, H, W)
+                moved = moved[..., :H, :W].reshape(B, self.T_out, C, H, W)
+                x_hat = moved + (self.zscore[1] * out if self.zscore else out)
+                return (x_hat, *split_flow(x_hat)) if return_parts else x_hat
             x_hat = self.dist_enc(features, code, **dist_kw)[..., :H, :W].reshape(B, self.T_out, C, H, W)
             if self.zscore:
                 x_hat = self.zscore[0] + self.zscore[1] * x_hat

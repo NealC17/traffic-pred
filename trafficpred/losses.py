@@ -93,7 +93,22 @@ UNBALANCED_DEFAULTS = dict(reach=0.3)   # sinkhorn_unbalanced's
 ADAPTIVE_DEFAULTS = dict(l1=1.0, l2=1.0, l3=1.0, adapt_beta=0.95, adapt_every=10)
 
 PARTS_LOSSES = (*WEIGHTED, *UNCERTAINTY, *ADAPTIVE)
-LOSSES = (*POINTWISE, *PARTS_LOSSES)
+LOSSES = (*POINTWISE, *PARTS_LOSSES, "huber_raw")
+
+
+class RawHuberLoss(nn.Module):
+    """--loss huber_raw: torch's HuberLoss (delta 1) on the raw counts, as STAEformer trains on PeMS. The data
+    are on the 0-1 scale (x - lo) / span here, so the error is mapped back by * span (lo cancels): the loss and
+    its gradients equal the official ones, so its Adam weight decay carries over unscaled."""
+    needs_parts = False
+
+    def __init__(self, span, delta=1.0):
+        super().__init__()
+        self.span, self.delta = float(span), delta
+
+    def forward(self, pred, y):
+        loss = F.huber_loss(pred.float() * self.span, y * self.span, delta=self.delta)
+        return loss, {"huber_raw": loss.detach()}
 
 
 class PointwiseLoss(nn.Module):

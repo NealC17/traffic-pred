@@ -8,6 +8,7 @@ from trafficpred.models.distvolformer import DistVolFormer
 from trafficpred.models.mlp import MLP
 from trafficpred.models.predformer import VARIANTS, PredFormer, with_horizon
 from trafficpred.models.stid import STID
+from trafficpred.models.staeformer import STAEformer
 from trafficpred.models.stresnet import STResNet
 
 
@@ -135,6 +136,8 @@ def _modes(args):   # only stored when on, so older checkpoints' kwargs stay val
         out["adaptive_embed"] = True
     if getattr(args, "no_vol_encoder", False):
         out["no_vol_encoder"] = True
+    if getattr(args, "mixed_head", False):
+        out["mixed_head"] = True
     tt = {}   # --tt-*: variants of the temporal latent transport
     if getattr(args, "tt_no_topology", False):
         tt["topology"] = False
@@ -146,6 +149,16 @@ def _modes(args):   # only stored when on, so older checkpoints' kwargs stay val
         tt["sensor_topology"] = True
     if getattr(args, "tt_hybrid", False):
         tt["hybrid"] = True
+    if getattr(args, "tt_flow_head", False):
+        tt["flow_head"] = True
+    if getattr(args, "tt_cond_cost", False):
+        tt["cond_cost"] = True
+    if getattr(args, "tt_chain", False):
+        tt["chain"] = True
+    if getattr(args, "st_transport", None):
+        tt["space_time"] = args.st_transport
+        if getattr(args, "st_only", False):
+            tt["st_only"] = True
     if tt:
         out["tt_opts"] = tt
     return out
@@ -168,6 +181,9 @@ def _configure_distvolformer_direct(args, splits):
     cfg = _configure_distvolformer(args, splits)
     if cfg.get("transport") or cfg.get("dist_residual"):
         raise SystemExit("distvolformer_direct doesn't take --transport / --dist-residual")
+    tt = cfg.get("tt_opts") or {}
+    if tt.get("space_time") and splits.dataset in ("pems04", "pems08"):   # the road graph of the sensors
+        cfg["tt_opts"] = dict(tt, graph=f"PEMS/{splits.dataset.upper()}/hops.npy")
     return dict(cfg, direct=True)
 
 
@@ -192,6 +208,17 @@ def _configure_stid(args, splits):
     return dict(_grid(splits), **({"ext_dim": splits.ext_dim} if splits.ext_dim else {}),
                 steps_per_day=getattr(DATASETS[splits.dataset], "steps_per_day", 288),
                 drop=_pick(args, "dropout", 0.15))
+
+
+def _configure_staeformer(args, splits):
+    from trafficpred.data.datasets import DATASETS
+    if splits.aux_in or splits.extra_in:
+        raise SystemExit("staeformer takes the recent frames only (no --od / --periods)")
+    if not splits.ext_dim:
+        raise SystemExit("staeformer needs the time of day / day of week: add --external")
+    return dict(_grid(splits), ext_dim=splits.ext_dim,
+                steps_per_day=getattr(DATASETS[splits.dataset], "steps_per_day", 288),
+                zscore=zscore_of(splits), drop=_pick(args, "dropout", 0.1))
 
 
 def _configure_mlp(args, splits):
@@ -293,6 +320,12 @@ MODELS = {
                       dict(CONV_TRAIN, epochs=100, batch_size=32, lr=2e-3, weight_decay=1e-4, clip=0.0,
                            optimizer="adam"),
                       {"pems08": dict(weight_decay=1e-4 * 145.6 / 1077), "pems04": dict(weight_decay=1e-4 * 156.5 / 919)}),
+    # the official PEMS recipe (model/STAEformer.yaml, train.py): Adam, wd 1.5e-3, lr 1e-3 x0.1 at epochs 25 /
+    # 45 / 65, batch 16, up to 300 epochs with early stopping after 30, no clipping; Huber on the raw counts
+    "staeformer": ModelSpec(STAEformer, _configure_staeformer, "huber_raw",
+                            dict(CONV_TRAIN, epochs=300, batch_size=16, lr=1e-3, weight_decay=1.5e-3, clip=0.0,
+                                 optimizer="adam", schedule="multistep", milestones=(25, 45, 65), lr_gamma=0.1,
+                                 patience=30)),
     "predformer": ModelSpec(_build_predformer, _configure_predformer, "mse",
                             PREDFORMER_TRAIN, {"mmnist": dict(epochs=2000)}),
     "predformer_official": ModelSpec(_build_official, _configure_official, "mse",
@@ -369,6 +402,29 @@ def add_model_args(ap):
                         "instead of N / S each")
     g.add_argument("--tt-sensor-topology", action="store_true",
                    help="--time-transport: one learned lag topology per sensor instead of one shared")
+    g.add_argument("--tt-flow-head", action="store_true",
+                   help="distvolformer_direct --time-transport: the forecast is the observed past flow moved by the "
+                        "last temporal block's transport plan, plus the head's correction (zero at the start)")
+    g.add_argument("--tt-no-decay", action="store_true",
+                   help="--time-transport / --latent-transport: no weight decay on the transport's geometry (its "
+                        "temperatures, topology positions and weights, and rho), as for norms and biases")
+    g.add_argument("--tt-cond-cost", action="store_true",
+                   help="--time-transport: add a cost term from the conditioning code (the target calendar), so the "
+                        "lag map can depend on the time of day / day of week (zero at the start)")
+    g.add_argument("--st-transport", type=int, metavar="R",
+                   help="--time-transport K: the temporal blocks become one space-time transport (K Sinkhorn steps): "
+                        "mass moves from any input frame of any sensor within R hops (the PEMS road graph, or the "
+                        "8-neighbour patch grid) to every frame of the sensor; unbalanced (--tt-unbalanced, default 1). "
+                        "Memory grows with the neighbourhood: PEMS08 at batch 16 needs ~3.3 GB per block for R = 1 "
+                        "(at most 10 neighbours), ~6.6 GB for R = 2 (28): R = 2 wants a bigger GPU")
+    g.add_argument("--tt-chain", action="store_true",
+                   help="--time-transport: chained transport: the temporal blocks after the first take every earlier "
+                        "frame as a source too (t+2 draws on the inputs and t+1, ...), unbalanced columns")
+    g.add_argument("--mixed-head", action="store_true",
+                   help="distvolformer --time-tokens: STAEformer's output layer: no target frames; each patch's "
+                        "final input-frame tokens, flattened, map to its T_out steps by one linear layer")
+    g.add_argument("--st-only", action="store_true",
+                   help="--st-transport: every block is a space-time transport (no spatial attention blocks)")
     g.add_argument("--tt-hybrid", action="store_true",
                    help="--time-transport: keep the temporal self-attention as well and add the two outputs")
     g.add_argument("--mode-gate", action="store_true",

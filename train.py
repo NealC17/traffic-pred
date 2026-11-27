@@ -60,7 +60,8 @@ def parse_args(argv=None):
     g.add_argument("--lr", type=float)
     g.add_argument("--weight-decay", type=float)
     g.add_argument("--clip", type=float, help="gradient norm clip (0 = off)")
-    g.add_argument("--schedule", choices=("onecycle", "plateau"))
+    g.add_argument("--schedule", choices=("onecycle", "plateau", "multistep"),
+                   help="multistep: the lr x lr_gamma at each of the model's milestones (epochs; STAEformer)")
     g.add_argument("--optimizer", choices=("adamw", "adam"))
     g.add_argument("--plateau-patience", type=int, help="epochs without improvement before halving the lr")
     g.add_argument("--patience", type=int, help="early stopping after N epochs without improvement (0 = off)")
@@ -172,11 +173,12 @@ def option_suffix(loss, options):
 
 def training_settings(args, spec):
     defaults = spec.train_defaults(args.dataset)
-    chosen = {k: getattr(args, k) if getattr(args, k) is not None else v for k, v in defaults.items()}
+    chosen = {k: getattr(args, k, None) if getattr(args, k, None) is not None else v for k, v in defaults.items()}
     eval_batch_size = args.eval_batch_size or (chosen["batch_size"] if args.model == "stdcformer" else 128)
     return TrainSettings(**chosen, select=args.select, amp=args.amp, compile=args.compile,
                          workers=args.workers, eval_batch_size=eval_batch_size,
-                         data_on_gpu=args.data_on_gpu, curves=args.curves)
+                         data_on_gpu=args.data_on_gpu, curves=args.curves,
+                         tt_no_decay=bool(getattr(args, "tt_no_decay", False)))
 
 
 def run_name(args, splits, loss, loss_options):
@@ -220,8 +222,8 @@ def main(argv=None, epoch_callback=None):
     """Run train.py with these arguments (default: the command line). Returns the val-selected
     checkpoint's scores by split, or None if epoch_callback stopped the run (see Trainer.fit)."""
     args = parse_args(argv)
-    if args.external and args.model not in ("stresnet", "cnn", "distvol", "distvolformer", "distvolformer_direct", "stid"):
-        raise SystemExit("--external works with --model stresnet / cnn / distvol / distvolformer / stid")
+    if args.external and args.model not in ("stresnet", "cnn", "distvol", "distvolformer", "distvolformer_direct", "stid", "staeformer"):
+        raise SystemExit("--external works with --model stresnet / cnn / distvol / distvolformer / stid / staeformer")
     if args.st_branches and args.model != "stresnet":
         raise SystemExit("--st-branches only works with --model stresnet")
     spec = MODELS[args.model]
@@ -262,10 +264,17 @@ def main(argv=None, epoch_callback=None):
                scale=(splits.lo, splits.hi), channels=splits.channels, loss=loss_name,
                loss_options=loss_options, seed=args.seed)
     threshold = (THRESHOLD - splits.lo) / splits.span   # the scored cut in scaled units (--low-weight)
-    loss = None if loss_name == "none" else make_loss(loss_name, threshold=threshold, **loss_options)
+    if loss_name == "huber_raw":
+        from trafficpred.losses import RawHuberLoss
+        loss = RawHuberLoss(splits.span)
+    else:
+        loss = None if loss_name == "none" else make_loss(loss_name, threshold=threshold, **loss_options)
     if getattr(args, "zscore", False) and loss is not None:   # the loss in z units: / the train std (0-1 scale)
         from trafficpred.models import zscore_of
-        loss = ScaledLoss(loss, 1.0 / zscore_of(splits)[1])
+        factor = 1.0 / zscore_of(splits)[1]
+        if loss_name == "huber_raw":   # raw counts -> z units (delta stays 1 vehicle), the same scale as L1 in z
+            factor /= splits.span
+        loss = ScaledLoss(loss, factor)
 
     torch.backends.cudnn.benchmark = device.type == "cuda"
     trainer = Trainer(model, run, splits, loss, settings, save, device)

@@ -14,6 +14,8 @@ Every run is the best no-split model so far (distvolformer_direct + TT 5 steps +
   sensortopo   one lag topology per sensor instead of one shared
   hybrid       temporal attention and TT side by side, outputs added
   periods      long history: + the 12 steps one day and one week before the targets (36 input frames)
+  nodecay      no weight decay on TT's geometry (temperatures, topology positions / weight)
+  flow         + the flow transport head: forecast = observed past flow moved by the last TT plan + a correction
   tt5          the reference itself, re-run on this machine (same-hardware comparison)
   attn         the attention control (no TT), as slurm/pems_ae_attention.sbatch runs on Sol
 
@@ -55,6 +57,18 @@ RUNS = {   # name -> (the change, the flags it adds to BASE)
     "sensortopo": ("a lag topology per sensor", "--time-transport 5 --tt-sensor-topology"),
     "hybrid": ("attention + TT", "--time-transport 5 --tt-hybrid"),
     "periods": ("+ day / week history", "--time-transport 5 --periods day week"),
+    "nodecay": ("no weight decay on TT geometry", "--time-transport 5 --tt-no-decay"),
+    "flow": ("flow transport head (+ no decay)", "--time-transport 5 --tt-no-decay --tt-flow-head"),
+    "condcost": ("calendar-conditioned cost (+ flow head, no decay)",
+                 "--time-transport 5 --tt-no-decay --tt-flow-head --tt-cond-cost"),
+    "huber": ("Huber loss, delta 1 vehicle, instead of L1 + volume (+ flow head, no decay)",
+              "--time-transport 5 --tt-no-decay --tt-flow-head --loss huber_raw"),
+    "st1": ("space-time transport, 1 road hop (+ flow head, no decay)",
+            "--time-transport 5 --tt-no-decay --tt-flow-head --st-transport 1"),
+    "st1only": ("space-time transport in every block, no spatial attention (+ flow head, no decay)",
+                "--time-transport 5 --tt-no-decay --tt-flow-head --st-transport 1 --st-only"),
+    "mixed": ("STAEformer's mixed-projection output head, no target frames", "--time-transport 5 --mixed-head"),
+    "chain": ("chained transport: later temporal blocks also draw on earlier future frames", "--time-transport 5 --tt-chain"),
     "tt5": ("the reference", "--time-transport 5"),
     "attn": ("attention control, no TT", ""),
 }
@@ -95,7 +109,8 @@ def epochs_done(log):
 def train(key, flags, seed, tag, wandb, overall, done_before):
     name = run_name(key, tag, seed)
     log_path = os.path.join(W, "logs", name + ".log")
-    cmd = [sys.executable, "-u", "train.py", *shlex.split(BASE), *shlex.split(flags), "--seed", str(seed),
+    base = BASE.replace("--loss sinkhorn --l2 0 ", "") if "--loss" in shlex.split(flags) else BASE   # a loss of its own
+    cmd = [sys.executable, "-u", "train.py", *shlex.split(base), *shlex.split(flags), "--seed", str(seed),
            "--save", os.path.join(W, name + ".pt"), "--resume"] + ([] if wandb else ["--no-wandb"])
     env = dict(os.environ, PYTORCH_ENABLE_MPS_FALLBACK="1")   # Apple GPUs: run the odd unsupported op on the CPU
     total = epochs_of(flags)
@@ -129,9 +144,10 @@ def train(key, flags, seed, tag, wandb, overall, done_before):
             bars = BATCH_BAR.findall(text[-5000:])
             if bars:
                 ep, n, of = map(int, bars[-1])
-                if batches.total != of:
+                if batches.total != of or ep != getattr(batches, "epoch", None):   # a new epoch: restart the clock
                     batches.reset(total=of)
-                batches.set_description(f"  {key} epoch {ep}")
+                    batches.epoch = ep
+                    batches.set_description(f"  {key} epoch {ep}")
                 batches.n = n
                 batches.refresh()
     except KeyboardInterrupt:

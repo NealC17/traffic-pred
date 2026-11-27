@@ -27,6 +27,9 @@ class TrainSettings:
     optimizer: str = "adamw"
     plateau_patience: int = 10
     select: str = "mse"
+    milestones: tuple = ()     # schedule "multistep": the epochs after which the lr is multiplied by lr_gamma
+    lr_gamma: float = 0.1
+    tt_no_decay: bool = False   # --tt-no-decay: no weight decay on the latent transports' geometry
     amp: bool = False
     compile: bool = False
     workers: int = 2
@@ -38,6 +41,10 @@ class TrainSettings:
         d = asdict(self)
         for k in ("amp", "compile", "workers", "eval_batch_size", "data_on_gpu", "patience", "curves"):
             d.pop(k)
+        # settings added later: left out at their defaults, so older checkpoints still resume
+        for k, default in (("milestones", ()), ("lr_gamma", 0.1), ("tt_no_decay", False)):
+            if d.get(k) == default:
+                d.pop(k)
         return d
 
 
@@ -140,6 +147,15 @@ class Trainer:
         s = self.settings
         optimizer = torch.optim.AdamW if s.optimizer == "adamw" else torch.optim.Adam
         groups = [{"params": list(self.net.parameters())}]
+        if s.tt_no_decay:   # the transports' temperatures / topology / rho: decay would collapse the learned geometry
+            from trafficpred.models.distvolformer import LatentTransport, SpaceTimeTransport
+            geometry = {id(p) for m in self.net.modules() if isinstance(m, (LatentTransport, SpaceTimeTransport))
+                        for name, p in m.named_parameters(recurse=False)
+                        if name in ("log_eps", "topo", "topo_w", "log_rho", "hop_cost")}
+            if not geometry:
+                raise SystemExit("--tt-no-decay: the model has no latent transport (--time-transport / --latent-transport)")
+            groups = [{"params": [p for p in self.net.parameters() if id(p) not in geometry]},
+                      {"params": [p for p in self.net.parameters() if id(p) in geometry], "weight_decay": 0.0}]
         loss_params = list(self.loss.parameters()) if self.loss is not None else []
         if loss_params:  # e.g. learned uncertainty weights: trained with the model, never decayed
             groups.append({"params": loss_params, "weight_decay": 0.0})
@@ -151,6 +167,8 @@ class Trainer:
         if s.schedule == "onecycle":
             self.sched = torch.optim.lr_scheduler.OneCycleLR(
                 self.opt, s.lr, total_steps=s.epochs * len(self.train_loader))
+        elif s.schedule == "multistep":   # stepped once per epoch, after the training batches
+            self.sched = torch.optim.lr_scheduler.MultiStepLR(self.opt, list(s.milestones), gamma=s.lr_gamma)
         else:
             self.sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.opt, mode="min", factor=0.5, patience=s.plateau_patience, min_lr=5e-6)
@@ -212,6 +230,8 @@ class Trainer:
             m = self.evaluate(self.net, self.val_loader, "  val")
             if s.schedule == "plateau":
                 self.sched.step(m[s.select])
+            elif s.schedule == "multistep":
+                self.sched.step()
             curves = None
             if self.train_sample_loader is not None:
                 curves = {"train": self.evaluate(self.net, self.train_sample_loader, "  train sample"),
