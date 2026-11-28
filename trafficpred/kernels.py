@@ -14,6 +14,7 @@ TRITON_INTERPRET=1 to test it on the CPU). tools/bench_kernels.py checks it agai
 import os
 
 import torch
+import torch.nn.functional as F
 
 try:
     import triton
@@ -168,9 +169,24 @@ def _run_check(device):
     return ok
 
 
+def prepare(device):
+    """Run the self-check on `device` now (train.py calls this before training). It must not run inside a model's
+    forward pass during training: gradient checkpointing replays that pass and counts the tensors it saves."""
+    device = torch.device(device)
+    if device.type == "cuda" and triton is not None and os.environ.get("TRAFFICPRED_TT_KERNEL", "") != "0":
+        ok = _self_check(device)
+        print(f"[kernels] fused TT Sinkhorn {'on' if ok else 'off'} ({torch.cuda.get_device_name(device)})")
+
+
 def tt_sinkhorn_plan(logits, col, frac, iters):
-    """sinkhorn_plan_eager's result, fused on the GPU (see the module docstring)."""
-    if iters < 1 or not _use_kernel(logits) or not _self_check(logits.device):
+    """sinkhorn_plan_eager's result, fused on the GPU (see the module docstring). The kernel is used once the
+    self-check has passed on this device: after prepare(), or a first call made without gradients (eval)."""
+    if iters < 1 or not _use_kernel(logits):
+        return sinkhorn_plan_eager(logits, col, frac, iters)
+    ok = _checked.get(logits.device)
+    if ok is None and not torch.is_grad_enabled():
+        ok = _self_check(logits.device)
+    if not ok:
         return sinkhorn_plan_eager(logits, col, frac, iters)
     return _fused(logits, col, frac, iters)
 
@@ -181,3 +197,27 @@ def _fused(logits, col, frac, iters):
     col_t = torch.as_tensor(col, dtype=torch.float32, device=dev).expand(B, h, 1, S).reshape(B * h, S).contiguous()
     frac_t = (torch.ones(h, device=dev) if frac is None else frac.reshape(h).float()).contiguous()
     return _TTSinkhorn.apply(logits, col_t, frac_t, iters).to(logits.dtype)
+
+
+def padded_sdpa(q, k, v, dropout_p=0.0):
+    """F.scaled_dot_product_attention for any head size. PyTorch's memory-efficient / flash kernels need the head
+    size to be a multiple of 8 (fp32: 4); otherwise it silently falls back to the plain softmax(q k^T) v, which
+    holds the whole L x L score matrix (BjTT: 1260 roads, 36 GB at batch 16). Zero-padding q, k, v to the next
+    multiple of 8 keeps q k^T and the first d output columns exactly the same; the scale stays 1 / sqrt(d)."""
+    d = q.shape[-1]
+    pad = -d % 8
+    if pad == 0 or not q.is_cuda:
+        return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+    q, k, v = (F.pad(t, (0, pad)) for t in (q, k, v))
+    return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, scale=d ** -0.5)[..., :d]
+
+
+def mha_self_attention(attn, x):
+    """attn(x, x, x, need_weights=False)[0] for an nn.MultiheadAttention(batch_first=True) without masks, through
+    padded_sdpa (same weights, same maths; attention dropout in training as attn does)."""
+    B, L, D = x.shape
+    h = attn.num_heads
+    q, k, v = F.linear(x, attn.in_proj_weight, attn.in_proj_bias).chunk(3, dim=-1)
+    q, k, v = (t.reshape(B, L, h, D // h).transpose(1, 2) for t in (q, k, v))
+    out = padded_sdpa(q, k, v, attn.dropout if attn.training else 0.0)
+    return attn.out_proj(out.transpose(1, 2).reshape(B, L, D))

@@ -291,6 +291,8 @@ def main(argv=None, epoch_callback=None):
     torch.backends.cudnn.benchmark = device.type == "cuda"
     if args.tf32:
         torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
+    from trafficpred import kernels
+    kernels.prepare(device)   # the fused TT kernel's self-check, before any (checkpointed) training step
     trainer = Trainer(model, run, splits, loss, settings, save, device)
     tracker_state = trainer.try_resume() if args.resume else None
     tracker = Tracker(name=name, job_type=args.model, enabled=not args.no_wandb, dataset=args.dataset,

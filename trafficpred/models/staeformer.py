@@ -20,6 +20,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from trafficpred.kernels import padded_sdpa
+
 
 def calendar_slots(ext, steps_per_day):
     """(B, T, E) calendar features (dow one-hot 7, day off, sin / cos time of day) -> (B, T) time-of-day slot
@@ -40,7 +42,7 @@ class _Attention(nn.Module):
         split = lambda t: torch.cat(torch.split(t, self.head_dim, dim=-1), dim=0)   # heads onto the batch
         q, k, v = split(self.q(x)), split(self.k(x)), split(self.v(x))
         # softmax(q k^T / sqrt(d)) v as the official code, fused: memory grows with L, not L^2 (BjTT: 1260 roads)
-        out = F.scaled_dot_product_attention(q, k, v)
+        out = padded_sdpa(q, k, v)   # head size 38: padded to 40 so the fused kernels apply
         out = torch.cat(torch.split(out, x.shape[0], dim=0), dim=-1)
         return self.out(out)
 

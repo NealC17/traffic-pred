@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.utils.checkpoint
 import torch.nn.functional as F
 
-from trafficpred.kernels import tt_sinkhorn_plan
+from trafficpred.kernels import mha_self_attention, tt_sinkhorn_plan
 
 from trafficpred.models.distvol import EPS, EXT_EMBED, ConvBlock, ODTransportHead, ext_maps, log_flow, log_last_distribution
 from trafficpred.models.transport import TransportHead
@@ -340,13 +340,13 @@ class AdaLNBlock(nn.Module):
         h = self.norm1(x) * (1 + scale1) + shift1
         kw = {"cond": cond} if getattr(self.modes, "cond_cost", None) is not None else {}
         if self.hybrid:
-            a = self.modes(h, **kw) + self.attn(h, h, h, need_weights=False)[0]
+            a = self.modes(h, **kw) + mha_self_attention(self.attn, h)
         elif self.modes is not None:
             a = self.modes(h, **kw)
         elif self.sinkformer:
             a = sinkhorn_attention(self.attn, h, self.sinkformer)
-        else:
-            a = self.attn(h, h, h, need_weights=False)[0]
+        else:   # padded to a head size the fused attention kernels take (152 / 4 = 38 isn't)
+            a = mha_self_attention(self.attn, h)
         x = x + (1 + gate1) * a
         h = self.norm2(x) * (1 + scale2) + shift2
         return x + (1 + gate2) * self.mlp(h)
