@@ -87,8 +87,10 @@ def usual_pattern(Y, cut, period):
 
 class GridFlowData:
     def __init__(self, title, pattern, channels, steps_per_day, test_days, val_days, horizon=(4, 4),
-                 spatial_file=None, has_external=False, source=None, calendar=None, od_file=None, weather=None):
+                 spatial_file=None, has_external=False, source=None, calendar=None, od_file=None, weather=None,
+                 graph_file=None):
         self.title = title
+        self.graph_file = graph_file   # (N, N) hop distances of the sensor / road graph (--st-transport)
         self.od_file = od_file   # per-frame origin-destination maps (tools/import_stdn_od.py), for --od
         self.source = source   # where to get the files, shown when they are missing
         self.calendar = calendar   # (start date, holidays): calendar external features
@@ -163,7 +165,8 @@ class GridFlowData:
                     if n in whole_ext:
                         continue
                     T = len(files.load(n))
-                    feats = ext_data.calendar(start, T, self.steps_per_day, holidays)
+                    first = start[n] if isinstance(start, dict) else start   # per-file start dates (BjTT months)
+                    feats = ext_data.calendar(first, T, self.steps_per_day, holidays)
                     if weather:
                         if len(names) > 1:
                             raise ValueError("weather is set up for single-file datasets")
@@ -472,6 +475,9 @@ BOUSAI_SOURCE = ("apply for Yahoo! Bousai Crowd Data at https://randd.yahoo.co.j
 PEMS_SOURCE = ("download <DS>_series.parquet and <DS>_edges.parquet from huggingface.co/datasets/Davidham3/"
                "pems-stsgcn into datasets/PEMS/<DS>/, then run python -I tools/import_pems.py <DS>")
 
+BJTT_SOURCE = ("request BjTT from its authors (licence form at chyazhang.github.io/BjTT), unzip BjTT.zip into "
+               "datasets/BjTT/raw/, then run python -I tools/import_bjtt.py")
+
 DATASETS = {
     "taxibj": GridFlowData("TaxiBJ", r"TaxiBJ/TaxiBJ20\d\d(_\d+)?\.npy", ("Inflow", "Outflow"),
                            steps_per_day=48, test_days=28, val_days=28, has_external=True),
@@ -512,10 +518,21 @@ DATASETS = {
     # the width (H = 1); --external gives the calendar (STAEformer / STID's time-of-day and day-of-week).
     "pems04": GridFlowData("PEMS04", r"PEMS/PEMS04/flow\.npy", ("Flow",), steps_per_day=288,
                            test_days=0.2 * 16992 / 288, val_days=0.2 * 16992 / 288, horizon=(12, 12),
-                           source=PEMS_SOURCE, calendar=("2018-01-01", ("2018-01-01", "2018-01-15", "2018-02-19"))),
+                           source=PEMS_SOURCE, calendar=("2018-01-01", ("2018-01-01", "2018-01-15", "2018-02-19")),
+                           graph_file="PEMS/PEMS04/hops.npy"),
     "pems08": GridFlowData("PEMS08", r"PEMS/PEMS08/flow\.npy", ("Flow",), steps_per_day=288,
                            test_days=0.2 * 17856 / 288, val_days=0.2 * 17856 / 288, horizon=(12, 12),
-                           source=PEMS_SOURCE, calendar=("2016-07-01", ("2016-07-04",))),
+                           source=PEMS_SOURCE, calendar=("2016-07-01", ("2016-07-04",)),
+                           graph_file="PEMS/PEMS08/hops.npy"),
+    # BjTT (Zhang et al., T-ITS'24; tools/import_bjtt.py): road speed (km/h) of 1260 Beijing roads every 4 minutes,
+    # Jan - Mar 2022, speed only as in the paper's experiments. The published split is chronological 70 / 10 / 20 of
+    # the 32,400 steps: test = the last 6480 (Mar 13 - 31), val = the 3240 before (Mar 4 - 13). February's roads come
+    # in another, unpublished order, so it is left out of train (Jan + Mar 1 - 4). 12 in -> 15 out (20 / 40 / 60 min
+    # = steps 5 / 10 / 15). Missing readings are 0: score masked (tools/eval_pems.py). Jan 1 - 3 = New Year holiday.
+    "bjtt": GridFlowData("BjTT", r"BjTT/speed_2022_0[13]\.npy", ("Speed",), steps_per_day=360,
+                         test_days=6480 / 360, val_days=3240 / 360, horizon=(12, 15), source=BJTT_SOURCE,
+                         calendar=({"BjTT/speed_2022_01.npy": "2022-01-01", "BjTT/speed_2022_03.npy": "2022-03-01"},
+                                   ("2022-01-03",)), graph_file="BjTT/hops.npy"),
     "mmnist": MovingMNISTData(),
     "synthetic": SyntheticData(),
 }

@@ -178,12 +178,18 @@ def _configure_distvolformer_graph(args, splits):
 
 def _configure_distvolformer_direct(args, splits):
     """Ablation: distvolformer's inputs and backbone, predicting the flow directly (no map x total)."""
+    from trafficpred.data.datasets import DATASETS
     cfg = _configure_distvolformer(args, splits)
     if cfg.get("transport") or cfg.get("dist_residual"):
         raise SystemExit("distvolformer_direct doesn't take --transport / --dist-residual")
+    if getattr(args, "stae_embed", False):
+        if getattr(DATASETS[splits.dataset], "graph_file", None) is None:
+            raise SystemExit("--stae-embed reads the calendar features of the sensor datasets (pems04 / pems08 / bjtt)")
+        cfg["stae_embed"] = DATASETS[splits.dataset].steps_per_day
     tt = cfg.get("tt_opts") or {}
-    if tt.get("space_time") and splits.dataset in ("pems04", "pems08"):   # the road graph of the sensors
-        cfg["tt_opts"] = dict(tt, graph=f"PEMS/{splits.dataset.upper()}/hops.npy")
+    graph = getattr(DATASETS[splits.dataset], "graph_file", None)
+    if tt.get("space_time") and graph:   # the road graph of the sensors
+        cfg["tt_opts"] = dict(tt, graph=graph)
     return dict(cfg, direct=True)
 
 
@@ -319,7 +325,8 @@ MODELS = {
     "stid": ModelSpec(STID, _configure_stid, "mae",
                       dict(CONV_TRAIN, epochs=100, batch_size=32, lr=2e-3, weight_decay=1e-4, clip=0.0,
                            optimizer="adam"),
-                      {"pems08": dict(weight_decay=1e-4 * 145.6 / 1077), "pems04": dict(weight_decay=1e-4 * 156.5 / 919)}),
+                      {"pems08": dict(weight_decay=1e-4 * 145.6 / 1077), "pems04": dict(weight_decay=1e-4 * 156.5 / 919),
+                       "bjtt": dict(weight_decay=1e-4 * 17.05 / 142)}),
     # the official PEMS recipe (model/STAEformer.yaml, train.py): Adam, wd 1.5e-3, lr 1e-3 x0.1 at epochs 25 /
     # 45 / 65, batch 16, up to 300 epochs with early stopping after 30, no clipping; Huber on the raw counts
     "staeformer": ModelSpec(STAEformer, _configure_staeformer, "huber_raw",
@@ -420,6 +427,11 @@ def add_model_args(ap):
     g.add_argument("--tt-chain", action="store_true",
                    help="--time-transport: chained transport: the temporal blocks after the first take every earlier "
                         "frame as a source too (t+2 draws on the inputs and t+1, ...), unbalanced columns")
+    g.add_argument("--stae-embed", action="store_true",
+                   help="distvolformer_direct --time-tokens --zscore --external (PEMS): STAEformer's token embedding "
+                        "(z-scored flow + time of day + day of week projected to 24, time-of-day and day-of-week "
+                        "embeddings 24 + 24, a free (frame, sensor) vector for the rest), concatenated, instead of the "
+                        "patch embedding of the input features")
     g.add_argument("--mixed-head", action="store_true",
                    help="distvolformer --time-tokens: STAEformer's output layer: no target frames; each patch's "
                         "final input-frame tokens, flattened, map to its T_out steps by one linear layer")

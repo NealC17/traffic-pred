@@ -391,23 +391,45 @@ class SpaceTimeTransformer(nn.Module):
 
     def __init__(self, cin_frame, cout_step, T_in, T_out, grid, patch, dim, depth, heads, mlp_dim,
                  cond_dim, drop, sinkformer=0, spatial_modes=0, mode_gate=False, latent_transport=0,
-                 time_transport=0, adaptive_embed=False, tt_opts=None, mixed_head=False):
+                 time_transport=0, adaptive_embed=False, tt_opts=None, mixed_head=False, stae_embed=None):
         """mixed_head (--mixed-head): STAEformer's output layer instead of target tokens: no target frames;
-        each patch's T_in final input-frame tokens, flattened, map to its T_out steps by one linear layer."""
+        each patch's T_in final input-frame tokens, flattened, map to its T_out steps by one linear layer.
+        stae_embed (--stae-embed): (steps per day, flow channels C): STAEformer's token embedding instead of
+        the patch embedding of the input features + an added adaptive embedding: each (frame, sensor) token is
+        the concatenation of Linear(C + 2, 24)([z-scored flow, time of day / day, day of week]), a time-of-day
+        embedding (24), a day-of-week embedding (24) and a free adaptive vector per (frame, sensor) (dim - 72,
+        Xavier init); a target frame has a learned 24-vector in place of its unknown flow part, and its own
+        calendar. forward() then needs stae_in."""
         super().__init__()
         self.patch, self.T_in, self.T_out, self.cout_step = patch, T_in, T_out, cout_step
         self.mixed_head = mixed_head
-        self.embed = nn.Conv2d(cin_frame, dim, patch, stride=patch)
         tokens = (grid[0] // patch) * (grid[1] // patch)
-        self.target = nn.Parameter(torch.zeros(1, T_out, 1, dim))
-        if adaptive_embed:   # STAEformer's spatio-temporal adaptive embedding: one free vector per (frame, patch)
-            self.adaptive = nn.Parameter(torch.zeros(1, T_in + T_out, tokens, dim))
-            params = (self.adaptive, self.target)
-        else:                # separable: a position per patch + an embedding per frame (lag / target step)
+        F_all = T_in if mixed_head else T_in + T_out
+        self.stae = stae_embed is not None
+        if self.stae:
+            if patch != 1 or adaptive_embed or dim <= 72:
+                raise ValueError("--stae-embed: patch size 1, no --adaptive-embed (it has its own), dim > 72")
+            steps_per_day, C = stae_embed
+            self.steps_per_day = steps_per_day
+            self.stae_proj = nn.Linear(C + 2, 24)
+            self.tod_embedding = nn.Embedding(steps_per_day, 24)
+            self.dow_embedding = nn.Embedding(7, 24)
+            self.stae_adaptive = nn.init.xavier_uniform_(nn.Parameter(torch.empty(F_all, tokens, dim - 72)))
+            self.target_flow = nn.Parameter(torch.zeros(24))
+            nn.init.trunc_normal_(self.target_flow, std=0.02)
             self.adaptive = None
-            self.pos = nn.Parameter(torch.zeros(1, 1, tokens, dim))
-            self.frame = nn.Parameter(torch.zeros(1, T_in + T_out, 1, dim))
-            params = (self.pos, self.frame, self.target)
+            params = ()
+        else:
+            self.embed = nn.Conv2d(cin_frame, dim, patch, stride=patch)
+            self.target = nn.Parameter(torch.zeros(1, T_out, 1, dim))
+            if adaptive_embed:   # STAEformer's spatio-temporal adaptive embedding: one free vector per (frame, patch)
+                self.adaptive = nn.Parameter(torch.zeros(1, T_in + T_out, tokens, dim))
+                params = (self.adaptive, self.target)
+            else:                # separable: a position per patch + an embedding per frame (lag / target step)
+                self.adaptive = None
+                self.pos = nn.Parameter(torch.zeros(1, 1, tokens, dim))
+                self.frame = nn.Parameter(torch.zeros(1, T_in + T_out, 1, dim))
+                params = (self.pos, self.frame, self.target)
         for p in params:
             nn.init.trunc_normal_(p, std=0.02)
         modes = (tokens, spatial_modes, mode_gate) if spatial_modes else None   # spatial blocks only; temporal keep attention
@@ -441,7 +463,6 @@ class SpaceTimeTransformer(nn.Module):
                 raise ValueError(f"--st-transport: a {len(st_hops)}-node graph for {tokens} tokens (use --patch-size 1)")
         elif st_only:
             raise ValueError("--st-only needs --st-transport R")
-        F_all = T_in if mixed_head else T_in + T_out
         t_transport = (F_all, time_transport, T_in, tt_opts) if time_transport else None
         # --tt-chain: the temporal blocks after the first take every earlier frame as a source too
         c_transport = (F_all, time_transport, F_all,
@@ -477,7 +498,20 @@ class SpaceTimeTransformer(nn.Module):
             nn.init.zeros_(self.head.weight)   # start as the transported flow alone; learn the correction
             nn.init.zeros_(self.head.bias)
 
-    def forward(self, x, cond, target_add=None, flow_src=None):
+    def _stae_tokens(self, stae_in):
+        """stae_in: flow (B, T_in, N, C) z-scored, tod (B, F) slot, dow (B, F) -> (B, F, N, dim) tokens."""
+        flow, tod, dow = stae_in
+        B, T, N, _ = flow.shape
+        F_ = self.stae_adaptive.shape[0]
+        tod, dow = tod[:, :F_, None].expand(-1, -1, N), dow[:, :F_, None].expand(-1, -1, N)
+        part = self.stae_proj(torch.cat([flow, (tod[:, :T].float() / self.steps_per_day)[..., None],
+                                         dow[:, :T].float()[..., None]], -1))       # (B, T, N, 24)
+        if F_ > T:
+            part = torch.cat([part, self.target_flow.expand(B, F_ - T, N, -1)], 1)
+        return torch.cat([part, self.tod_embedding(tod), self.dow_embedding(dow),
+                          self.stae_adaptive.expand(B, -1, -1, -1)], -1)
+
+    def forward(self, x, cond, target_add=None, flow_src=None, stae_in=None):
         """x: (B, T_in, cin_frame, H, W) -> (B, T_out * cout_step, H, W), step-major like DistTransformer.
         target_add: optional (B, T_out, dim) added to the target tokens (--ext-input: the targets' features).
         flow_src (--tt-flow-head): the observed flow (B, T_in, cout_step, H, W); then returns (head output,
@@ -485,10 +519,15 @@ class SpaceTimeTransformer(nn.Module):
         plan (a head mixture; each row sums to 1) applied to the input frames' flow, patch by patch."""
         B, T, Cf, H, W = x.shape
         h, w = H // self.patch, W // self.patch
-        tokens = self.embed(x.reshape(B * T, Cf, H, W)).flatten(2).transpose(1, 2).reshape(B, T, h * w, -1)
-        if self.mixed_head:   # input frames only
+        if self.stae:
+            if stae_in is None:
+                raise ValueError("built with --stae-embed: pass stae_in")
+            z = self._stae_tokens(stae_in)                                         # (B, F, N, D)
+        elif self.mixed_head:   # input frames only
+            tokens = self.embed(x.reshape(B * T, Cf, H, W)).flatten(2).transpose(1, 2).reshape(B, T, h * w, -1)
             z = tokens + (self.adaptive[:, :T] if self.adaptive is not None else self.pos + self.frame[:, :T])
         else:
+            tokens = self.embed(x.reshape(B * T, Cf, H, W)).flatten(2).transpose(1, 2).reshape(B, T, h * w, -1)
             target = self.target.expand(B, -1, h * w, -1)
             if target_add is not None:
                 target = target + target_add[:, :, None]
@@ -652,7 +691,7 @@ class DistVolFormer(nn.Module):
                  count_scale=0.0, count_offset=0.0, direct=False, aux=0, od_head=None, od_slot_scale=0.0,
                  ext_dim=0, ext_input=False, ext_volume=False, spatial_modes=0, mode_head=0, mode_init="random", mode_gate=False,
                  crop_pad=False, latent_transport=0, time_transport=0, adaptive_embed=False, zscore=None,
-                 no_vol_encoder=False, tt_opts=None, mixed_head=False):
+                 no_vol_encoder=False, tt_opts=None, mixed_head=False, stae_embed=0):
         """aux: extra input maps per frame after the C flow channels (--od), fed as log-flow maps next to
         the flow's (in every layout: stacked, time tokens, graph, volume transformer); not predicted.
 
@@ -723,6 +762,9 @@ class DistVolFormer(nn.Module):
                              "--time-tokens, and no --sinkformer")
         if tt_opts and tt_opts.get("flow_head") and not (direct and time_tokens):
             raise ValueError("--tt-flow-head: only with distvolformer_direct --time-tokens")
+        self.stae_embed = stae_embed
+        if stae_embed and not (direct and time_tokens and zscore and ext_dim):
+            raise ValueError("--stae-embed: only with distvolformer_direct --time-tokens --zscore --external")
         if mixed_head and not (direct and time_tokens):
             raise ValueError("--mixed-head: only with distvolformer_direct --time-tokens")
         if tt_opts and not time_transport:
@@ -764,7 +806,7 @@ class DistVolFormer(nn.Module):
                                                  (H, W) if crop_pad else grid, patch, dim, depth,
                                                  heads, mlp_dim, code_dim, drop, sinkformer, spatial_modes, mode_gate,
                                                  latent_transport, time_transport, adaptive_embed, tt_opts,
-                                                 mixed_head)
+                                                 mixed_head, (stae_embed, C) if stae_embed else None)
         else:
             self.dist_enc = DistTransformer(2 * k_in + a_in + e_in, self.transport.channels if transport else k_out + g_out,
                                             grid, patch,
@@ -845,6 +887,12 @@ class DistVolFormer(nn.Module):
             if e_maps is not None:
                 features = torch.cat([features, e_maps], 1)
         dist_kw = {"target_add": self.ext_target(e_frames[:, T:])} if self.ext_target is not None else {}
+        if self.stae_embed:   # --stae-embed: the z-scored flow of each (frame, sensor) and every frame's calendar
+            from trafficpred.models.staeformer import calendar_slots
+            src = x if self.crop_pad else F.pad(x, (0, self.pad_w, 0, self.pad_h))
+            flow = ((src - self.zscore[0]) / self.zscore[1]).flatten(3).transpose(2, 3)   # (B, T, N, C)
+            tod, dow = calendar_slots(ext, self.stae_embed)                             # (B, T + T_out)
+            dist_kw["stae_in"] = (flow, tod, dow)
 
         if self.direct:
             if getattr(self.dist_enc, "flow_head", False):   # x_hat = transported past flow + a correction

@@ -1,5 +1,7 @@
 """Score PEMS04 / PEMS08 checkpoints the way the PeMS papers do (STSGCN, STID, STAEformer, STD-MAE): MAE,
 RMSE and MAPE of the flow over all 12 forecast steps together, and at steps 3 / 6 / 12 (15 / 30 / 60 min).
+BjTT (road speed, 4-min steps, 15 out): the average over the 15 steps and steps 5 / 10 / 15 (20 / 40 / 60 min),
+the BjTT paper's horizons, with MAE / RMSE at each.
 The masked numbers leave out readings whose true value is 0 (the BasicTS / STAEformer masked metrics with
 null value 0); the "all" MAE / RMSE keep them. Seeds of a run are averaged (mean and sample sd).
 
@@ -31,12 +33,24 @@ PUBLISHED = {
                ("STAEformer (CIKM'23)", (13.46, 23.25, 8.88)),
                ("STD-MAE (IJCAI'24, long-history pre-training)", (13.44, 22.47, 8.76))],
 }
+# BjTT paper (arXiv 2403.05029, Table II, 70 / 10 / 20, trained on all three months): MAE / RMSE at 20 / 40 / 60 min
+PUBLISHED_HORIZONS = {
+    "bjtt": [("STGCN (BjTT paper)", ((3.56, 5.45), (3.85, 5.93), (4.00, 6.19))),
+             ("MTGNN (BjTT paper)", ((3.60, 5.60), (3.74, 5.91), (3.89, 6.19))),
+             ("LDM, text-conditioned diffusion (BjTT paper)", ((3.30, 5.08), (3.26, 5.07), (3.24, 5.00))),
+             ("CrossTrafficLLM (arXiv 2601.06042, own split)", ((3.25, 4.86), (3.37, 5.11), (3.55, 5.36)))],
+}
+HORIZONS = {"bjtt": (5, 10, 15)}   # forecast steps reported on their own (1-based); default 3 / 6 / 12
 
 
-def scores(pred, true):
+def horizons(dataset):
+    return HORIZONS.get(dataset, (3, 6, 12))
+
+
+def scores(pred, true, steps_out=(3, 6, 12)):
     pred, true = pred.flatten(2), true.flatten(2)                    # (N, T, sensors)
     out = {}
-    for name, steps in (("avg", slice(None)), ("h3", slice(2, 3)), ("h6", slice(5, 6)), ("h12", slice(11, 12))):
+    for name, steps in [("avg", slice(None))] + [(f"h{k}", slice(k - 1, k)) for k in steps_out]:
         p, t = pred[:, steps], true[:, steps]
         keep = t > 0.5                                               # true 0 (counts); float error stays away
         e = (p - t)[keep]
@@ -67,7 +81,7 @@ def main():
         if dataset and ck["dataset"] != dataset:
             raise SystemExit("give runs of one dataset at a time")
         dataset = ck["dataset"]
-        runs[re.sub(r"_seed\d+$", "", os.path.basename(path)[:-3])].append(scores(pred, true))
+        runs[re.sub(r"_seed\d+$", "", os.path.basename(path)[:-3])].append(scores(pred, true, horizons(dataset)))
         print(f"scored {os.path.basename(path)}", file=sys.stderr, flush=True)
     if not runs:
         raise SystemExit("no finished runs matched")
@@ -75,20 +89,27 @@ def main():
     def ms(vals):
         return f"{st.mean(vals):6.2f}" + (f" ±{st.stdev(vals):4.2f}" if len(vals) > 1 else "      ")
 
-    print(f"{dataset} {args.split}: flow, 12 steps, masked (true > 0) unless 'all'; mean ± sd over seeds")
+    hs = horizons(dataset)
+    what = "speed" if dataset == "bjtt" else "flow"
+    print(f"{dataset} {args.split}: {what}, {pred.shape[1]} steps, masked (true > 0) unless 'all'; mean ± sd over seeds")
     print(f"  {'run':52}{'n':>2}  {'MAE':>12}{'RMSE':>12}{'MAPE %':>12}   {'all MAE':>8}{'all RMSE':>9}   "
-          f"{'MAE@3':>8}{'MAE@6':>8}{'MAE@12':>8}")
+          + "".join(f"{f'MAE@{k}':>8}" for k in hs) + "".join(f"{f'RMSE@{k}':>8}" for k in hs))
     order = sorted(runs, key=lambda r: st.mean(s["avg"][0] for s in runs[r]))
     for r in order:
         s = runs[r]
         cols = [ms([x["avg"][k] for x in s]) for k in range(3)]
         print(f"  {r[:52]:52}{len(s):2d}  " + "".join(f"{c:>12}" for c in cols)
               + f"   {st.mean(x['all'][0] for x in s):8.2f}{st.mean(x['all'][1] for x in s):9.2f}   "
-              + "".join(f"{st.mean(x[h][0] for x in s):{w}.2f}" for h, w in (("h3", 8), ("h6", 8), ("h12", 8))))
+              + "".join(f"{st.mean(x[f'h{k}'][0] for x in s):8.2f}" for k in hs)
+              + "".join(f"{st.mean(x[f'h{k}'][1] for x in s):8.2f}" for k in hs))
     if args.split == "test" and dataset in PUBLISHED:
         print("\npublished (12-step average, masked): MAE / RMSE / MAPE")
         for name, (mae, rmse, mape) in PUBLISHED[dataset]:
             print(f"  {name:52}{mae:8.2f}{rmse:8.2f}{mape:8.2f}")
+    if args.split == "test" and dataset in PUBLISHED_HORIZONS:
+        print(f"\npublished MAE / RMSE at steps {' / '.join(map(str, hs))} (the BjTT papers don't say masked or not)")
+        for name, vals in PUBLISHED_HORIZONS[dataset]:
+            print(f"  {name:52}" + "   ".join(f"{m:5.2f} / {r:5.2f}" for m, r in vals))
 
 
 if __name__ == "__main__":

@@ -69,6 +69,14 @@ RUNS = {   # name -> (the change, the flags it adds to BASE)
                 "--time-transport 5 --tt-no-decay --tt-flow-head --st-transport 1 --st-only"),
     "mixed": ("STAEformer's mixed-projection output head, no target frames", "--time-transport 5 --mixed-head"),
     "chain": ("chained transport: later temporal blocks also draw on earlier future frames", "--time-transport 5 --tt-chain"),
+    "staeembed": ("STAEformer's token embedding (flow + calendar, concatenated adaptive part), no --adaptive-embed",
+                  "--time-transport 5 --stae-embed"),
+    # STAEformer's recipe: Huber (delta 1 vehicle), Adam with coupled decay 1.5e-3 on raw-count gradients (our loss
+    # is in z units, PEMS08 train std 145.6 vehicles: 1.5e-3 / 145.6 = 1.03e-5, the same relative strength), lr cut
+    # x0.1 at epochs 25 / 45 / 65, no clipping, up to 300 epochs, early stopping after 30, picked by val MAE
+    "recipe": ("STAEformer's training recipe on the reference",
+               "--time-transport 5 --loss huber_raw --optimizer adam --weight-decay 1.03e-5 --schedule multistep "
+               "--milestones 25 45 65 --lr-gamma 0.1 --clip 0 --epochs 300 --patience 30 --select mae"),
     "tt5": ("the reference", "--time-transport 5"),
     "attn": ("attention control, no TT", ""),
 }
@@ -110,6 +118,8 @@ def train(key, flags, seed, tag, wandb, overall, done_before):
     name = run_name(key, tag, seed)
     log_path = os.path.join(W, "logs", name + ".log")
     base = BASE.replace("--loss sinkhorn --l2 0 ", "") if "--loss" in shlex.split(flags) else BASE   # a loss of its own
+    if "--stae-embed" in shlex.split(flags):   # it has its own adaptive embedding
+        base = base.replace("--adaptive-embed ", "")
     cmd = [sys.executable, "-u", "train.py", *shlex.split(base), *shlex.split(flags), "--seed", str(seed),
            "--save", os.path.join(W, name + ".pt"), "--resume"] + ([] if wandb else ["--no-wandb"])
     env = dict(os.environ, PYTORCH_ENABLE_MPS_FALLBACK="1")   # Apple GPUs: run the odd unsupported op on the CPU

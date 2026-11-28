@@ -18,6 +18,16 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+def calendar_slots(ext, steps_per_day):
+    """(B, T, E) calendar features (dow one-hot 7, day off, sin / cos time of day) -> (B, T) time-of-day slot
+    and day of week of each step."""
+    dow = ext[..., :7].argmax(-1)
+    angle = torch.atan2(ext[..., 8], ext[..., 9]) % (2 * math.pi)
+    tod = (angle / (2 * math.pi) * steps_per_day).round().long() % steps_per_day
+    return tod, dow
 
 
 class _Attention(nn.Module):
@@ -29,8 +39,8 @@ class _Attention(nn.Module):
     def forward(self, x):                                   # (..., L, dim)
         split = lambda t: torch.cat(torch.split(t, self.head_dim, dim=-1), dim=0)   # heads onto the batch
         q, k, v = split(self.q(x)), split(self.k(x)), split(self.v(x))
-        score = (q @ k.transpose(-1, -2)) / self.head_dim ** 0.5
-        out = torch.softmax(score, dim=-1) @ v
+        # softmax(q k^T / sqrt(d)) v as the official code, fused: memory grows with L, not L^2 (BjTT: 1260 roads)
+        out = F.scaled_dot_product_attention(q, k, v)
         out = torch.cat(torch.split(out, x.shape[0], dim=0), dim=-1)
         return self.out(out)
 
@@ -74,11 +84,7 @@ class STAEformer(nn.Module):
 
     def _calendar(self, ext, T):
         """(B, T) time-of-day slot and day of week of each input step, from the calendar features."""
-        e = ext[:, :T]
-        dow = e[..., :7].argmax(-1)
-        angle = torch.atan2(e[..., 8], e[..., 9]) % (2 * math.pi)
-        tod = (angle / (2 * math.pi) * self.steps_per_day).round().long() % self.steps_per_day
-        return tod, dow
+        return calendar_slots(ext[:, :T], self.steps_per_day)
 
     def forward(self, x, ext=None):
         if ext is None:

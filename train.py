@@ -62,6 +62,9 @@ def parse_args(argv=None):
     g.add_argument("--clip", type=float, help="gradient norm clip (0 = off)")
     g.add_argument("--schedule", choices=("onecycle", "plateau", "multistep"),
                    help="multistep: the lr x lr_gamma at each of the model's milestones (epochs; STAEformer)")
+    g.add_argument("--milestones", type=int, nargs="+", metavar="EPOCH",
+                   help="--schedule multistep: the epochs at which the lr is cut (default: the model's)")
+    g.add_argument("--lr-gamma", type=float, help="--schedule multistep: the factor of each cut (default 0.1)")
     g.add_argument("--optimizer", choices=("adamw", "adam"))
     g.add_argument("--plateau-patience", type=int, help="epochs without improvement before halving the lr")
     g.add_argument("--patience", type=int, help="early stopping after N epochs without improvement (0 = off)")
@@ -174,6 +177,12 @@ def option_suffix(loss, options):
 def training_settings(args, spec):
     defaults = spec.train_defaults(args.dataset)
     chosen = {k: getattr(args, k, None) if getattr(args, k, None) is not None else v for k, v in defaults.items()}
+    if getattr(args, "milestones", None):
+        chosen["milestones"] = tuple(args.milestones)
+    if getattr(args, "lr_gamma", None) is not None:
+        chosen["lr_gamma"] = args.lr_gamma
+    if chosen.get("schedule") == "multistep" and not chosen.get("milestones"):
+        raise SystemExit("--schedule multistep needs --milestones (this model has no default ones)")
     eval_batch_size = args.eval_batch_size or (chosen["batch_size"] if args.model == "stdcformer" else 128)
     return TrainSettings(**chosen, select=args.select, amp=args.amp, compile=args.compile,
                          workers=args.workers, eval_batch_size=eval_batch_size,
