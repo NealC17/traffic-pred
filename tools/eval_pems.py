@@ -33,8 +33,28 @@ PUBLISHED = {
                ("STAEformer (CIKM'23)", (13.46, 23.25, 8.88)),
                ("STD-MAE (IJCAI'24, long-history pre-training)", (13.44, 22.47, 8.76))],
 }
-# BjTT paper (arXiv 2403.05029, Table II, 70 / 10 / 20, trained on all three months): MAE / RMSE at 20 / 40 / 60 min
+# BjTT baselines: MAE / RMSE at steps 5 / 10 / 15 (20 / 40 / 60 min), the sota2.com BjTT leaderboards
+# (traffic-prediction-on-bjtt-t-{5-20,10-40,15-60}-min-test, rows from CrossTrafficLLM, arXiv 2601.06042; its GNN rows
+# match the BjTT paper's). Protocol not stated there; the BjTT paper is 70 / 10 / 20 on all three months. The BjTT
+# paper's own text-conditioned LDM (arXiv 2403.05029, Table II) isn't on the leaderboard and is added last.
 PUBLISHED_HORIZONS = {
+    "bjtt": [
+        ("CrossTrafficLLM, with text", ((3.25, 4.86), (3.37, 5.11), (3.55, 5.36))),
+        ("CrossTrafficLLM, no text", ((3.31, 4.92), (3.45, 5.19), (3.64, 5.46))),
+        ("Crossformer", ((3.39, 5.03), (3.52, 5.31), (3.79, 5.51))),
+        ("TimeXer", ((3.43, 5.21), (3.61, 5.48), (3.74, 5.63))),
+        ("Informer", ((3.55, 5.36), (3.84, 5.85), (4.02, 6.13))),
+        ("STGCN", ((3.56, 5.45), (3.85, 5.93), (4.0, 6.19))),
+        ("STG-NCDE", ((3.56, 5.53), (3.83, 6.09), (4.05, 6.52))),
+        ("MTGNN", ((3.6, 5.6), (3.74, 5.91), (3.89, 6.19))),
+        ("GWN", ((3.61, 5.6), (3.92, 6.19), (4.16, 6.61))),
+        ("STSGCN", ((3.66, 5.74), (4.01, 6.22), (4.15, 6.63))),
+        ("ASTGCN", ((3.79, 5.87), (4.15, 6.54), (4.44, 7.02))),
+        ("iTransformer", ((3.83, 5.91), (3.84, 5.93), (3.86, 5.99))),
+        ("LDM, text-conditioned diffusion (BjTT paper)", ((3.30, 5.08), (3.26, 5.07), (3.24, 5.00))),
+    ],
+}
+HORIZONS = {
     "bjtt": [("STGCN (BjTT paper)", ((3.56, 5.45), (3.85, 5.93), (4.00, 6.19))),
              ("MTGNN (BjTT paper)", ((3.60, 5.60), (3.74, 5.91), (3.89, 6.19))),
              ("LDM, text-conditioned diffusion (BjTT paper)", ((3.30, 5.08), (3.26, 5.07), (3.24, 5.00))),

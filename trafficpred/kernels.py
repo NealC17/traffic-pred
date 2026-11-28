@@ -39,6 +39,8 @@ def sinkhorn_plan_eager(logits, col, frac, iters):
 
 
 if triton is not None:
+    _NEG = tl.constexpr(NEG)   # a jit'ed kernel may only read constexpr globals
+
     @triton.jit
     def _lse(x, axis: tl.constexpr):
         mx = tl.max(x, axis=axis, keep_dims=True)
@@ -50,7 +52,7 @@ if triton is not None:
             l = l - _lse(l, 1)
         else:
             l = l + frac * (col - _lse(l, 0))
-        return tl.where(valid, l, NEG)
+        return tl.where(valid, l, _NEG)
 
     @triton.jit
     def _fwd_kernel(L, COL, FRAC, P, F, S, H, ITERS: tl.constexpr, BF: tl.constexpr, BS: tl.constexpr):
@@ -59,7 +61,7 @@ if triton is not None:
         s = tl.arange(0, BS)[None, :]
         valid = (f < F) & (s < S)
         offs = m * F * S + f * S + s
-        l = tl.load(L + offs, mask=valid, other=NEG)
+        l = tl.load(L + offs, mask=valid, other=_NEG)
         col = tl.load(COL + m * S + s, mask=s < S, other=0.0)
         frac = tl.load(FRAC + m % H)
         for i in tl.static_range(ITERS):
@@ -74,15 +76,14 @@ if triton is not None:
         s = tl.arange(0, BS)[None, :]
         valid = (f < F) & (s < S)
         offs = m * F * S + f * S + s
-        l0 = tl.load(L + offs, mask=valid, other=NEG)
+        l0 = tl.load(L + offs, mask=valid, other=_NEG)
         col = tl.load(COL + m * S + s, mask=s < S, other=0.0)
         frac = tl.load(FRAC + m % H)
         p = tl.load(P + offs, mask=valid, other=0.0)
         g = tl.load(GP + offs, mask=valid, other=0.0) * p            # d loss / d final logits
         gcol = tl.zeros((1, BS), dtype=tl.float32)
         gfrac = tl.zeros((1, 1), dtype=tl.float32)
-        for k in tl.static_range(ITERS):
-            i: tl.constexpr = ITERS - 1 - k
+        for i in tl.static_range(ITERS - 1, -1, -1):                # the steps in reverse
             l = l0
             for j in tl.static_range(i):                             # recompute iterate i in registers
                 l = _step(l, col, frac, valid, j)
@@ -137,9 +138,17 @@ def _use_kernel(logits):
 _checked = {}   # device -> the kernel passed its self-check there (False: failed, use the eager loop)
 
 
+def _key(device):   # cuda and cuda:0 are the same device
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
 def _self_check(device):
     """Once per device: the kernel against the eager loop on a small random plan (values and gradients), so a
     Triton build or GPU that miscompiles it falls back to the eager loop instead of training on wrong plans."""
+    device = _key(device)
     if device in _checked:
         return _checked[device]
     try:
@@ -183,7 +192,7 @@ def tt_sinkhorn_plan(logits, col, frac, iters):
     self-check has passed on this device: after prepare(), or a first call made without gradients (eval)."""
     if iters < 1 or not _use_kernel(logits):
         return sinkhorn_plan_eager(logits, col, frac, iters)
-    ok = _checked.get(logits.device)
+    ok = _checked.get(_key(logits.device))
     if ok is None and not torch.is_grad_enabled():
         ok = _self_check(logits.device)
     if not ok:
