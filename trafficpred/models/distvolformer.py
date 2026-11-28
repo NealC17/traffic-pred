@@ -6,6 +6,8 @@ import torch.nn as nn
 import torch.utils.checkpoint
 import torch.nn.functional as F
 
+from trafficpred.kernels import tt_sinkhorn_plan
+
 from trafficpred.models.distvol import EPS, EXT_EMBED, ConvBlock, ODTransportHead, ext_maps, log_flow, log_last_distribution
 from trafficpred.models.transport import TransportHead
 from trafficpred.sinkhorn import split_flow
@@ -187,13 +189,9 @@ class LatentTransport(nn.Module):
         if self.log_rho is not None:   # unbalanced: a damped column step
             rho = self.log_rho.exp()[:, None, None]
             frac = rho / (rho + eps)
-        for i in range(self.iters):   # odd count ends on the rows: each destination's weights sum to 1
-            if i % 2 == 0:
-                logits = logits - logits.logsumexp(dim=-1, keepdim=True)
-            else:
-                step = col - logits.logsumexp(dim=-2, keepdim=True)
-                logits = logits + (step if frac is None else frac * step)
-        plan = logits.exp()
+        # odd iteration count ends on the rows: each destination's weights sum to 1. Fused into one Triton
+        # kernel on the GPU (trafficpred/kernels.py), the same maths as the eager loop there
+        plan = tt_sinkhorn_plan(logits, col, frac, self.iters)
         # --tt-flow-head reads the last temporal block's plan (with gradients, before dropout: rows sum to 1)
         self.flow_plan = plan if getattr(self, "keep_flow_plan", False) else None
         plan = F.dropout(plan, self.drop, self.training)

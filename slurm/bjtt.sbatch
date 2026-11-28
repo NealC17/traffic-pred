@@ -46,7 +46,7 @@ JOB_INDEX=${JOB_INDEX:-1}
 W=checkpoints/workspaces/bjtt
 DATA=(datasets/BjTT/speed_2022_01.npy datasets/BjTT/speed_2022_03.npy datasets/BjTT/hops.npy)
 
-COMMON=(--dataset bjtt --t-in 12 --t-out 15 --external)
+COMMON=(--dataset bjtt --t-in 12 --t-out 15 --external --tf32)   # TF32 tensor cores for the float32 matmuls
 # the PEMS08 DistVolFormer setup (run_tt_ablations.py BASE): STAEformer-sized, time tokens over the roads
 DVF=(--model distvolformer_direct --loss sinkhorn --l2 0 --time-tokens --patch-size 1 --ext-input --adaptive-embed
      --zscore --log-counts --grad-checkpoint --eval-batch-size 16 --dim 152 --num-blocks 6 --heads 4 --mlp-dim 256
@@ -93,6 +93,9 @@ grep -q '"bjtt"' trafficpred/data/datasets.py && grep -q -- "--tt-flow-head" tra
 # shellcheck disable=SC1091
 source setup.sh || { log "source setup.sh failed"; exit 1; }
 command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | sed 's/^/    GPU: /'
+if [ "$JOB_INDEX" = 1 ]; then   # the fused TT kernel against the eager loop on this GPU (~10 s)
+    python tools/bench_kernels.py 2>&1 | tee logs/bench_kernels.out | sed 's/^/    /'
+fi
 
 resubmit() {
     if [ -z "${SLURM_JOB_ID:-}" ]; then

@@ -71,6 +71,9 @@ def parse_args(argv=None):
     g.add_argument("--select", default=SELECT, help="val metric that picks the checkpoint")
     g.add_argument("--amp", action="store_true", help="bf16 autocast on CUDA")
     g.add_argument("--compile", action="store_true", help="torch.compile the model")
+    g.add_argument("--tf32", action="store_true",
+                   help="CUDA: float32 matmuls / convolutions on the TF32 tensor cores (A100, H100, RTX 30xx+): "
+                        "several times faster, ~1e-3 relative error per product; the TT Sinkhorn iterations stay float32")
     g.add_argument("--workers", type=int, default=2)
     g.add_argument("--grad-checkpoint", action="store_true",
                    help="distvolformer*: recompute each transformer block in the backward pass (less memory, "
@@ -286,6 +289,8 @@ def main(argv=None, epoch_callback=None):
         loss = ScaledLoss(loss, factor)
 
     torch.backends.cudnn.benchmark = device.type == "cuda"
+    if args.tf32:
+        torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
     trainer = Trainer(model, run, splits, loss, settings, save, device)
     tracker_state = trainer.try_resume() if args.resume else None
     tracker = Tracker(name=name, job_type=args.model, enabled=not args.no_wandb, dataset=args.dataset,

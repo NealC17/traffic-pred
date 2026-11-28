@@ -57,9 +57,12 @@ def evaluate(model, loader, device, span, lo=0.0, amp=False, desc="  eval"):
 
         p_hat, _ = split_flow(pred)
         p, _ = split_flow(y.clamp_min(0))
-        sk = sinkhorn_divergence(p_hat.reshape(-1, H, W), p.reshape(-1, H, W),
-                                 eps=SINKHORN_EPS, iters=SINKHORN_ITERS).reshape(B, T, C)
-        totals.add("sinkhorn", sk.sum(dim=(0, 2)))
+        if H > 1:
+            sk = sinkhorn_divergence(p_hat.reshape(-1, H, W), p.reshape(-1, H, W),
+                                     eps=SINKHORN_EPS, iters=SINKHORN_ITERS).reshape(B, T, C)
+            totals.add("sinkhorn", sk.sum(dim=(0, 2)))
+        # H = 1: sensors / roads in a row (PEMS, BjTT), where a distance along the row means nothing; the
+        # divergence (W x W per map, 1260^2 on BjTT) is skipped and reported as 0
         dp = p_hat - p
         totals.add("dist_se", (dp * (H * W)).pow(2).sum(dim=(0, 2, 3, 4)))
         totals.add("tv", (0.5 * dp.abs().sum(dim=(-2, -1))).sum(dim=(0, 2)))
